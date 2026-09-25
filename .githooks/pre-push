@@ -1,0 +1,4 @@
+#!/bin/sh
+# Abort the push if anything that looks private is in the tree.
+# This repo is public — see tools/secret-scan.js for what it checks.
+exec node "$(git rev-parse --show-toplevel)/tools/secret-scan.js"
