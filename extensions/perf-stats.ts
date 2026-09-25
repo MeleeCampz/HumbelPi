@@ -7,14 +7,16 @@
  *
  *   - TTFT        : before_provider_request → first content delta (text/thinking/toolcall)
  *   - gen tok/s   : exact, usage.output / streaming duration; live estimate (chars/4) while streaming
- *   - prompt eval : (usage.input + usage.cacheRead) / TTFT — blended prefill speed, heuristic
+ *
+ * #16: the prompt-eval estimate (prompt tokens / TTFT) was removed — it is off by a
+ * large margin compared to the backend's real prefill numbers. TTFT + gen tok/s stay.
  *
  * Published via ctx.ui.setStatus("perf", …); guards.ts' custom footer renders it
  * on the existing model info line (no extra lines).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-interface UsageLike { input?: number; output?: number; cacheRead?: number; [k: string]: unknown; }
+interface UsageLike { input?: number; output?: number; [k: string]: unknown; }
 
 export interface PerfInput {
   t0: number;
@@ -24,7 +26,7 @@ export interface PerfInput {
 }
 
 /** Pure: stats for one completed provider call. Rates in tokens/sec, times in ms. */
-export function computeStats({ t0, firstDeltaAt, lastDeltaAt, usage }: PerfInput): { ttftMs: number | null; tps: number | null; evalTps: number | null } {
+export function computeStats({ t0, firstDeltaAt, lastDeltaAt, usage }: PerfInput): { ttftMs: number | null; tps: number | null } {
   const ttftMs = firstDeltaAt != null && firstDeltaAt >= t0 ? firstDeltaAt - t0 : null;
 
   let tps: number | null = null;
@@ -32,13 +34,7 @@ export function computeStats({ t0, firstDeltaAt, lastDeltaAt, usage }: PerfInput
     tps = usage.output / ((lastDeltaAt - firstDeltaAt) / 1000);
   }
 
-  let evalTps: number | null = null;
-  if (ttftMs != null && ttftMs > 0) {
-    const promptTokens = (usage?.input ?? 0) + (usage?.cacheRead ?? 0);
-    if (promptTokens > 0) evalTps = promptTokens / (ttftMs / 1000);
-  }
-
-  return { ttftMs, tps, evalTps };
+  return { ttftMs, tps };
 }
 
 function formatRate(t: number): string {
@@ -52,12 +48,11 @@ function formatMs(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-/** Final per-call text, e.g. "42 t/s · TTFT 380ms · eval 12.3k t/s"; null when nothing measurable. */
-export function formatFinal(s: { ttftMs: number | null; tps: number | null; evalTps: number | null }): string | null {
+/** Final per-call text, e.g. "42 t/s · TTFT 380ms"; null when nothing measurable. */
+export function formatFinal(s: { ttftMs: number | null; tps: number | null }): string | null {
   const parts: string[] = [];
   if (s.tps != null) parts.push(`${formatRate(s.tps)} t/s`);
   if (s.ttftMs != null) parts.push(`TTFT ${formatMs(s.ttftMs)}`);
-  if (s.evalTps != null) parts.push(`eval ${formatRate(s.evalTps)} t/s`);
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 

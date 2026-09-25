@@ -158,7 +158,7 @@ function markerLabel(m: Marker): string {
 const USAGE = `📋 Backlog usage:
   /backlog <idea>      add an item
   /backlog             checklist → select items (plan / implement / done / delete)
-                         e/→ expand item · bottom rows: clear completed · clear all`;
+                         ← collapse / → expand item (e toggles) · bottom rows: clear completed · clear all`;
 
 // ── Checklist component (shown via ctx.ui.custom) ───────────────────────
 
@@ -188,10 +188,14 @@ function createChecklist(
       }
       if (matchesKey(data, "up") || data === "k") { cursor = Math.max(0, cursor - 1); return; }
       if (matchesKey(data, "down") || data === "j") { cursor = Math.min(totalRows - 1, cursor + 1); return; }
-      if (data === "e" || matchesKey(data, "right")) {
+      if (data === "e" || matchesKey(data, "left") || matchesKey(data, "right")) {
         const it = items[cursor];
         if (!it) return; // action rows are not expandable
-        if (expanded.has(it.num)) expanded.delete(it.num); else expanded.add(it.num);
+        // #13: ← collapse · → expand · e toggles (as before)
+        if (matchesKey(data, "left")) expanded.delete(it.num);
+        else if (matchesKey(data, "right")) expanded.add(it.num);
+        else if (expanded.has(it.num)) expanded.delete(it.num);
+        else expanded.add(it.num);
         return;
       }
       if (data === "x" || data === " ") {
@@ -204,7 +208,7 @@ function createChecklist(
     render(width: number): string[] {
       const lines: string[] = [
         theme.fg("dim", `📋 Backlog — ${items.length} item(s) · select one or more`),
-        theme.fg("dim", "↑↓/jk move · x/space select · e/→ expand · ⏎ confirm · esc cancel"),
+        theme.fg("dim", "↑↓/jk move · x/space select · ← collapse / → expand (e toggles) · ⏎ confirm · esc cancel"),
       ];
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
@@ -253,7 +257,7 @@ interface CmdCtx {
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("backlog", {
-    description: "Backlog: /backlog <idea> appends an idea; bare /backlog opens the checklist (select items → plan/implement/done/delete; e/→ expand item; bottom rows clear done/all)",
+    description: "Backlog: /backlog <idea> appends an idea; bare /backlog opens the checklist (select items → plan/implement/done/delete; ← collapse / → expand, e toggles; bottom rows clear done/all)",
 
     async handler(target: string, ctx: CmdCtx) {
       const file = backlogPath(ctx.cwd);

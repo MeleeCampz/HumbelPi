@@ -394,10 +394,12 @@ async function pushTargets(cwd: string, rawArgs: string): Promise<string[]> {
 
 type Decision = "once" | "always" | "ro" | "block";
 
-/** Terminal window/tab title: yolo marker without adding any console line. */
+/** Terminal window/tab title: guard marker always visible, no console line needed. */
 function applyTitle(ctx: ExtensionContext, state: GuardState): void {
 	const dir = path.basename(ctx.cwd) || "pi";
-	ctx.ui.setTitle(state.yoloMode ? `🔥 YOLO — pi — ${dir}` : state.planMode ? `📋 PLAN — pi — ${dir}` : `pi — ${dir}`);
+	// #12: 🛡️ shown in the normal state; yolo + plan combine instead of hiding each other.
+	const marker = [state.yoloMode ? "🔥 YOLO" : null, state.planMode ? "📋 PLAN" : null].filter(Boolean).join(" · ");
+	ctx.ui.setTitle(marker ? `${marker} — pi — ${dir}` : `🛡️ pi — ${dir}`);
 }
 
 function formatTokens(count: number): string {
@@ -502,6 +504,8 @@ export default function (pi: ExtensionAPI) {
 		const choice = await ctx.ui.select(`${title}\n\n${body}`, options);
 		if (choice === "Allow once") return "once";
 		if (typeof choice === "string" && choice.startsWith("Always allow")) return "always";
+		// #15: read prompts offer an explicit full-access option with different wording
+		if (typeof choice === "string" && choice.startsWith("Full access")) return "always";
 		if (typeof choice === "string" && choice.startsWith("Read-only")) return "ro";
 		return "block";
 	}
@@ -595,8 +599,9 @@ export default function (pi: ExtensionAPI) {
 							? savable.length > 0
 									? ["Allow once", "Always allow here (full access, saved)", "Read-only here (writes still ask, saved)", "No — block"]
 									: ["Allow once", "No — block"]
+							// #14/#15: reads offer a saved read-only grant; full access must be chosen explicitly
 							: savable.length > 0
-								? ["Allow once", "Always allow here (saved)", "No — block"]
+								? ["Allow once", "Read-only here (writes still ask, saved)", "Full access here (read + write, saved)", "No — block"]
 								: ["Allow once", "No — block"];
 					const tag = group.kind === "ro" ? "read-only — writes ask" : "no grant";
 					const targetLines = group.paths.length === 1
@@ -604,7 +609,12 @@ export default function (pi: ExtensionAPI) {
 						: [`${group.kind === "ro" ? "Targets (currently read-only):" : "Targets (no existing grant):"}`, ...group.paths.map((s) => `  - ${s}`)];
 					const consequence = group.kind === "ro"
 						? savable.length > 0 ? `"Upgrade to full access" saves full access for every target above.` : ""
-						: isWrite && savable.length > 0 ? `This is a WRITE — "read-only here" will keep asking for writes.` : "";
+						: isWrite && savable.length > 0
+							? `This is a WRITE — "read-only here" will keep asking for writes.`
+							// #15: make the weight of a full-access grant from a READ prompt explicit
+							: !isWrite && savable.length > 0
+								? `"Full access here" also allows writes without asking — pick "Read-only here" if reads are all you need.`
+								: "";
 					const body = [`Tool:     ${event.toolName}`, ...targetLines, `Project:  ${cwd}`, consequence]
 						.filter((l) => l !== "")
 						.join("\n");
@@ -626,7 +636,9 @@ export default function (pi: ExtensionAPI) {
 							state.readOnlyPaths = state.readOnlyPaths.filter((r) => !state.allowedPaths.some((a) => grantCovers(a, r)));
 							ctx.ui.notify(group.kind === "ro"
 								? `Upgraded to full access (was read-only): ${savable.join(", ")}`
-								: `Always allowed (full access): ${savable.join(", ")}`, "info");
+								: isWrite
+									? `Always allowed (full access): ${savable.join(", ")}`
+									: `Full access granted (reads AND writes): ${savable.join(", ")}`, "info");
 						} else {
 							for (const s of savable) if (!state.readOnlyPaths.includes(s)) state.readOnlyPaths.push(s);
 							ctx.ui.notify(`Read-only granted: ${savable.join(", ")} (reads free, writes still ask)`, "info");
@@ -849,8 +861,9 @@ export default function (pi: ExtensionAPI) {
 			saveState(state);
 			applyTitle(ctx, state);
 			ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
-			pi.sendUserMessage(implementationInstruction(file), { deliverAs: "followUp" });
-			return { content: [{ type: "text", text: "Plan approved — implementation has been started; begin with step 1." }], details: undefined };
+			// #10: no queued follow-up — the instruction goes into the tool result so the model
+			// implements in the SAME turn. A queued message would land later as a stale duplicate.
+			return { content: [{ type: "text", text: implementationInstruction(file) }], details: undefined };
 		},
 	});
 
@@ -886,11 +899,13 @@ export default function (pi: ExtensionAPI) {
 					state.yoloMode = arg === "on" ? true : arg === "off" ? false : !state.yoloMode;
 					saveState(state);
 					applyTitle(ctx, state);
+					// #12: "info" (replaceable status line) for both directions — a "warning"
+					// notification is a permanent chat line that never gets cleared on exit.
 					ctx.ui.notify(
 						state.yoloMode
 							? "🔥 YOLO mode ON — path sandbox silenced (push guard still active). /guards yolo off to exit."
 							: "YOLO mode off — guards fully active.",
-						state.yoloMode ? "warning" : "info",
+						"info",
 					);
 					break;
 				}

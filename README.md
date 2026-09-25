@@ -11,7 +11,8 @@ extensions/
   guards.ts        sandbox + git-push guard, yolo mode, planning mode (/plan on [task]),
                    per-group permission dialogs, custom footer (perf stats), title sync
   backlog.ts       /backlog checklist: multi-select + actions (plan/implement/done/delete/clear)
-  perf-stats.ts    tok/s + TTFT + prompt-eval measured client-side, shown in the footer
+  perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
+  working-task.ts  working_task tool — model sets/clears the current task in the working indicator
   spellcheck.ts    spelling checks for user messages (dictionary: extensions/words-en.txt)
   web-search.ts    web search tool
   ask-user.ts      structured ask_user dialog
