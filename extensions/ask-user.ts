@@ -8,10 +8,24 @@
  *
  * Global extension: applies to every project.
  */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const OTHER = "Other — I'll type my own answer";
+
+// Shared guard state (schema owner: guards.ts) — duplicated per the backlog.ts pattern.
+// Unattended mode: the user is away, so questions are auto-rejected instead of hanging.
+const GUARD_STATE_FILE = path.join(os.homedir(), ".pi", "agent", "guard-state.json");
+function isUnattended(): boolean {
+	try {
+		return (JSON.parse(fs.readFileSync(GUARD_STATE_FILE, "utf8")) as { unattendedMode?: boolean }).unattendedMode === true;
+	} catch {
+		return false;
+	}
+}
 
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
@@ -40,6 +54,17 @@ export default function (pi: ExtensionAPI) {
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (isUnattended()) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `The user is away (unattended mode) — this question was auto-rejected. Do not wait and do not re-ask the same decision. Pick the safest reasonable option, state your assumption explicitly, and record it in a "Decisions made while unattended" section of your final report.`,
+						},
+					],
+					details: undefined,
+				};
+			}
 			if (!ctx.hasUI) {
 				return {
 					content: [

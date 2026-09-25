@@ -8,8 +8,9 @@ Everything here is **extensions** — the pi installation itself is never modifi
 
 ```
 extensions/
-  guards.ts        sandbox + git-push guard, yolo mode, planning mode (/plan on [task]),
-                   per-group permission dialogs, custom footer (perf stats), title sync
+  guards.ts        sandbox + git-push guard, yolo mode, unattended mode (/away [instruction]),
+                   planning mode (/plan on [task]), per-group permission dialogs,
+                   custom footer (perf stats), title sync
   backlog.ts       /backlog checklist: multi-select + actions (plan/implement/done/delete/clear)
   perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
   working-task.ts  working_task tool — model sets/clears the current task in the working indicator
@@ -106,6 +107,24 @@ no post-enter confirmation: the text is sent exactly as typed.
 - The state is visible at all times in the window title (`🔥 YOLO — pi — <dir>`) and
   in the `/guards` status line, so you always know it's on.
 - Toggle: `/guards yolo on | off`.
+
+## Unattended mode
+
+- For when you step away and want the agent to keep working: `/away [instruction]`
+  turns unattended mode on and immediately hands your instruction to the agent as its
+  next message. Bare `/away` turns it off.
+- While on, **every confirmation dialogue is auto-rejected instead of hanging**: the
+  sandbox path dialog, the push guard, `ask_user`, and the `finish_plan` approval all
+  decline automatically, and each rejection tells the model to pick the safest reasonable
+  option and record it in a "Decisions made while unattended" section of its final report.
+- Every user message also carries an `[UNATTENDED MODE]` frame so the model knows you are
+  away and should not wait for input — when it runs out of safe work it ends its turn
+  with a summary instead of blocking.
+- Per-session: the mode auto-clears when a different session starts (resuming the same
+  session keeps it). YOLO silencing still wins — ops yolo already silences never reach a
+  dialog and keep passing silently.
+- Visible in the window title (`🌙 AWAY — pi — <dir>`, combines with 🔥/📋), the footer
+  marker, and the `/guards` status line.
 
 ## Web search
 
