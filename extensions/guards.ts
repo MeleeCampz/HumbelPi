@@ -5,7 +5,16 @@
  *
  * 1. Path sandbox   — tool calls touching paths outside the current project
  *                      (ctx.cwd) ask first. Bash commands are heuristically
- *                      scanned for absolute / escaping paths.
+ *                      scanned for absolute / escaping paths. Heuristics (#12):
+ *                        • on Windows a single-segment bare token (/async, /help)
+ *                          is a CLI argument, not a path — never flagged;
+ *                        • outside candidates are only flagged when the path or an
+ *                          ancestor directory exists on disk (unmounted drives and
+ *                          garbage tokens pass silently);
+ *                        • known limitation: creating a brand-new directory tree
+ *                          OUTSIDE the project is not flagged (nothing exists yet).
+ *                      This is a guardrail, NOT a security boundary — for real
+ *                      isolation run pi in a proper sandbox (Docker/VM/devcontainer).
  *                      Two grant tiers:
  *                        • allowedPaths   — full access, never asks (read + write)
  *                        • readOnlyPaths  — reads pass silently; writes/edits/
@@ -36,6 +45,12 @@
  *    Only the pinned plan file may be written (default: ~/.pi/agent/plans/<project>/PLAN.md,
  *    outside the repo). finish_plan presents the finished plan for approval; approve or
  *    implement starts implementation with step-by-step progress reporting.
+ * 4. Unattended mode — /away [instruction] | /away
+ *    The user is away: every confirmation dialog (sandbox, push guard, ask_user,
+ *    finish_plan) is auto-rejected instead of hanging, and each user message carries an
+ *    [UNATTENDED MODE] frame telling the model to work autonomously. Per-session:
+ *    auto-clears when a different session starts. YOLO silencing still wins — ops yolo
+ *    already silences never reach a dialog.
  */
 
 import fs from "node:fs";
@@ -54,6 +69,8 @@ interface GuardState {
 	pushGuardEnabled: boolean;
 	yoloMode: boolean;
 	planMode: boolean;
+	unattendedMode: boolean;
+	unattendedSessionId: string | null;
 	planFile: string | null;
 	planSessionId: string | null;
 	allowedPaths: string[];
@@ -65,6 +82,8 @@ const DEFAULT_STATE: GuardState = {
 	sandboxEnabled: true,
 	pushGuardEnabled: true,
 	yoloMode: false,
+	unattendedMode: false,
+	unattendedSessionId: null,
 	planMode: false,
 	planFile: null,
 	planSessionId: null,
@@ -232,9 +251,28 @@ function tokenPath(tok: string, cwd: string): string | null {
 		if (SYSTEM_ROOTS.test(t)) return null; // /tmp, /usr, … — harmless system dirs
 		const m = t.match(/^\/([A-Za-z])([\\/].+)$/);
 		if (m) return resolveProjectPath(m[1].toUpperCase() + ":/" + m[2].slice(1), cwd); // Git Bash /c/Users/… → C:/Users/…
+		// #12: on Windows a single-segment bare token like /async is a CLI argument,
+		// not a path — Node would resolve it to C:\\async and flag it as outside.
+		if (process.platform === "win32" && !t.slice(1).includes("/") && !t.slice(1).includes("\\")) return null;
 		return resolveProjectPath(t, cwd);
 	}
 	return null; // relative — stays in the project unless it contains .. (caller checks)
+}
+
+/**
+ * #12: true when the target or any ancestor directory exists on disk.
+ * Used to drop outside-project candidates that refer to nothing real
+ * (unmounted drives, garbage multi-segment tokens). Bounded walk up to root.
+ */
+function pathPlausiblyExists(target: string): boolean {
+	let p = target;
+	for (let i = 0; i < 24; i++) {
+		try { if (fs.existsSync(p)) return true; } catch { /* keep walking */ }
+		const parent = path.dirname(p);
+		if (parent === p) return false; // reached the root
+		p = parent;
+	}
+	return false;
 }
 
 /** Heuristic: find paths referenced by a shell command that leave the project. */
@@ -248,7 +286,9 @@ export function suspiciousPathsInCommand(command: string, cwd: string): string[]
 			continue;
 		}
 		const p = tokenPath(tok, cwd);
-		if (p !== null && isOutside(p, cwd)) outside.add(p);
+		// #12: only flag outside candidates that plausibly exist on disk —
+		// new files inside an existing outside dir still trip this (parent exists).
+		if (p !== null && isOutside(p, cwd) && pathPlausiblyExists(p)) outside.add(p);
 	}
 	return [...outside];
 }
@@ -394,10 +434,12 @@ async function pushTargets(cwd: string, rawArgs: string): Promise<string[]> {
 
 type Decision = "once" | "always" | "ro" | "block";
 
-/** Terminal window/tab title: yolo marker without adding any console line. */
+/** Terminal window/tab title: guard marker always visible, no console line needed. */
 function applyTitle(ctx: ExtensionContext, state: GuardState): void {
 	const dir = path.basename(ctx.cwd) || "pi";
-	ctx.ui.setTitle(state.yoloMode ? `🔥 YOLO — pi — ${dir}` : state.planMode ? `📋 PLAN — pi — ${dir}` : `pi — ${dir}`);
+	// #12: 🛡️ shown in the normal state; away + yolo + plan combine instead of hiding each other.
+	const marker = [state.unattendedMode ? "🌙 AWAY" : null, state.yoloMode ? "🔥 YOLO" : null, state.planMode ? "📋 PLAN" : null].filter(Boolean).join(" · ");
+	ctx.ui.setTitle(marker ? `${marker} — pi — ${dir}` : `🛡️ pi — ${dir}`);
 }
 
 function formatTokens(count: number): string {
@@ -418,7 +460,7 @@ function createGuardFooter(ctx: any): (tui: any, theme: any, footerData: any) =>
 		dispose() {},
 		render(width: number): string[] {
 			const state = loadState();
-			const marker = state.yoloMode ? "🔥" : state.planMode ? "📋" : "🛡️";
+			const marker = [state.unattendedMode ? "🌙" : null, state.yoloMode ? "🔥" : null, state.planMode ? "📋" : null].filter(Boolean).join(" ") || "🛡️";
 
 			// --- line 1: marker + pwd (+ branch, session name) ---
 			let cwd = ctx.sessionManager.getCwd();
@@ -502,6 +544,8 @@ export default function (pi: ExtensionAPI) {
 		const choice = await ctx.ui.select(`${title}\n\n${body}`, options);
 		if (choice === "Allow once") return "once";
 		if (typeof choice === "string" && choice.startsWith("Always allow")) return "always";
+		// #15: read prompts offer an explicit full-access option with different wording
+		if (typeof choice === "string" && choice.startsWith("Full access")) return "always";
 		if (typeof choice === "string" && choice.startsWith("Read-only")) return "ro";
 		return "block";
 	}
@@ -515,6 +559,13 @@ export default function (pi: ExtensionAPI) {
 			state.planSessionId = null;
 			saveState(state);
 			ctx.ui.notify("📋 Planning mode is still on, but the previous session’s plan was not carried over (plans are per-session). Give me a task and I’ll write a fresh plan.", "info");
+		}
+		// Unattended mode is per-session: a different session must not inherit it.
+		if (state.unattendedMode && state.unattendedSessionId !== ctx.sessionManager.getSessionId()) {
+			state.unattendedMode = false;
+			state.unattendedSessionId = null;
+			saveState(state);
+			ctx.ui.notify("🌙 Unattended mode was on, but it is per-session and auto-cleared for this new session. /away [instruction] to re-enable.", "info");
 		}
 		applyTitle(ctx, state);
 		ctx.ui.setFooter(createGuardFooter(ctx));
@@ -579,6 +630,8 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (gated.length > 0) {
 				const label = `${event.toolName} → ${gated.join(", ")}`;
+				// Unattended: auto-reject instead of showing a dialog that would hang forever.
+				if (state.unattendedMode) return { block: true, reason: `Unattended mode (user is away): permission request auto-rejected (${label}). Choose an in-project alternative or skip this action, and note it in your final report.` };
 				// #7: one tailored question per group of targets sharing the same existing setting
 				for (const group of groupGated(gated, state)) {
 					const savable = group.paths.filter((s) => s !== "../…");
@@ -595,8 +648,9 @@ export default function (pi: ExtensionAPI) {
 							? savable.length > 0
 									? ["Allow once", "Always allow here (full access, saved)", "Read-only here (writes still ask, saved)", "No — block"]
 									: ["Allow once", "No — block"]
+							// #14/#15: reads offer a saved read-only grant; full access must be chosen explicitly
 							: savable.length > 0
-								? ["Allow once", "Always allow here (saved)", "No — block"]
+								? ["Allow once", "Read-only here (writes still ask, saved)", "Full access here (read + write, saved)", "No — block"]
 								: ["Allow once", "No — block"];
 					const tag = group.kind === "ro" ? "read-only — writes ask" : "no grant";
 					const targetLines = group.paths.length === 1
@@ -604,7 +658,12 @@ export default function (pi: ExtensionAPI) {
 						: [`${group.kind === "ro" ? "Targets (currently read-only):" : "Targets (no existing grant):"}`, ...group.paths.map((s) => `  - ${s}`)];
 					const consequence = group.kind === "ro"
 						? savable.length > 0 ? `"Upgrade to full access" saves full access for every target above.` : ""
-						: isWrite && savable.length > 0 ? `This is a WRITE — "read-only here" will keep asking for writes.` : "";
+						: isWrite && savable.length > 0
+							? `This is a WRITE — "read-only here" will keep asking for writes.`
+							// #15: make the weight of a full-access grant from a READ prompt explicit
+							: !isWrite && savable.length > 0
+								? `"Full access here" also allows writes without asking — pick "Read-only here" if reads are all you need.`
+								: "";
 					const body = [`Tool:     ${event.toolName}`, ...targetLines, `Project:  ${cwd}`, consequence]
 						.filter((l) => l !== "")
 						.join("\n");
@@ -626,7 +685,9 @@ export default function (pi: ExtensionAPI) {
 							state.readOnlyPaths = state.readOnlyPaths.filter((r) => !state.allowedPaths.some((a) => grantCovers(a, r)));
 							ctx.ui.notify(group.kind === "ro"
 								? `Upgraded to full access (was read-only): ${savable.join(", ")}`
-								: `Always allowed (full access): ${savable.join(", ")}`, "info");
+								: isWrite
+									? `Always allowed (full access): ${savable.join(", ")}`
+									: `Full access granted (reads AND writes): ${savable.join(", ")}`, "info");
 						} else {
 							for (const s of savable) if (!state.readOnlyPaths.includes(s)) state.readOnlyPaths.push(s);
 							ctx.ui.notify(`Read-only granted: ${savable.join(", ")} (reads free, writes still ask)`, "info");
@@ -652,6 +713,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (flagged.length > 0) {
 					const label = `git push → ${flagged.join(", ")}`;
+					// Unattended: auto-reject instead of showing a dialog that would hang forever.
+					if (state.unattendedMode) return { block: true, reason: `Unattended mode (user is away): push to protected branch auto-rejected (${label}). Commit locally on a feature branch instead and note it in your final report.` };
 					const body = `Branches: ${flagged.join(", ")}\nCommand:  ${command}`;
 					const decision = await ask(
 						ctx,
@@ -672,15 +735,22 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	});
 
-	// ── planning mode: one-line frame on every user message (full rules live in the /plan on injection) ──
+	// ── planning mode + unattended mode: frame(s) on every user message (full rules live in the command injections) ──
 	pi.on("input", async (event, _ctx) => {
 		if (event.source === "extension" || event.text.startsWith("/")) return { action: "continue" };
 		const state = loadState();
-		if (!state.planMode) return { action: "continue" };
-		const file = state.planFile ?? "(no plan file bound — run /plan on)";
+		const frames: string[] = [];
+		if (state.planMode) {
+			const file = state.planFile ?? "(no plan file bound — run /plan on)";
+			frames.push(`[PLAN MODE] Planning mode is on. Refine the plan at ${file} only; do not implement anything else. /plan approve to finish.`);
+		}
+		if (state.unattendedMode) {
+			frames.push("[UNATTENDED MODE] The user is away and wants you to do as much useful work as possible without waiting for input. Any request for permission, confirmation or a decision will be AUTO-REJECTED — never block on one; pick the safest reasonable option, state your assumption, and collect all such decisions in a \"Decisions made while unattended\" section of your final report. When you run out of safe work, end your turn with a summary instead of waiting.");
+		}
+		if (frames.length === 0) return { action: "continue" };
 		return {
 			action: "transform",
-			text: `[PLAN MODE] Planning mode is on. Refine the plan at ${file} only; do not implement anything else. /plan approve to finish.\n\nUser message:\n${event.text}`,
+			text: `${frames.join("\n\n")}\n\nUser message:\n${event.text}`,
 		};
 	});
 
@@ -826,6 +896,10 @@ export default function (pi: ExtensionAPI) {
 			if (!file || !fs.existsSync(file)) {
 				return { content: [{ type: "text", text: `Plan file missing (${file ?? "unbound"}) — write the plan there first, then call finish_plan again.` }], details: undefined };
 			}
+			// Unattended: auto-reject instead of showing a dialog that would hang forever.
+			if (state.unattendedMode) {
+				return { content: [{ type: "text", text: "Plan approval was auto-rejected (user is away, unattended mode). Do NOT call finish_plan again while unattended mode is active and do NOT implement. End your turn with a concise summary of the plan so the user can approve when back." }], details: undefined };
+			}
 			if (!ctx.hasUI) {
 				return { content: [{ type: "text", text: `No interactive UI available. Ask the user to run: /plan approve ${file}` }], details: undefined };
 			}
@@ -849,8 +923,40 @@ export default function (pi: ExtensionAPI) {
 			saveState(state);
 			applyTitle(ctx, state);
 			ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
-			pi.sendUserMessage(implementationInstruction(file), { deliverAs: "followUp" });
-			return { content: [{ type: "text", text: "Plan approved — implementation has been started; begin with step 1." }], details: undefined };
+			// #10: no queued follow-up — the instruction goes into the tool result so the model
+			// implements in the SAME turn. A queued message would land later as a stale duplicate.
+			return { content: [{ type: "text", text: implementationInstruction(file) }], details: undefined };
+		},
+	});
+
+	// ── /away command (unattended mode) ──
+	pi.registerCommand("away", {
+		description: "Unattended mode: /away [instruction] turns it on (dialogs auto-rejected), bare /away turns it off",
+		handler: async (args, ctx) => {
+			const state = loadState();
+			const instruction = (args ?? "").trim();
+			if (!instruction && state.unattendedMode) {
+				state.unattendedMode = false;
+				state.unattendedSessionId = null;
+				saveState(state);
+				applyTitle(ctx, state);
+				ctx.ui.notify("🌙 Unattended mode OFF — normal operation (dialogs ask again).", "info");
+				return;
+			}
+			if (!instruction) {
+				ctx.ui.notify("Unattended mode is already OFF. /away [instruction] to start working while you're away.", "info");
+				return;
+			}
+			if (!state.unattendedMode) {
+				state.unattendedMode = true;
+				state.unattendedSessionId = ctx.sessionManager.getSessionId();
+				saveState(state);
+				applyTitle(ctx, state);
+				ctx.ui.notify("🌙 Unattended mode ON — all confirmation dialogs auto-rejected until /away or a new session.", "info");
+			} else {
+				ctx.ui.notify("Already unattended — sending your instruction.", "info");
+			}
+			pi.sendUserMessage(instruction, { deliverAs: "followUp" });
 		},
 	});
 
@@ -866,12 +972,14 @@ export default function (pi: ExtensionAPI) {
 				[
 					`🛡️ Guards (${STATE_FILE})`,
 					`  yolo    : ${state.yoloMode ? "🔥 ON (sandbox silenced)" : "off"}`,
+					`  unattended: ${state.unattendedMode ? "🌙 ON (dialogs auto-rejected, per-session)" : "off"}`,
 					`  plan    : ${state.planMode ? `📋 ON (${state.planFile ?? "no file bound"})` : "off"}`,
 					`  sandbox : ${state.sandboxEnabled ? "ON " : "OFF"}`,
 					`  push    : ${state.pushGuardEnabled ? "ON " : "OFF"}`,
 					`  allowed paths  : ${state.allowedPaths.length ? state.allowedPaths.join(", ") : "(none)"}`,
 					`  read-only paths : ${state.readOnlyPaths.length ? state.readOnlyPaths.join(", ") : "(none)"}`,
 					`  allowed branches: ${state.allowedBranches.length ? state.allowedBranches.join(", ") : "(none)"}`,
+					`  ⚠ heuristic guard only — for real isolation run pi in a proper sandbox (Docker/VM)`,
 				].join("\n");
 
 			switch (cmd) {
@@ -886,11 +994,13 @@ export default function (pi: ExtensionAPI) {
 					state.yoloMode = arg === "on" ? true : arg === "off" ? false : !state.yoloMode;
 					saveState(state);
 					applyTitle(ctx, state);
+					// #12: "info" (replaceable status line) for both directions — a "warning"
+					// notification is a permanent chat line that never gets cleared on exit.
 					ctx.ui.notify(
 						state.yoloMode
 							? "🔥 YOLO mode ON — path sandbox silenced (push guard still active). /guards yolo off to exit."
 							: "YOLO mode off — guards fully active.",
-						state.yoloMode ? "warning" : "info",
+						"info",
 					);
 					break;
 				}

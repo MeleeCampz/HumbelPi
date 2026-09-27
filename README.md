@@ -4,14 +4,35 @@ Personal [pi coding agent](https://github.com/badlogic/pi-mono) setup, distribut
 [pi package](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/packages.md).
 Everything here is **extensions** — the pi installation itself is never modified.
 
+## ⚠️ The guards are not a real sandbox
+
+The path sandbox in `guards.ts` is a **heuristic**. It scans bash commands token by
+token and checks tool paths against the project root — it is a guardrail against
+accidents, **not a security boundary**.
+
+It can be bypassed, intentionally or not:
+
+- shell variables and expansion (`$HOME`, `$(…)`, backticks), encoded or indirect
+  commands, and anything that builds a path at runtime;
+- creating a brand-new directory tree *outside* the project (nothing exists yet,
+  so there is nothing to detect);
+- any tool or code path that isn't inspected token-by-token.
+
+**If you work with untrusted content, very capable models, or unattended runs —
+run pi inside a proper sandbox:** a Docker container, a VM, a devcontainer, or at
+least strict OS-level user/permissions. The guards then become a second layer of
+convenience on top of a real boundary, not the boundary itself.
+
 ## What's inside
 
 ```
 extensions/
-  guards.ts        sandbox + git-push guard, yolo mode, planning mode (/plan on [task]),
-                   per-group permission dialogs, custom footer (perf stats), title sync
+  guards.ts        sandbox + git-push guard, yolo mode, unattended mode (/away [instruction]),
+                   planning mode (/plan on [task]), per-group permission dialogs,
+                   custom footer (perf stats), title sync
   backlog.ts       /backlog checklist: multi-select + actions (plan/implement/done/delete/clear)
-  perf-stats.ts    tok/s + TTFT + prompt-eval measured client-side, shown in the footer
+  perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
+  working-task.ts  working_task tool — model sets/clears the current task in the working indicator
   spellcheck.ts    spelling checks for user messages (dictionary: extensions/words-en.txt)
   web-search.ts    web search tool
   ask-user.ts      structured ask_user dialog
@@ -84,7 +105,9 @@ no post-enter confirmation: the text is sent exactly as typed.
 - Saved options persist per machine in `~/.pi/agent/guard-state.json`; "Allow once" is
   one-shot; blocking aborts the tool call immediately.
 - Honest limitation: bash commands are scanned *heuristically* for the paths they
-  touch — the sandbox is a guardrail, not a hard boundary.
+  touch — the sandbox is a guardrail, not a hard boundary. See
+  [⚠️ The guards are not a real sandbox](#-the-guards-are-not-a-real-sandbox) —
+  for real isolation, run pi in Docker/a VM.
 
 ## Push guard
 
@@ -105,6 +128,24 @@ no post-enter confirmation: the text is sent exactly as typed.
 - The state is visible at all times in the window title (`🔥 YOLO — pi — <dir>`) and
   in the `/guards` status line, so you always know it's on.
 - Toggle: `/guards yolo on | off`.
+
+## Unattended mode
+
+- For when you step away and want the agent to keep working: `/away [instruction]`
+  turns unattended mode on and immediately hands your instruction to the agent as its
+  next message. Bare `/away` turns it off.
+- While on, **every confirmation dialogue is auto-rejected instead of hanging**: the
+  sandbox path dialog, the push guard, `ask_user`, and the `finish_plan` approval all
+  decline automatically, and each rejection tells the model to pick the safest reasonable
+  option and record it in a "Decisions made while unattended" section of its final report.
+- Every user message also carries an `[UNATTENDED MODE]` frame so the model knows you are
+  away and should not wait for input — when it runs out of safe work it ends its turn
+  with a summary instead of blocking.
+- Per-session: the mode auto-clears when a different session starts (resuming the same
+  session keeps it). YOLO silencing still wins — ops yolo already silences never reach a
+  dialog and keep passing silently.
+- Visible in the window title (`🌙 AWAY — pi — <dir>`, combines with 🔥/📋), the footer
+  marker, and the `/guards` status line.
 
 ## Web search
 

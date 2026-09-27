@@ -3,7 +3,8 @@
  *
  * A plain markdown file at <project>/.pi/backlog.md where the user can jot down
  * ideas even while the agent is working. Items are numbered and timestamped,
- * with checkbox status markers: [ ] open, [~] in progress, [x] done.
+ * with checkbox status markers: [ ] open, [~] working (auto-set by the Plan /
+ * Implement actions), [x] done.
  *
  * Commands (exactly two entry points — everything else lives in the checklist UI):
  *   /backlog <idea...>     append a new item (works mid-turn, never interrupts)
@@ -152,13 +153,13 @@ function removeEntries(file: string, nums: number[]): { removed: number; missing
 }
 
 function markerLabel(m: Marker): string {
-  return m === "x" ? "done" : m === "~" ? "in progress" : "open";
+  return m === "x" ? "done" : m === "~" ? "working" : "open";
 }
 
 const USAGE = `📋 Backlog usage:
   /backlog <idea>      add an item
   /backlog             checklist → select items (plan / implement / done / delete)
-                         e/→ expand item · bottom rows: clear completed · clear all`;
+                         ← collapse / → expand item (e toggles) · bottom rows: clear completed · clear all`;
 
 // ── Checklist component (shown via ctx.ui.custom) ───────────────────────
 
@@ -188,10 +189,14 @@ function createChecklist(
       }
       if (matchesKey(data, "up") || data === "k") { cursor = Math.max(0, cursor - 1); return; }
       if (matchesKey(data, "down") || data === "j") { cursor = Math.min(totalRows - 1, cursor + 1); return; }
-      if (data === "e" || matchesKey(data, "right")) {
+      if (data === "e" || matchesKey(data, "left") || matchesKey(data, "right")) {
         const it = items[cursor];
         if (!it) return; // action rows are not expandable
-        if (expanded.has(it.num)) expanded.delete(it.num); else expanded.add(it.num);
+        // #13: ← collapse · → expand · e toggles (as before)
+        if (matchesKey(data, "left")) expanded.delete(it.num);
+        else if (matchesKey(data, "right")) expanded.add(it.num);
+        else if (expanded.has(it.num)) expanded.delete(it.num);
+        else expanded.add(it.num);
         return;
       }
       if (data === "x" || data === " ") {
@@ -204,12 +209,12 @@ function createChecklist(
     render(width: number): string[] {
       const lines: string[] = [
         theme.fg("dim", `📋 Backlog — ${items.length} item(s) · select one or more`),
-        theme.fg("dim", "↑↓/jk move · x/space select · e/→ expand · ⏎ confirm · esc cancel"),
+        theme.fg("dim", "↑↓/jk move · x/space select · ← collapse / → expand (e toggles) · ⏎ confirm · esc cancel"),
       ];
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
         const box = selected.has(it.num) ? "x" : " ";
-        const tag = it.marker === "x" ? " (done)" : it.marker === "~" ? " (in progress)" : "";
+        const tag = it.marker === "x" ? " (done)" : it.marker === "~" ? theme.fg("yellow", " 🔧 working") : "";
         const prefix = `${i === cursor ? "❯" : " "} [${box}] #${it.num} `;
         if (expanded.has(it.num)) {
           // #9: full text, word-wrapped — continuation lines align with the text column
@@ -253,7 +258,7 @@ interface CmdCtx {
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("backlog", {
-    description: "Backlog: /backlog <idea> appends an idea; bare /backlog opens the checklist (select items → plan/implement/done/delete; e/→ expand item; bottom rows clear done/all)",
+    description: "Backlog: /backlog <idea> appends an idea; bare /backlog opens the checklist (select items → plan/implement/done/delete; ← collapse / → expand, e toggles; bottom rows clear done/all)",
 
     async handler(target: string, ctx: CmdCtx) {
       const file = backlogPath(ctx.cwd);
@@ -267,7 +272,7 @@ export default function (pi: ExtensionAPI) {
       const sendReference = (nums: number[]): void => {
         const lines = nums.map(entryRefLine);
         pi.sendUserMessage(
-          `Backlog reference — work on these item(s):\n${lines.join("\n")}\nWhen you start one, mark it [~] in .pi/backlog.md; when finished, mark it [x].`,
+          `Backlog reference — work on these item(s) (already marked working in .pi/backlog.md):\n${lines.join("\n")}\nWhen you finish one, mark it [x] in .pi/backlog.md.`,
           { deliverAs: "followUp" },
         );
       };
@@ -349,8 +354,12 @@ export default function (pi: ExtensionAPI) {
 
         // options carry emoji prefixes — match on the keyword, not the prefix
         if (action.includes("Plan")) {
+          const mark = setMarkers(file, selected, "~");
+          if (mark.changed > 0) ctx.ui.notify(`🔧 Marked ${mark.changed} item(s) working`, "info");
           await doPlan(selected);
         } else if (action.includes("Implement")) {
+          const mark = setMarkers(file, selected, "~");
+          if (mark.changed > 0) ctx.ui.notify(`🔧 Marked ${mark.changed} item(s) working`, "info");
           sendReference(selected);
         } else if (action.includes("Mark done")) {
           const { changed, missing } = setMarkers(file, selected, "x");

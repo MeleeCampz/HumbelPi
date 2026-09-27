@@ -2,6 +2,6 @@
   "name": "humbel-pi",
   "version": "0.1.0",
   "private": true,
-  "description": "Humbel's personal pi coding agent setup: global extensions (guards/sandbox, backlog checklist, perf stats, spellcheck, web search, ask-user).",
+  "description": "Humbel's personal pi coding agent setup: global extensions (guards/sandbox, backlog checklist, perf stats, working-task indicator, spellcheck, web search, ask-user).",
   "keywords": ["pi-package"]
 }
