@@ -3,7 +3,8 @@
  *
  * A plain markdown file at <project>/.pi/backlog.md where the user can jot down
  * ideas even while the agent is working. Items are numbered and timestamped,
- * with checkbox status markers: [ ] open, [~] in progress, [x] done.
+ * with checkbox status markers: [ ] open, [~] working (auto-set by the Plan /
+ * Implement actions), [x] done.
  *
  * Commands (exactly two entry points — everything else lives in the checklist UI):
  *   /backlog <idea...>     append a new item (works mid-turn, never interrupts)
@@ -152,7 +153,7 @@ function removeEntries(file: string, nums: number[]): { removed: number; missing
 }
 
 function markerLabel(m: Marker): string {
-  return m === "x" ? "done" : m === "~" ? "in progress" : "open";
+  return m === "x" ? "done" : m === "~" ? "working" : "open";
 }
 
 const USAGE = `📋 Backlog usage:
@@ -213,7 +214,7 @@ function createChecklist(
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
         const box = selected.has(it.num) ? "x" : " ";
-        const tag = it.marker === "x" ? " (done)" : it.marker === "~" ? " (in progress)" : "";
+        const tag = it.marker === "x" ? " (done)" : it.marker === "~" ? theme.fg("yellow", " 🔧 working") : "";
         const prefix = `${i === cursor ? "❯" : " "} [${box}] #${it.num} `;
         if (expanded.has(it.num)) {
           // #9: full text, word-wrapped — continuation lines align with the text column
@@ -271,7 +272,7 @@ export default function (pi: ExtensionAPI) {
       const sendReference = (nums: number[]): void => {
         const lines = nums.map(entryRefLine);
         pi.sendUserMessage(
-          `Backlog reference — work on these item(s):\n${lines.join("\n")}\nWhen you start one, mark it [~] in .pi/backlog.md; when finished, mark it [x].`,
+          `Backlog reference — work on these item(s) (already marked working in .pi/backlog.md):\n${lines.join("\n")}\nWhen you finish one, mark it [x] in .pi/backlog.md.`,
           { deliverAs: "followUp" },
         );
       };
@@ -353,8 +354,12 @@ export default function (pi: ExtensionAPI) {
 
         // options carry emoji prefixes — match on the keyword, not the prefix
         if (action.includes("Plan")) {
+          const mark = setMarkers(file, selected, "~");
+          if (mark.changed > 0) ctx.ui.notify(`🔧 Marked ${mark.changed} item(s) working`, "info");
           await doPlan(selected);
         } else if (action.includes("Implement")) {
+          const mark = setMarkers(file, selected, "~");
+          if (mark.changed > 0) ctx.ui.notify(`🔧 Marked ${mark.changed} item(s) working`, "info");
           sendReference(selected);
         } else if (action.includes("Mark done")) {
           const { changed, missing } = setMarkers(file, selected, "x");
