@@ -214,7 +214,7 @@ function createChecklist(
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
         const box = selected.has(it.num) ? "x" : " ";
-        const tag = it.marker === "x" ? " (done)" : it.marker === "~" ? theme.fg("yellow", " 🔧 working") : "";
+        const tag = it.marker === "x" ? " (done)" : it.marker === "~" ? theme.fg("warning", " 🔧 working") : "";
         const prefix = `${i === cursor ? "❯" : " "} [${box}] #${it.num} `;
         if (expanded.has(it.num)) {
           // #9: full text, word-wrapped — continuation lines align with the text column
