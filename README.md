@@ -4,6 +4,25 @@ Personal [pi coding agent](https://github.com/badlogic/pi-mono) setup, distribut
 [pi package](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/packages.md).
 Everything here is **extensions** — the pi installation itself is never modified.
 
+## ⚠️ The guards are not a real sandbox
+
+The path sandbox in `guards.ts` is a **heuristic**. It scans bash commands token by
+token and checks tool paths against the project root — it is a guardrail against
+accidents, **not a security boundary**.
+
+It can be bypassed, intentionally or not:
+
+- shell variables and expansion (`$HOME`, `$(…)`, backticks), encoded or indirect
+  commands, and anything that builds a path at runtime;
+- creating a brand-new directory tree *outside* the project (nothing exists yet,
+  so there is nothing to detect);
+- any tool or code path that isn't inspected token-by-token.
+
+**If you work with untrusted content, very capable models, or unattended runs —
+run pi inside a proper sandbox:** a Docker container, a VM, a devcontainer, or at
+least strict OS-level user/permissions. The guards then become a second layer of
+convenience on top of a real boundary, not the boundary itself.
+
 ## What's inside
 
 ```
@@ -86,7 +105,9 @@ no post-enter confirmation: the text is sent exactly as typed.
 - Saved options persist per machine in `~/.pi/agent/guard-state.json`; "Allow once" is
   one-shot; blocking aborts the tool call immediately.
 - Honest limitation: bash commands are scanned *heuristically* for the paths they
-  touch — the sandbox is a guardrail, not a hard boundary.
+  touch — the sandbox is a guardrail, not a hard boundary. See
+  [⚠️ The guards are not a real sandbox](#-the-guards-are-not-a-real-sandbox) —
+  for real isolation, run pi in Docker/a VM.
 
 ## Push guard
 

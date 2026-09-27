@@ -5,7 +5,16 @@
  *
  * 1. Path sandbox   — tool calls touching paths outside the current project
  *                      (ctx.cwd) ask first. Bash commands are heuristically
- *                      scanned for absolute / escaping paths.
+ *                      scanned for absolute / escaping paths. Heuristics (#12):
+ *                        • on Windows a single-segment bare token (/async, /help)
+ *                          is a CLI argument, not a path — never flagged;
+ *                        • outside candidates are only flagged when the path or an
+ *                          ancestor directory exists on disk (unmounted drives and
+ *                          garbage tokens pass silently);
+ *                        • known limitation: creating a brand-new directory tree
+ *                          OUTSIDE the project is not flagged (nothing exists yet).
+ *                      This is a guardrail, NOT a security boundary — for real
+ *                      isolation run pi in a proper sandbox (Docker/VM/devcontainer).
  *                      Two grant tiers:
  *                        • allowedPaths   — full access, never asks (read + write)
  *                        • readOnlyPaths  — reads pass silently; writes/edits/
@@ -242,9 +251,28 @@ function tokenPath(tok: string, cwd: string): string | null {
 		if (SYSTEM_ROOTS.test(t)) return null; // /tmp, /usr, … — harmless system dirs
 		const m = t.match(/^\/([A-Za-z])([\\/].+)$/);
 		if (m) return resolveProjectPath(m[1].toUpperCase() + ":/" + m[2].slice(1), cwd); // Git Bash /c/Users/… → C:/Users/…
+		// #12: on Windows a single-segment bare token like /async is a CLI argument,
+		// not a path — Node would resolve it to C:\\async and flag it as outside.
+		if (process.platform === "win32" && !t.slice(1).includes("/") && !t.slice(1).includes("\\")) return null;
 		return resolveProjectPath(t, cwd);
 	}
 	return null; // relative — stays in the project unless it contains .. (caller checks)
+}
+
+/**
+ * #12: true when the target or any ancestor directory exists on disk.
+ * Used to drop outside-project candidates that refer to nothing real
+ * (unmounted drives, garbage multi-segment tokens). Bounded walk up to root.
+ */
+function pathPlausiblyExists(target: string): boolean {
+	let p = target;
+	for (let i = 0; i < 24; i++) {
+		try { if (fs.existsSync(p)) return true; } catch { /* keep walking */ }
+		const parent = path.dirname(p);
+		if (parent === p) return false; // reached the root
+		p = parent;
+	}
+	return false;
 }
 
 /** Heuristic: find paths referenced by a shell command that leave the project. */
@@ -258,7 +286,9 @@ export function suspiciousPathsInCommand(command: string, cwd: string): string[]
 			continue;
 		}
 		const p = tokenPath(tok, cwd);
-		if (p !== null && isOutside(p, cwd)) outside.add(p);
+		// #12: only flag outside candidates that plausibly exist on disk —
+		// new files inside an existing outside dir still trip this (parent exists).
+		if (p !== null && isOutside(p, cwd) && pathPlausiblyExists(p)) outside.add(p);
 	}
 	return [...outside];
 }
@@ -949,6 +979,7 @@ export default function (pi: ExtensionAPI) {
 					`  allowed paths  : ${state.allowedPaths.length ? state.allowedPaths.join(", ") : "(none)"}`,
 					`  read-only paths : ${state.readOnlyPaths.length ? state.readOnlyPaths.join(", ") : "(none)"}`,
 					`  allowed branches: ${state.allowedBranches.length ? state.allowedBranches.join(", ") : "(none)"}`,
+					`  ⚠ heuristic guard only — for real isolation run pi in a proper sandbox (Docker/VM)`,
 				].join("\n");
 
 			switch (cmd) {
