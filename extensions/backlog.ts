@@ -289,7 +289,7 @@ export default function (pi: ExtensionAPI) {
         let justTurnedOn = false;
         if (!ss.planMode) {
           // #1: fresh read-modify-write — never save a snapshot taken before the check above.
-          const saved = updateSessionState(s => {
+          const saved = updateSessionState(sid, s => {
             if (!s.planFile) {
               s.planFile = defaultPlanFile(ctx.cwd);
               fs.mkdirSync(path.dirname(s.planFile), { recursive: true });

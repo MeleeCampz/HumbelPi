@@ -769,7 +769,7 @@ export default function (pi: ExtensionAPI) {
 						}
 						break;
 					}
-					const savedOn = updateSessionState(s => {
+					const savedOn = updateSessionState(sid, s => {
 						if (!s.planFile) {
 							s.planFile = defaultPlanFile(ctx.cwd);
 							fs.mkdirSync(path.dirname(s.planFile), { recursive: true });
@@ -789,7 +789,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "off":
-					updateSessionState(s => { s.planMode = false; });
+					updateSessionState(sid, s => { s.planMode = false; });
 					applyTitle(ctx);
 					ctx.ui.notify("Planning mode OFF — normal operation (implementation allowed).", "info");
 					break;
@@ -804,7 +804,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`Plan file not found: ${file}\nUsage: /plan approve [path/to/plan.md]`, "warning");
 						break;
 					}
-					updateSessionState(s => { s.planMode = false; s.planFile = null; });
+					updateSessionState(sid, s => { s.planMode = false; s.planFile = null; });
 					verifyPlanModeOff(ctx, sid);
 					applyTitle(ctx);
 					ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
@@ -838,7 +838,7 @@ export default function (pi: ExtensionAPI) {
 						break;
 					}
 					if (ss.planMode) {
-						updateSessionState(s => { s.planMode = false; s.planFile = null; });
+						updateSessionState(sid, s => { s.planMode = false; s.planFile = null; });
 						verifyPlanModeOff(ctx, sid);
 						applyTitle(ctx);
 					}
@@ -904,7 +904,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				return { content: [{ type: "text", text: "The user wants to keep planning. Do NOT implement. Wait for their feedback, revise the plan file, and call finish_plan again when ready." }], details: undefined };
 			}
-			updateSessionState(s => { s.planMode = false; s.planFile = null; });
+			updateSessionState(sid, s => { s.planMode = false; s.planFile = null; });
 			verifyPlanModeOff(ctx, sid);
 			applyTitle(ctx);
 			ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
@@ -922,7 +922,7 @@ export default function (pi: ExtensionAPI) {
 			const ss = loadSessionState(sid);
 			const instruction = (args ?? "").trim();
 			if (!instruction && ss.unattendedMode) {
-				updateSessionState(s => { s.unattendedMode = false; });
+				updateSessionState(sid, s => { s.unattendedMode = false; });
 				applyTitle(ctx);
 				ctx.ui.notify("🌙 Unattended mode OFF — normal operation (dialogs ask again).", "info");
 				return;
@@ -932,7 +932,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (!ss.unattendedMode) {
-				updateSessionState(s => { s.unattendedMode = true; });
+				updateSessionState(sid, s => { s.unattendedMode = true; });
 				applyTitle(ctx);
 				ctx.ui.notify("🌙 Unattended mode ON (this console) — all confirmation dialogs auto-rejected until /away or a new session.", "info");
 			} else {
@@ -976,7 +976,7 @@ export default function (pi: ExtensionAPI) {
 				case "yolo": {
 					const arg = (rest[0] ?? "").toLowerCase();
 					const next = arg === "on" ? true : arg === "off" ? false : !ss.yoloMode;
-					updateSessionState(s => { s.yoloMode = next; });
+					updateSessionState(sid, s => { s.yoloMode = next; });
 					applyTitle(ctx);
 					// #12: "info" (replaceable status line) for both directions — a "warning"
 					// notification is a permanent chat line that never gets cleared on exit.
