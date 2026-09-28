@@ -115,6 +115,8 @@ export interface GuardState {
 	allowedPaths: string[];
 	readOnlyPaths: string[];
 	allowedBranches: string[];
+	/** Shift-select in the input editor (select-editor.ts). Defaults ON. */
+	selectionMode?: boolean;
 }
 
 export const DEFAULT_GUARD_STATE: GuardState = {
@@ -123,6 +125,7 @@ export const DEFAULT_GUARD_STATE: GuardState = {
 	allowedPaths: [],
 	readOnlyPaths: [],
 	allowedBranches: [],
+	selectionMode: true,
 };
 
 /** Fresh read of the global guard state — defaults when missing or corrupt. Never cached. */

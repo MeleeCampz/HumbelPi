@@ -13,6 +13,7 @@
       "extensions/guards.ts",
       "extensions/perf-stats.ts",
       "extensions/spellcheck.ts",
+    "extensions/select-editor.ts",
       "extensions/web-search.ts",
       "extensions/working-task.ts"
     ]

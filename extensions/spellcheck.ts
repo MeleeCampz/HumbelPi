@@ -168,7 +168,7 @@ export function highlightLine(line: string, bad: Set<string>): string {
 	return out + suffix;
 }
 
-class SpellcheckEditor extends CustomEditor {
+export class SpellcheckEditor extends CustomEditor {
 	private cacheText = "\u0000";
 	private bad: Set<string> = new Set();
 
@@ -269,13 +269,22 @@ export function createSpellcheckInputDialog(
 	return new SpellcheckInputDialog(theme, title, placeholder, done);
 }
 
+// select-editor.ts is the single owner of the custom editor (it composes
+// SpellcheckEditor). Read its flag from globalThis — NOT via an import, which
+// would create a module cycle (select-editor imports this file for the class).
+const selectionEnabled = (): boolean =>
+	((globalThis as Record<string, unknown>).__humbel_pi_select as { enabled?: boolean } | undefined)?.enabled ?? false;
+
 export default function (pi: ExtensionAPI) {
 	const install = (ctx: Parameters<Parameters<ExtensionAPI["on"]>[1]>[1]) => {
 		ctx.ui.setEditorComponent((tui, theme, kb) => new SpellcheckEditor(tui, theme, kb));
 	};
 
 	pi.on("session_start", (_event, ctx) => {
-		if (STATE.enabled) install(ctx);
+		// Only install when selection is OFF — select-editor's session_start
+		// handler (idempotent, runs later in manifest order) re-applies the
+		// combined choice, so both-on converges to SelectingEditor either way.
+		if (STATE.enabled && !selectionEnabled()) install(ctx);
 	});
 
 	pi.registerCommand("spellcheck", {
@@ -284,11 +293,14 @@ export default function (pi: ExtensionAPI) {
 			const a = (args ?? "").trim();
 			if (a === "on") {
 				STATE.enabled = true;
-				install(ctx);
+				// When selection is ON the installed SelectingEditor reads STATE
+				// live on every render — no reinstall needed.
+				if (!selectionEnabled()) install(ctx);
 				ctx.ui.notify("Spellcheck highlighting: ON", "info");
 			} else if (a === "off") {
 				STATE.enabled = false;
-				ctx.ui.setEditorComponent(undefined);
+				// Same live-read logic; only drop the editor when selection is OFF.
+				if (!selectionEnabled()) ctx.ui.setEditorComponent(undefined);
 				ctx.ui.notify("Spellcheck highlighting: OFF", "info");
 			} else {
 				ctx.ui.notify(`Spellcheck highlighting: ${STATE.enabled ? "ON" : "OFF"}  (toggle with /spellcheck on|off)`, "info");
