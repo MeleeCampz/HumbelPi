@@ -156,6 +156,25 @@ export function styleColumnRange(line: string, colStart: number, colEnd: number,
 	return out;
 }
 
+/**
+ * Truncate a rendered (ANSI) line to at most maxCols VISIBLE columns, cutting
+ * only on character boundaries — never inside an escape sequence. Escape
+ * sequences are dropped (pi's truncateToWidth counts their bytes as visible
+ * width and slices by char index, which corrupts styled lines).
+ */
+export function truncateAnsi(line: string, maxCols: number): string {
+	if (maxCols <= 0) return "";
+	let out = "";
+	let col = 0;
+	for (const t of items(line)) {
+		if (t.w === 0) continue; // drop sequences — never emit dangling styles
+		if (col + t.w > maxCols) break;
+		out += t.s;
+		col += t.w;
+	}
+	return out;
+}
+
 /** Wrap flagged words in a rendered (ANSI) line with red + underline. */
 export function highlightLine(line: string, bad: Set<string>): string {
 	if (bad.size === 0) return line;

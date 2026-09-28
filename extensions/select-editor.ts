@@ -2,26 +2,36 @@
  * Select-Editor Extension (shift-based text selection in the input)
  *
  * Turns pi's DEAD Shift+arrow keys into standard text selection in the main
- * input editor, with copy to the system clipboard. Research-backed design —
- * see the approved plan for backlog #3.
+ * input editor, with copy to the system clipboard. Design mirrors the
+ * oh-my-pi reference implementation (PR #1310: "text selection — Ctrl+A,
+ * Shift+Arrow, Ctrl+C copy") adapted for use as an external extension:
+ * instead of patching core Editor internals we extend SpellcheckEditor and
+ * post-process its rendered output.
  *
  * How it works
  * - SelectingEditor extends SpellcheckEditor (so typo highlighting keeps
- *   working) and overrides handleInput/render only.
- * - Shift+Left/Right/Up/Down/Home/End (+ Ctrl+Shift word jumps) set a
- *   document-coordinate anchor, then synthesize the PLAIN movement sequence
- *   into super.handleInput() so pi's own grapheme-aware engine moves the caret.
+ *   working) and overrides handleInput/render/setText only.
+ * - Selection state: explicit selStart/selEnd document positions (reference
+ *   model), held on the instance; collapsed == no selection.
+ * - Shift+Left/Right/Up/Down/Home/End (+ Ctrl+Shift word jumps) set
+ *   selStart on first press, synthesize the PLAIN movement sequence into
+ *   super.handleInput() so pi's own grapheme-aware engine moves the caret,
+ *   then pin selEnd to the new caret.
+ * - Ctrl+A selects all (pi stock binds ctrl+a to line-start; selection mode
+ *   repurposes it, matching the reference impl — /select off restores stock).
  * - Standard editing semantics while a selection is active: typing / Backspace
- *   / Delete REPLACE the selection (range deleted in place, caret collapses to
- *   its start, then the key is processed normally). Plain arrows collapse to
- *   the edge in the pressed direction; other keys clear the selection.
+ *   / Delete REPLACE the selection (undo snapshot taken first → two-step undo,
+ *   range deleted in place, caret collapses to its start, then the key is
+ *   processed normally; Backspace/Delete are consumed). Plain arrows collapse
+ *   to the edge in the pressed direction; other keys clear the selection.
  * - Copy: Shift+Insert, Ctrl+Shift+C, or Ctrl+C while a non-collapsed
  *   selection exists (consumed — without a selection Ctrl+C falls through to
- *   pi's clear/exit, so double-Ctrl+C-to-exit is preserved). Uses pi's own
+ *   pi's app.clear, so double-Ctrl+C behavior is preserved). Uses pi's own
  *   exported copyToClipboard() (native → WSL interop → OSC 52).
  * - Visibility: the selected range is drawn with a gray background (ANSI-safe,
- *   composes with spellcheck red and the inverted cursor), plus a "⬒ N"
- *   indicator on the editor's bottom border.
+ *   composes with spellcheck red and the inverted cursor — unlike the
+ *   reference's reverse video, which double-inverts under the caret), plus a
+ *   "⬒ N" indicator on the editor's bottom border.
  *
  * Editor ownership
  * spellcheck.ts ALSO installs a custom editor. Two owners would clobber each
@@ -37,8 +47,8 @@
  */
 
 import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { SpellcheckEditor, styleColumnRange } from "./spellcheck";
+import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
+import { SpellcheckEditor, styleColumnRange, truncateAnsi } from "./spellcheck";
 import { loadGuardState, updateGuardState } from "./lib/session-state";
 
 // ── Shared state (globalThis — jiti double-instance safe) ────────────────
@@ -74,20 +84,31 @@ const SHIFT_MOVES: Array<[string, string]> = [
  * so Shift is present when ((m - 1) & 1) !== 0 (wire 2=shift, 3=alt, 4=shift+alt…).
  */
 const RAW_SHIFT_ARROW = /^\x1b\[(\d+);(\d+)([ABCDHF])$/;
-const RAW_KITTY_SHIFT_ARROW = /^\x1b\[(8592|8593|8594|8595);(\d+)u$/;
-const KITTY_ARROW_SEQ: Record<string, string> = { "8592": "\x1b[D", "8594": "\x1b[C", "8593": "\x1b[A", "8595": "\x1b[B" };
+const RAW_KITTY_SHIFT_MOVE = /^\x1b\[(8592|8593|8594|8595|8963|8964);(\d+)u$/;
+const KITTY_MOVE_SEQ: Record<string, string> = {
+	"8592": "\x1b[D", "8594": "\x1b[C", "8593": "\x1b[A", "8595": "\x1b[B",
+	"8963": "\x1b[H", "8964": "\x1b[F",
+};
+/** Kitty CSI-u for Shift+Insert (U+21E5; 57425 is pi's mapped variant). */
+const RAW_KITTY_SHIFT_INSERT = /^\x1b\[(8677|57425);(\d+)u$/;
 
 const hasShiftWireMod = (wireMod: string): boolean => ((parseInt(wireMod, 10) - 1) & 1) !== 0;
+const hasCtrlWireMod = (wireMod: string): boolean => ((parseInt(wireMod, 10) - 1) & 4) !== 0;
 
 function matchShiftMove(data: string): string | null {
 	for (const [key, seq] of SHIFT_MOVES) if (matchesKey(data, key)) return seq;
 	let m = RAW_SHIFT_ARROW.exec(data);
 	if (m && hasShiftWireMod(m[2])) {
+		// Ctrl bit + left/right → word jump (reference: shift+ctrl+arrow
+		// extends selection by words even when matchesKey is unreliable).
+		if (hasCtrlWireMod(m[2]) && (m[3] === "D" || m[3] === "C")) {
+			return m[3] === "D" ? "\x1b[1;5D" : "\x1b[1;5C";
+		}
 		const plain: Record<string, string> = { D: "\x1b[D", C: "\x1b[C", A: "\x1b[A", B: "\x1b[B", H: "\x1b[H", F: "\x1b[F" };
 		return plain[m[3]] ?? null;
 	}
-	m = RAW_KITTY_SHIFT_ARROW.exec(data);
-	if (m && hasShiftWireMod(m[2])) return KITTY_ARROW_SEQ[m[1]] ?? null;
+	m = RAW_KITTY_SHIFT_MOVE.exec(data);
+	if (m && hasShiftWireMod(m[2])) return KITTY_MOVE_SEQ[m[1]] ?? null;
 	return null;
 }
 
@@ -96,7 +117,9 @@ function matchShiftMove(data: string): string | null {
 interface DocPos { line: number; col: number }
 
 class SelectingEditor extends SpellcheckEditor {
-	private anchor: DocPos | null = null;
+	/** Explicit selection endpoints (reference model); null = no selection. */
+	private selStart: DocPos | null = null;
+	private selEnd: DocPos | null = null;
 
 	/** Caret position from the (TS-private, runtime-public) editor state. */
 	private caretPos(): DocPos | null {
@@ -113,16 +136,35 @@ class SelectingEditor extends SpellcheckEditor {
 		anyThis.tui?.requestRender?.();
 	}
 
+	private clearSelection(): void {
+		this.selStart = null;
+		this.selEnd = null;
+	}
+
 	/** Normalized (document-order) selection range, or null when none/collapsed. */
 	private normRange(): { s: DocPos; e: DocPos } | null {
-		const a = this.anchor, c = this.caretPos();
-		if (!a || !c) return null;
-		if (a.line === c.line && a.col === c.col) return null;
-		const startFirst = a.line < c.line || (a.line === c.line && a.col <= c.col);
-		return { s: startFirst ? a : c, e: startFirst ? c : a };
+		const a = this.selStart, b = this.selEnd;
+		if (!a || !b) return null;
+		const st = (this as unknown as { state?: { lines: string[] } }).state;
+		if (!st) return null;
+		// Stale-proofing: if an endpoint fell out of bounds because text
+		// changed underneath us, drop the selection rather than risk a bad edit.
+		if (a.line < 0 || b.line < 0 || a.line >= st.lines.length || b.line >= st.lines.length) return null;
+		if (a.line === b.line && a.col === b.col) return null;
+		const startFirst = a.line < b.line || (a.line === b.line && a.col <= b.col);
+		return { s: startFirst ? a : b, e: startFirst ? b : a };
 	}
 
 	private hasSelection(): boolean { return this.normRange() !== null; }
+
+	/** Select the whole document (caret stays in place). */
+	private selectAll(): void {
+		const st = (this as unknown as { state?: { lines: string[] } }).state;
+		if (!st || st.lines.length === 0) return;
+		this.selStart = { line: 0, col: 0 };
+		const last = st.lines.length - 1;
+		this.selEnd = { line: last, col: (st.lines[last] ?? "").length };
+	}
 
 	/** Selected text in document order, or null when no/collapsed selection. */
 	getSelectedText(): string | null {
@@ -151,7 +193,14 @@ class SelectingEditor extends SpellcheckEditor {
 	/** Printable char / Backspace / Delete — the keys that edit text in place. */
 	private isEditingKey(data: string): boolean {
 		if (matchesKey(data, "backspace") || matchesKey(data, "delete")) return true;
-		return data.length === 1 && data.charCodeAt(0) >= 32;
+		// Single printable code point (astral-safe: emoji are 2 UTF-16 units).
+		const cps = [...data];
+		return cps.length === 1 && cps[0]!.charCodeAt(0) >= 32;
+	}
+
+	private isRawShiftInsert(data: string): boolean {
+		const m = RAW_KITTY_SHIFT_INSERT.exec(data);
+		return !!m && hasShiftWireMod(m[2]!);
 	}
 
 	/** Delete the active selection in place; caret collapses to its start. */
@@ -160,6 +209,10 @@ class SelectingEditor extends SpellcheckEditor {
 		if (!rng) return false;
 		const st = (this as unknown as { state?: { lines: string[] } }).state;
 		if (!st) return false;
+		// Undo snapshot BEFORE mutating (UndoStack clones on push): replace-on-
+		// type then gives two-step undo — first ctrl+z restores the deleted
+		// range, second restores everything (VS Code semantics).
+		try { (this as unknown as { pushUndoSnapshot?: () => void }).pushUndoSnapshot?.(); } catch { /* older pi — ignore */ }
 		const { s, e } = rng;
 		if (s.line === e.line) {
 			const ln = st.lines[s.line] ?? "";
@@ -169,7 +222,7 @@ class SelectingEditor extends SpellcheckEditor {
 			const tail = (st.lines[e.line] ?? "").slice(e.col);
 			st.lines.splice(s.line, e.line - s.line + 1, head + tail);
 		}
-		this.anchor = null;
+		this.clearSelection();
 		this.setCaret(s);
 		return true;
 	}
@@ -178,16 +231,24 @@ class SelectingEditor extends SpellcheckEditor {
 		// Copy keys — only with a live selection.
 		if (this.hasSelection()) {
 			const text = this.getSelectedText();
-			if (text !== null && (matchesKey(data, "shift+insert") || matchesKey(data, "ctrl+shift+c"))) {
+			if (text !== null && (matchesKey(data, "shift+insert") || matchesKey(data, "ctrl+shift+c") || this.isRawShiftInsert(data))) {
 				void this.copySelected(text);
 				return;
 			}
 			// Ctrl+C with an active selection copies and is consumed; without a
-			// selection it falls through to pi's clear/exit (double-Ctrl+C preserved).
+			// selection it falls through to pi's app.clear (double-Ctrl+C preserved).
 			if (matchesKey(data, "ctrl+c")) {
 				void this.copySelected(text);
 				return;
 			}
+		}
+
+		// Ctrl+A — select all. Pi stock binds ctrl+a to line-start; selection
+		// mode repurposes it (reference impl). Raw \x01 covers terminals that
+		// send the plain control byte.
+		if (matchesKey(data, "ctrl+a") || data === "\u0001") {
+			this.selectAll();
+			return;
 		}
 
 		// Standard editing semantics with an active selection: typing / Backspace
@@ -203,31 +264,36 @@ class SelectingEditor extends SpellcheckEditor {
 		// Shift-movement: start the selection, then let pi move the caret.
 		const plain = matchShiftMove(data);
 		if (plain !== null) {
-			if (!this.anchor) this.anchor = this.caretPos();
+			if (!this.selStart) this.selStart = this.caretPos();
+			const before = this.getText();
 			super.handleInput(plain);
+			// If the key replaced the text instead of moving the caret (up/down
+			// trigger pi's history navigation at line boundaries), the endpoints
+			// are meaningless — drop the selection (reference-impl behavior).
+			if (this.getText() !== before) this.clearSelection();
+			else this.selEnd = this.caretPos();
 			return;
 		}
 
-		// Any other key: clear the selection first…
-		if (this.anchor !== null) {
-			const a = this.anchor;
-			this.anchor = null;
-			const c = this.caretPos();
-			// …but a plain arrow collapses to the edge in the pressed direction
-			// and consumes the key (reference-impl policy).
-			if (c) {
-				const dirLeft = matchesKey(data, "left") || matchesKey(data, "up") || matchesKey(data, "home");
-				const dirRight = matchesKey(data, "right") || matchesKey(data, "down") || matchesKey(data, "end");
-				if (dirLeft || dirRight) {
-					const startFirst = a.line < c.line || (a.line === c.line && a.col <= c.col);
-					const start = startFirst ? a : c, end = startFirst ? c : a;
-					this.setCaret(dirLeft ? start : end);
-					return;
-				}
-			}
+		// Any other key: a plain arrow collapses to the edge in the pressed
+		// direction and consumes the key (reference-impl policy); anything else
+		// just clears the selection and proceeds normally.
+		if (this.hasSelection()) {
+			const rng = this.normRange()!;
+			this.clearSelection();
+			const dirLeft = matchesKey(data, "left") || matchesKey(data, "up") || matchesKey(data, "home");
+			const dirRight = matchesKey(data, "right") || matchesKey(data, "down") || matchesKey(data, "end");
+			if (dirLeft) { this.setCaret(rng.s); return; }
+			if (dirRight) { this.setCaret(rng.e); return; }
 		}
 
 		super.handleInput(data);
+	}
+
+	override setText(text: string): void {
+		super.setText(text);
+		// Programmatic replace — selection endpoints may now be stale.
+		this.clearSelection();
 	}
 
 	override render(width: number): string[] {
@@ -238,11 +304,12 @@ class SelectingEditor extends SpellcheckEditor {
 
 		this.paintSelection(lines, width);
 
-		// Border indicator.
+		// Border indicator (ANSI-safe truncation — theme borders may carry
+		// escape sequences that truncateToWidth would slice through).
 		const label = ` \u2B12 ${[...text].length} `;
 		const last = lines.length - 1;
 		if (visibleWidth(lines[last]!) >= label.length) {
-			lines[last] = truncateToWidth(lines[last]!, width - label.length, "") + label;
+			lines[last] = truncateAnsi(lines[last]!, width - label.length) + label;
 		}
 		return lines;
 	}
@@ -373,7 +440,7 @@ export default function (pi: ExtensionAPI): void {
 				SELECT.enabled = true;
 				persist();
 				applyEditor(ctx);
-				ctx.ui.notify("Shift-select in input: ON  (shift+arrows select · shift+insert / ctrl+shift+c / ctrl+c copy)", "info");
+				ctx.ui.notify("Shift-select in input: ON  (shift+arrows select · ctrl+a all · shift+insert / ctrl+shift+c / ctrl+c copy)", "info");
 			} else if (a === "off") {
 				SELECT.enabled = false;
 				persist();
