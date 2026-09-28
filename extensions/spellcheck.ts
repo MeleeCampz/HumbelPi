@@ -98,6 +98,13 @@ function items(line: string): Item[] {
 				// OSC: ends with BEL or ST (ESC \)
 				while (j < line.length && line[j] !== "\x07" && !(line[j] === "\x1b" && line[j + 1] === "\\")) j++;
 				j += line[j] === "\x1b" ? 2 : 1;
+			} else if (line[j] === "_") {
+				// APC (e.g. pi's CURSOR_MARKER "\x1b_pi:c\x07"): ends with BEL or ST.
+				// MUST stay one atomic token — pi strips it by exact indexOf before
+				// writing, so splitting it leaks a raw BEL (terminal bell) and the
+				// embedded "pi:c" text to the screen.
+				while (j < line.length && line[j] !== "\x07" && !(line[j] === "\x1b" && line[j + 1] === "\\")) j++;
+				j += line[j] === "\x1b" ? 2 : 1;
 			} else {
 				j = i + 2; // F1/F2 or bare escape
 			}
@@ -141,6 +148,9 @@ export function styleColumnRange(line: string, colStart: number, colEnd: number,
 	let styled = false;
 	for (const t of toks) {
 		if (t.w === 0) {
+			// Close the range BEFORE the sequence: if it sits at the range end,
+			// dropping the closing SGR would leak the style to end-of-line.
+			if (styled) out += off;
 			out += t.s;
 			styled = false; // the sequence may have reset SGR state — re-assert later
 			continue;
