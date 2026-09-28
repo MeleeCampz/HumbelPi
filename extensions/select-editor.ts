@@ -38,7 +38,6 @@
 
 import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { wordWrapLine } from "@earendil-works/pi-tui/dist/components/editor.js";
 import { SpellcheckEditor, styleColumnRange } from "./spellcheck";
 import { loadGuardState, updateGuardState } from "./lib/session-state";
 
@@ -249,11 +248,46 @@ class SelectingEditor extends SpellcheckEditor {
 	}
 
 	/**
+	 * Map logical lines onto rendered layout entries by consuming the editor's
+	 * own layoutText() output — the exact layout core used this frame (same
+	 * wrap algorithm, same paste-marker-aware segmentation). Chunk texts are
+	 * exact slices that tile each wrapped line, so character ranges are
+	 * recovered by walking; any mismatch returns null (skip the paint).
+	 */
+	private buildLayoutEntries(layoutWidth: number): Array<{ lineIdx: number; s: number; e: number; text: string }> | null {
+		const host = this as unknown as { layoutText?: (w: number) => Array<{ text?: string }> };
+		const raw = typeof host.layoutText === "function" ? host.layoutText(layoutWidth) : null;
+		if (!Array.isArray(raw)) return null;
+		const entries: Array<{ lineIdx: number; s: number; e: number; text: string }> = [];
+		let j = 0;
+		for (let i = 0; i < this.state.lines.length; i++) {
+			const line = this.state.lines[i] ?? "";
+			if (visibleWidth(line) <= layoutWidth) {
+				if (j >= raw.length || (raw[j]?.text ?? "") !== line) return null;
+				entries.push({ lineIdx: i, s: 0, e: line.length, text: line });
+				j++;
+			} else {
+				let pos = 0;
+				while (pos < line.length) {
+					if (j >= raw.length) return null;
+					const t = raw[j]?.text ?? "";
+					if (t.length === 0 || !line.startsWith(t, pos)) return null;
+					entries.push({ lineIdx: i, s: pos, e: pos + t.length, text: t });
+					pos += t.length;
+					j++;
+				}
+			}
+		}
+		return j === raw.length ? entries : null;
+	}
+
+	/**
 	 * Paint the selected range with a gray background on the rendered content
-	 * lines. Re-derives pi's layout (same rules as core render: fit → 1 line,
-	 * else wordWrapLine chunks) to map document coordinates onto visible
-	 * columns; if the derivation ever drifts from what core actually rendered,
-	 * a sanity check skips the highlight for that frame (indicator still works).
+	 * lines. Maps document coordinates onto visible columns using the editor's
+	 * own layoutText() output (zero drift by construction); if the layout can't
+	 * be recovered (e.g. pi renamed layoutText) or disagrees with what core
+	 * rendered, a sanity check skips the highlight for that frame (indicator
+	 * still works).
 	 */
 	private paintSelection(lines: string[], width: number): void {
 		try {
@@ -276,20 +310,9 @@ class SelectingEditor extends SpellcheckEditor {
 			const layoutWidth = Math.max(1, contentWidth - (paddingX ? 0 : 1));
 
 			// Layout entries: one per rendered content line, with the char range
-			// of the logical line it covers.
-			interface Entry { lineIdx: number; s: number; e: number; text: string }
-			const entries: Entry[] = [];
-			for (let i = 0; i < st.lines.length; i++) {
-				const ln = st.lines[i] ?? "";
-				if (visibleWidth(ln) <= layoutWidth) {
-					entries.push({ lineIdx: i, s: 0, e: ln.length, text: ln });
-				} else {
-					for (const chunk of wordWrapLine(ln, layoutWidth)) {
-						if (!chunk) continue;
-						entries.push({ lineIdx: i, s: chunk.startIndex ?? 0, e: chunk.endIndex ?? (chunk.startIndex ?? 0), text: chunk.text });
-					}
-				}
-			}
+			// of the logical line it covers (from core's own layout this frame).
+			const entries = this.buildLayoutEntries(layoutWidth);
+			if (!entries) return;
 
 			const scrollOffset = ed.scrollOffset;
 			const visibleCount = ed.renderedVisibleLineCount;
