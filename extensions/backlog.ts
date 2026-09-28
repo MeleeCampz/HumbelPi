@@ -214,20 +214,31 @@ function createChecklist(
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
         const box = selected.has(it.num) ? "x" : " ";
-        const tag = it.marker === "x" ? " (done)" : it.marker === "~" ? theme.fg("warning", " 🔧 working") : "";
-        const prefix = `${i === cursor ? "❯" : " "} [${box}] #${it.num} `;
+        // Status glyph + color per state, placed BEFORE the text so truncation can
+        // never cut it off (the old trailing tag got clipped on long items).
+        //   ✓ done (green check, dimmed text) · ◐ working (amber) · ○ open (default)
+        const glyph = it.marker === "x" ? "✓" : it.marker === "~" ? "◐" : "○";
+        const glyphColored =
+          it.marker === "x" ? theme.fg("success", glyph)
+          : it.marker === "~" ? theme.fg("warning", glyph)
+          : glyph; // open → default color
+        const colorText = (t: string): string =>
+          it.marker === "x" ? theme.fg("dim", t)
+          : it.marker === "~" ? theme.fg("warning", t)
+          : t; // open → default color
+        const prefix = `${i === cursor ? "❯" : " "} [${box}] #${it.num} ${glyphColored} `;
         if (expanded.has(it.num)) {
           // #9: full text, word-wrapped — continuation lines align with the text column
           const indent = visibleWidth(prefix);
-          const wrapped = wrapTextWithAnsi(`${it.text}${tag}`, Math.max(10, width - indent));
+          const wrapped = wrapTextWithAnsi(it.text, Math.max(10, width - indent));
           wrapped.forEach((w, wi) => {
-            const line = wi === 0 ? prefix + w : " ".repeat(indent) + w;
-            lines.push(it.marker === "x" ? theme.fg("dim", line) : line);
+            const line = wi === 0 ? prefix + colorText(w) : " ".repeat(indent) + colorText(w);
+            lines.push(line);
           });
         } else {
-          const text = truncateToWidth(`${it.text}${tag}`, Math.max(10, width - 12));
-          const line = prefix + text;
-          lines.push(it.marker === "x" ? theme.fg("dim", line) : line);
+          // Truncate the text only — the status glyph sits before it and always survives.
+          const text = truncateToWidth(it.text, Math.max(10, width - visibleWidth(prefix)));
+          lines.push(prefix + colorText(text));
         }
       }
       lines.push(theme.fg("dim", "─".repeat(Math.max(4, Math.min(width, 60)))));
