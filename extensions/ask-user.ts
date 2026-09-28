@@ -17,12 +17,14 @@ import { createSpellcheckInputDialog } from "./spellcheck";
 
 const OTHER = "Other — I'll type my own answer";
 
-// Shared guard state (schema owner: guards.ts) — duplicated per the backlog.ts pattern.
-// Unattended mode: the user is away, so questions are auto-rejected instead of hanging.
-const GUARD_STATE_FILE = path.join(os.homedir(), ".pi", "agent", "guard-state.json");
-function isUnattended(): boolean {
+// Per-session state (schema owner: guards.ts) — duplicated per the backlog.ts pattern.
+// #4: unattended mode is per session (own file keyed by session id), so questions are
+// only auto-rejected in the console where /away was turned on.
+const SESSION_STATE_DIR = path.join(os.homedir(), ".pi", "agent", "session-state");
+function isUnattended(sessionId: string): boolean {
 	try {
-		return (JSON.parse(fs.readFileSync(GUARD_STATE_FILE, "utf8")) as { unattendedMode?: boolean }).unattendedMode === true;
+		const f = path.join(SESSION_STATE_DIR, `${sessionId.replace(/[^\w.-]/g, "_")}.json`);
+		return (JSON.parse(fs.readFileSync(f, "utf8")) as { unattendedMode?: boolean }).unattendedMode === true;
 	} catch {
 		return false;
 	}
@@ -55,7 +57,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			if (isUnattended()) {
+			if (isUnattended(ctx.sessionManager.getSessionId())) {
 				return {
 					content: [
 						{

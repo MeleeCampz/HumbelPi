@@ -28,13 +28,25 @@ const ENTRY_RE = /^- \[( |~|x)\] (\d+)\. /;
 
 // ── Shared guard state (schema owner: guards.ts) ────────────────────────
 // The "plan" action flips planning mode on, exactly like `/plan on` does.
+// #4: plan state is PER SESSION — one small file per session id (same layout as
+// guards.ts). Consoles on the same machine are independent; this only ever
+// touches the current session's file. guard-state.json itself is only probed
+// as a "guards installed" sanity check.
 const GUARD_STATE_FILE = path.join(os.homedir(), ".pi", "agent", "guard-state.json");
-interface GuardStateLite { planMode?: boolean; planFile?: string | null; planSessionId?: string | null; [k: string]: unknown; }
+function loadGuardState(): unknown { try { return JSON.parse(fs.readFileSync(GUARD_STATE_FILE, "utf8")); } catch { return null; } }
 
-function loadGuardState(): GuardStateLite | null {
-  try { return JSON.parse(fs.readFileSync(GUARD_STATE_FILE, "utf8")) as GuardStateLite; } catch { return null; }
+const SESSION_STATE_DIR = path.join(os.homedir(), ".pi", "agent", "session-state");
+interface SessionStateLite { planMode?: boolean; planFile?: string | null; unattendedMode?: boolean; [k: string]: unknown; }
+function sessionStatePath(sessionId: string): string {
+  return path.join(SESSION_STATE_DIR, `${sessionId.replace(/[^\w.-]/g, "_")}.json`);
 }
-function saveGuardState(gs: GuardStateLite): void { fs.writeFileSync(GUARD_STATE_FILE, JSON.stringify(gs)); }
+function loadSessionStateLite(sessionId: string): SessionStateLite {
+  try { return JSON.parse(fs.readFileSync(sessionStatePath(sessionId), "utf8")) as SessionStateLite; } catch { return {}; }
+}
+function saveSessionStateLite(sessionId: string, s: SessionStateLite): void {
+  fs.mkdirSync(SESSION_STATE_DIR, { recursive: true });
+  fs.writeFileSync(sessionStatePath(sessionId), JSON.stringify(s));
+}
 
 // Duplicated from guards.ts — keep in sync with sanitizeProjectName/defaultPlanFile there.
 function sanitizeProjectName(name: string): string {
@@ -290,32 +302,30 @@ export default function (pi: ExtensionAPI) {
 
       const doPlan = async (nums: number[]): Promise<void> => {
         const lines = nums.map(entryRefLine);
-        const gs = loadGuardState();
-        if (!gs) {
+        if (!loadGuardState()) {
           pi.sendUserMessage(`Planning mode is not set up on this machine — run /plan on first. Items to plan:\n${lines.join("\n")}`, { deliverAs: "followUp" });
           return;
         }
+        const sid = ctx.sessionManager.getSessionId();
+        const ss = loadSessionStateLite(sid);
         let justTurnedOn = false;
-        if (!gs.planMode) {
-          const sid = ctx.sessionManager.getSessionId();
-          if (!gs.planFile || gs.planSessionId !== sid) {
-            gs.planFile = defaultPlanFile(ctx.cwd);
-            fs.mkdirSync(path.dirname(gs.planFile), { recursive: true });
-            gs.planSessionId = sid;
+        if (!ss.planMode) {
+          if (!ss.planFile) {
+            ss.planFile = defaultPlanFile(ctx.cwd);
+            fs.mkdirSync(path.dirname(ss.planFile), { recursive: true });
           }
-          gs.planMode = true;
-          saveGuardState(gs);
+          saveSessionStateLite(sid, { ...ss, planMode: true });
           ctx.ui.setTitle(`📋 PLAN — pi — ${path.basename(ctx.cwd) || "pi"}`);
           justTurnedOn = true;
         }
         const taskList = `Your task: plan these backlog items:\n${lines.join("\n")}\nDraft the plan for them now.`;
         if (justTurnedOn) {
           pi.sendUserMessage(
-            `Planning mode is now ACTIVE. Rules: do not implement anything; the only file you may create or modify is ${gs.planFile} — write the complete plan there, replacing any stale content. Reading, web search and read-only commands are allowed. When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls. ${taskList} When the plan is complete, call the finish_plan tool with a short summary to present it for approval — don't just tell me it's done.`,
+            `Planning mode is now ACTIVE. Rules: do not implement anything; the only file you may create or modify is ${ss.planFile ?? "unbound"} — write the complete plan there, replacing any stale content. Reading, web search and read-only commands are allowed. When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls. ${taskList} When the plan is complete, call the finish_plan tool with a short summary to present it for approval — don't just tell me it's done.`,
             { deliverAs: "followUp" },
           );
         } else {
-          pi.sendUserMessage(`We are already in planning mode (pinned plan: ${gs.planFile}). ${taskList}`, { deliverAs: "followUp" });
+          pi.sendUserMessage(`We are already in planning mode (pinned plan: ${ss.planFile ?? "unbound"}). ${taskList}`, { deliverAs: "followUp" });
         }
       };
 

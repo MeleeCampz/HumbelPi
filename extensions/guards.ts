@@ -1,7 +1,8 @@
 /**
  * Guards Extension (merged: path sandbox + git push guard)
  *
- * Two guards, one state file (~/.pi/agent/guard-state.json), one command.
+ * Two guards, one global state file (~/.pi/agent/guard-state.json) plus per-session
+ * state (~/.pi/agent/session-state/<sessionId>.json — plan/unattended/yolo, #4), one command.
  *
  * 1. Path sandbox   — tool calls touching paths outside the current project
  *                      (ctx.cwd) ask first. Bash commands are heuristically
@@ -48,9 +49,13 @@
  * 4. Unattended mode — /away [instruction] | /away
  *    The user is away: every confirmation dialog (sandbox, push guard, ask_user,
  *    finish_plan) is auto-rejected instead of hanging, and each user message carries an
- *    [UNATTENDED MODE] frame telling the model to work autonomously. Per-session:
- *    auto-clears when a different session starts. YOLO silencing still wins — ops yolo
- *    already silences never reach a dialog.
+ *    [UNATTENDED MODE] frame telling the model to work autonomously. YOLO silencing still
+ *    wins — ops yolo already silences never reach a dialog.
+ *
+ * #4: planning + unattended state is PER CONSOLE/SESSION — one small file per session at
+ * ~/.pi/agent/session-state/<sessionId>.json. Consoles on the same machine are fully
+ * independent; resuming a session keeps its state, new sessions start clean. Yolo mode,
+ * sandbox grants and push-branch allowlists stay machine-global in guard-state.json.
  */
 
 import fs from "node:fs";
@@ -68,12 +73,6 @@ const PROTECTED_BRANCHES = new Set(["main", "master"]);
 interface GuardState {
 	sandboxEnabled: boolean;
 	pushGuardEnabled: boolean;
-	yoloMode: boolean;
-	planMode: boolean;
-	unattendedMode: boolean;
-	unattendedSessionId: string | null;
-	planFile: string | null;
-	planSessionId: string | null;
 	allowedPaths: string[];
 	readOnlyPaths: string[];
 	allowedBranches: string[];
@@ -82,12 +81,6 @@ interface GuardState {
 const DEFAULT_STATE: GuardState = {
 	sandboxEnabled: true,
 	pushGuardEnabled: true,
-	yoloMode: false,
-	unattendedMode: false,
-	unattendedSessionId: null,
-	planMode: false,
-	planFile: null,
-	planSessionId: null,
 	allowedPaths: [],
 	readOnlyPaths: [],
 	allowedBranches: [],
@@ -115,8 +108,62 @@ function loadState(): GuardState {
 
 function saveState(s: GuardState): void {
 	fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-	fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
+	// One-way migration (#4): plan/unattended moved to per-session files — strip the
+	// legacy keys (they may still be present on objects parsed from an old file).
+	const { planMode: _pm, planFile: _pf, planSessionId: _ps, unattendedMode: _um, unattendedSessionId: _us, yoloMode: _yo, ...clean } = s as GuardState & Record<string, unknown>;
+	fs.writeFileSync(STATE_FILE, JSON.stringify(clean, null, 2));
 	stateCache = null; // force re-read on next load
+}
+
+// ── Per-session state (plan + unattended) — #4 ────────────────────────
+// Used to live in the global guard-state.json, so every console on the machine
+// enforced other consoles' plan/unattended state. Now each session owns a small
+// file keyed by its id: consoles are independent, resuming a session keeps its
+// state, new sessions start clean.
+const SESSION_STATE_DIR = path.join(os.homedir(), ".pi", "agent", "session-state");
+interface SessionState { planMode: boolean; planFile: string | null; unattendedMode: boolean; yoloMode: boolean }
+const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false, yoloMode: false };
+
+const sessionStateCache = new Map<string, { mtimeMs: number; data: SessionState }>();
+let sessionStatePruned = false;
+
+function sessionStateFile(sessionId: string): string {
+	return path.join(SESSION_STATE_DIR, `${sessionId.replace(/[^\w.-]/g, "_")}.json`);
+}
+
+/** Delete session-state files not touched in 30 days (no session_end event to hook). */
+function pruneOldSessionState(): void {
+	if (sessionStatePruned) return;
+	sessionStatePruned = true;
+	try {
+		const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+		for (const f of fs.readdirSync(SESSION_STATE_DIR)) {
+			if (!f.endsWith(".json")) continue;
+			const p = path.join(SESSION_STATE_DIR, f);
+			try { if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p); } catch { /* keep going */ }
+		}
+	} catch { /* dir missing — nothing to prune */ }
+}
+
+function loadSessionState(sessionId: string): SessionState {
+	pruneOldSessionState();
+	const file = sessionStateFile(sessionId);
+	try {
+		const st = fs.statSync(file);
+		const cached = sessionStateCache.get(sessionId);
+		if (cached && st.mtimeMs === cached.mtimeMs) return cached.data;
+		const s = { ...DEFAULT_SESSION_STATE, ...JSON.parse(fs.readFileSync(file, "utf8")) };
+		sessionStateCache.set(sessionId, { mtimeMs: st.mtimeMs, data: s });
+		return s;
+	} catch {
+		return { ...DEFAULT_SESSION_STATE };
+	}
+}
+
+function saveSessionState(sessionId: string, s: SessionState): void {
+	fs.mkdirSync(SESSION_STATE_DIR, { recursive: true });
+	fs.writeFileSync(sessionStateFile(sessionId), JSON.stringify(s));
+	sessionStateCache.delete(sessionId); // force re-read on next load
 }
 
 // ── shell tokenization (quote/escape aware) ─────────────────────
@@ -436,10 +483,12 @@ async function pushTargets(cwd: string, rawArgs: string): Promise<string[]> {
 type Decision = "once" | "always" | "ro" | "block";
 
 /** Terminal window/tab title: guard marker always visible, no console line needed. */
-function applyTitle(ctx: ExtensionContext, state: GuardState): void {
+function applyTitle(ctx: ExtensionContext): void {
 	const dir = path.basename(ctx.cwd) || "pi";
 	// #12: 🛡️ shown in the normal state; away + yolo + plan combine instead of hiding each other.
-	const marker = [state.unattendedMode ? "🌙 AWAY" : null, state.yoloMode ? "🔥 YOLO" : null, state.planMode ? "📋 PLAN" : null].filter(Boolean).join(" · ");
+	// Away/yolo/plan are all per-session (#4).
+	const s = loadSessionState(ctx.sessionManager.getSessionId());
+	const marker = [s.unattendedMode ? "🌙 AWAY" : null, s.yoloMode ? "🔥 YOLO" : null, s.planMode ? "📋 PLAN" : null].filter(Boolean).join(" · ");
 	ctx.ui.setTitle(marker ? `${marker} — pi — ${dir}` : `🛡️ pi — ${dir}`);
 }
 
@@ -461,7 +510,8 @@ function createGuardFooter(ctx: any): (tui: any, theme: any, footerData: any) =>
 		dispose() {},
 		render(width: number): string[] {
 			const state = loadState();
-			const marker = [state.unattendedMode ? "🌙" : null, state.yoloMode ? "🔥" : null, state.planMode ? "📋" : null].filter(Boolean).join(" ") || "🛡️";
+			const ss = loadSessionState(ctx.sessionManager.getSessionId());
+			const marker = [ss.unattendedMode ? "🌙" : null, ss.yoloMode ? "🔥" : null, ss.planMode ? "📋" : null].filter(Boolean).join(" ") || "🛡️";
 
 			// --- line 1: marker + pwd (+ branch, session name) ---
 			let cwd = ctx.sessionManager.getCwd();
@@ -553,22 +603,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_e, ctx) => {
 		lastCtx = ctx;
-		const state = loadState();
-		// Plans are per-session: a fresh session must not continue an old plan.
-		if (state.planMode && state.planSessionId && state.planSessionId !== ctx.sessionManager.getSessionId()) {
-			state.planFile = null;
-			state.planSessionId = null;
-			saveState(state);
-			ctx.ui.notify("📋 Planning mode is still on, but the previous session’s plan was not carried over (plans are per-session). Give me a task and I’ll write a fresh plan.", "info");
-		}
-		// Unattended mode is per-session: a different session must not inherit it.
-		if (state.unattendedMode && state.unattendedSessionId !== ctx.sessionManager.getSessionId()) {
-			state.unattendedMode = false;
-			state.unattendedSessionId = null;
-			saveState(state);
-			ctx.ui.notify("🌙 Unattended mode was on, but it is per-session and auto-cleared for this new session. /away [instruction] to re-enable.", "info");
-		}
-		applyTitle(ctx, state);
+		// Plan/unattended state is per-session (own file keyed by session id, #4) —
+		// nothing to repair or carry over between sessions anymore.
+		applyTitle(ctx);
 		ctx.ui.setFooter(createGuardFooter(ctx));
 	});
 
@@ -576,22 +613,23 @@ export default function (pi: ExtensionAPI) {
 	// extension reset and session rename — re-apply our marker every 5 s so it stays in sync.
 	const titleTimer = setInterval(() => {
 		if (!lastCtx) return;
-		try { applyTitle(lastCtx, loadState()); } catch { /* non-interactive mode */ }
+		try { applyTitle(lastCtx); } catch { /* non-interactive mode */ }
 	}, 5000);
 	titleTimer.unref?.();
 
 	pi.on("session_info_changed", (_e, ctx) => {
 		lastCtx = ctx;
-		applyTitle(ctx, loadState());
+		applyTitle(ctx);
 	});
 
 	pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
 		const state = loadState();
+		const ss = loadSessionState(ctx.sessionManager.getSessionId());
 		const cwd = ctx.cwd;
 
-		// ── 0. planning mode: only the pinned plan file may be written ──
-		if (state.planMode) {
-			const planFile = state.planFile;
+		// ── 0. planning mode (per-session, #4): only the pinned plan file may be written ──
+		if (ss.planMode) {
+			const planFile = ss.planFile;
 			if (event.toolName === "write" || event.toolName === "edit") {
 				const p = typeof event.input?.path === "string" ? path.resolve(cwd, event.input.path) : "";
 				if (!planFile || !samePath(p, planFile)) {
@@ -610,11 +648,11 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		// ── 1. path sandbox ──
-		if (state.sandboxEnabled && !state.yoloMode) {
+		if (state.sandboxEnabled && !ss.yoloMode) {
 			let suspects: string[] = [];
 			let isWrite = false;
 			// The pinned plan file is already vetted by the planning gate — never prompt for it.
-			const planExempt = state.planMode ? state.planFile : null;
+			const planExempt = ss.planMode ? ss.planFile : null;
 			if (event.toolName === "bash") {
 				const command = (event.input.command as string) ?? "";
 				suspects = suspiciousPathsInCommand(command, cwd);
@@ -632,7 +670,7 @@ export default function (pi: ExtensionAPI) {
 			if (gated.length > 0) {
 				const label = `${event.toolName} → ${gated.join(", ")}`;
 				// Unattended: auto-reject instead of showing a dialog that would hang forever.
-				if (state.unattendedMode) return { block: true, reason: `Unattended mode (user is away): permission request auto-rejected (${label}). Choose an in-project alternative or skip this action, and note it in your final report.` };
+				if (ss.unattendedMode) return { block: true, reason: `Unattended mode (user is away): permission request auto-rejected (${label}). Choose an in-project alternative or skip this action, and note it in your final report.` };
 				// #7: one tailored question per group of targets sharing the same existing setting
 				for (const group of groupGated(gated, state)) {
 					const savable = group.paths.filter((s) => s !== "../…");
@@ -715,7 +753,7 @@ export default function (pi: ExtensionAPI) {
 				if (flagged.length > 0) {
 					const label = `git push → ${flagged.join(", ")}`;
 					// Unattended: auto-reject instead of showing a dialog that would hang forever.
-					if (state.unattendedMode) return { block: true, reason: `Unattended mode (user is away): push to protected branch auto-rejected (${label}). Commit locally on a feature branch instead and note it in your final report.` };
+					if (ss.unattendedMode) return { block: true, reason: `Unattended mode (user is away): push to protected branch auto-rejected (${label}). Commit locally on a feature branch instead and note it in your final report.` };
 					const body = `Branches: ${flagged.join(", ")}\nCommand:  ${command}`;
 					const decision = await ask(
 						ctx,
@@ -737,15 +775,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── planning mode + unattended mode: frame(s) on every user message (full rules live in the command injections) ──
-	pi.on("input", async (event, _ctx) => {
+	pi.on("input", async (event, ctx) => {
 		if (event.source === "extension" || event.text.startsWith("/")) return { action: "continue" };
-		const state = loadState();
+		const ss = loadSessionState(ctx.sessionManager.getSessionId());
 		const frames: string[] = [];
-		if (state.planMode) {
-			const file = state.planFile ?? "(no plan file bound — run /plan on)";
+		if (ss.planMode) {
+			const file = ss.planFile ?? "(no plan file bound — run /plan on)";
 			frames.push(`[PLAN MODE] Planning mode is on. Refine the plan at ${file} only; do not implement anything else. /plan approve to finish.`);
 		}
-		if (state.unattendedMode) {
+		if (ss.unattendedMode) {
 			frames.push("[UNATTENDED MODE] The user is away and wants you to do as much useful work as possible without waiting for input. Any request for permission, confirmation or a decision will be AUTO-REJECTED — never block on one; pick the safest reasonable option, state your assumption, and collect all such decisions in a \"Decisions made while unattended\" section of your final report. When you run out of safe work, end your turn with a summary instead of waiting.");
 		}
 		if (frames.length === 0) return { action: "continue" };
@@ -759,7 +797,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("plan", {
 		description: "Planning mode: /plan on [task] | off | approve [file] | implement <file> | reject [reason]",
 		handler: async (args, ctx) => {
-			const state = loadState();
+			const sid = ctx.sessionManager.getSessionId();
+			const ss = loadSessionState(sid);
 			const [cmd, ...rest] = (args ?? "").trim().split(/\s+/);
 			const target = rest.join(" ");
 
@@ -768,15 +807,15 @@ export default function (pi: ExtensionAPI) {
 				case "":
 				case "status":
 					ctx.ui.notify(
-						state.planMode
-							? `📋 Planning mode ON — plan file: ${state.planFile ?? "(unbound)"}. finish_plan or /plan approve to implement, /plan reject [reason] to revise.`
+						ss.planMode
+							? `📋 Planning mode ON (this console) — plan file: ${ss.planFile ?? "(unbound)"}. finish_plan or /plan approve to implement, /plan reject [reason] to revise.`
 							: "Planning mode OFF. Start with: /plan on [task]",
 						"info",
 					);
 					break;
 
 				case "on": {
-					if (state.planMode) {
+					if (ss.planMode) {
 						if (target) {
 							ctx.ui.notify("Already in planning mode — sending your task.", "info");
 							pi.sendUserMessage(target, { deliverAs: "followUp" });
@@ -785,58 +824,51 @@ export default function (pi: ExtensionAPI) {
 						}
 						break;
 					}
-					const sid = ctx.sessionManager.getSessionId();
-					if (!state.planFile || state.planSessionId !== sid) {
-						state.planFile = defaultPlanFile(ctx.cwd);
-						fs.mkdirSync(path.dirname(state.planFile), { recursive: true });
-						state.planSessionId = sid;
+					if (!ss.planFile) {
+						ss.planFile = defaultPlanFile(ctx.cwd);
+						fs.mkdirSync(path.dirname(ss.planFile), { recursive: true });
 					}
-					state.planMode = true;
-					saveState(state);
-					applyTitle(ctx, state);
-					ctx.ui.notify(`📋 Planning mode ON — plan file: ${state.planFile}. Reads and web search stay free; all other writes are blocked.`, "info");
+					saveSessionState(sid, { ...ss, planMode: true });
+					applyTitle(ctx);
+					ctx.ui.notify(`📋 Planning mode ON — plan file: ${ss.planFile}. Reads and web search stay free; all other writes are blocked.`, "info");
 					pi.sendUserMessage(
 						target
-							? `Planning mode is now ACTIVE. Rules: do not implement anything; the only file you may create or modify is ${state.planFile} — write the complete plan there, replacing any stale content. Reading, web search and read-only commands are allowed. When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls. Your task: ${target} — draft the plan for it now. When the plan is complete, call the finish_plan tool with a short summary to present it for approval — don't just tell me it's done.`
-							: `Planning mode is now ACTIVE. Rules: do not implement anything; the only file you may create or modify is ${state.planFile} — write the complete plan there, replacing any stale content. Reading, web search and read-only commands are allowed. When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls. Wait for my task, then draft the plan. When the plan is complete, call the finish_plan tool with a short summary to present it for approval — don't just tell me it's done.`,
+							? `Planning mode is now ACTIVE. Rules: do not implement anything; the only file you may create or modify is ${ss.planFile} — write the complete plan there, replacing any stale content. Reading, web search and read-only commands are allowed. When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls. Your task: ${target} — draft the plan for it now. When the plan is complete, call the finish_plan tool with a short summary to present it for approval — don't just tell me it's done.`
+							: `Planning mode is now ACTIVE. Rules: do not implement anything; the only file you may create or modify is ${ss.planFile} — write the complete plan there, replacing any stale content. Reading, web search and read-only commands are allowed. When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls. Wait for my task, then draft the plan. When the plan is complete, call the finish_plan tool with a short summary to present it for approval — don't just tell me it's done.`,
 						{ deliverAs: "followUp" },
 					);
 					break;
 				}
 
 				case "off":
-					state.planMode = false;
-					saveState(state);
-					applyTitle(ctx, state);
+					saveSessionState(sid, { ...ss, planMode: false });
+					applyTitle(ctx);
 					ctx.ui.notify("Planning mode OFF — normal operation (implementation allowed).", "info");
 					break;
 
 				case "approve": {
-					if (!state.planMode) {
+					if (!ss.planMode) {
 						ctx.ui.notify("Not in planning mode. /plan on first.", "warning");
 						break;
 					}
-					const file = target ? path.resolve(ctx.cwd, target) : state.planFile ?? path.join(ctx.cwd, "PLAN.md");
+					const file = target ? path.resolve(ctx.cwd, target) : ss.planFile ?? path.join(ctx.cwd, "PLAN.md");
 					if (!fs.existsSync(file)) {
 						ctx.ui.notify(`Plan file not found: ${file}\nUsage: /plan approve [path/to/plan.md]`, "warning");
 						break;
 					}
-					state.planMode = false;
-					state.planFile = null;
-					state.planSessionId = null;
-					saveState(state);
-					applyTitle(ctx, state);
+					saveSessionState(sid, { ...ss, planMode: false, planFile: null });
+					applyTitle(ctx);
 					ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
 					pi.sendUserMessage(implementationInstruction(file), { deliverAs: "followUp" });
 					break;
 				}
 
 				case "reject": {
-					if (!state.planMode) {
+					if (!ss.planMode) {
 						ctx.ui.notify("Not in planning mode.", "warning");
 						break;
 					}
-					const file = state.planFile ?? "the plan file";
+					const file = ss.planFile ?? "the plan file";
 					const feedback = target.trim();
 					ctx.ui.notify(feedback ? `📋 Plan rejected with feedback — still in planning mode.` : `📋 Plan rejected — still in planning mode. Tell me what should change (or /plan off to exit).`, "info");
 					pi.sendUserMessage(
@@ -856,12 +888,9 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`Plan file not found: ${file}`, "warning");
 						break;
 					}
-					if (state.planMode) {
-						state.planMode = false;
-						state.planFile = null;
-						state.planSessionId = null;
-						saveState(state);
-						applyTitle(ctx, state);
+					if (ss.planMode) {
+						saveSessionState(sid, { ...ss, planMode: false, planFile: null });
+						applyTitle(ctx);
 					}
 					ctx.ui.notify(`🚀 Implementing ${file} (planning mode off)`, "info");
 					pi.sendUserMessage(implementationInstruction(file), { deliverAs: "followUp" });
@@ -889,16 +918,17 @@ export default function (pi: ExtensionAPI) {
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const state = loadState();
-			if (!state.planMode) {
-				return { content: [{ type: "text", text: "Not in planning mode — run /plan on first. Do not implement." }], details: undefined };
+			const sid = ctx.sessionManager.getSessionId();
+			const ss = loadSessionState(sid);
+			if (!ss.planMode) {
+				return { content: [{ type: "text", text: "Not in planning mode (this console) — run /plan on first. Do not implement." }], details: undefined };
 			}
-			const file = state.planFile;
+			const file = ss.planFile;
 			if (!file || !fs.existsSync(file)) {
 				return { content: [{ type: "text", text: `Plan file missing (${file ?? "unbound"}) — write the plan there first, then call finish_plan again.` }], details: undefined };
 			}
 			// Unattended: auto-reject instead of showing a dialog that would hang forever.
-			if (state.unattendedMode) {
+			if (ss.unattendedMode) {
 				return { content: [{ type: "text", text: "Plan approval was auto-rejected (user is away, unattended mode). Do NOT call finish_plan again while unattended mode is active and do NOT implement. End your turn with a concise summary of the plan so the user can approve when back." }], details: undefined };
 			}
 			if (!ctx.hasUI) {
@@ -908,7 +938,7 @@ export default function (pi: ExtensionAPI) {
 			if (choice === undefined || !/approve/i.test(choice)) {
 				// #13: refusal reason inline — no extra manual turn
 				// TUI: spellchecked input dialog (same look as ctx.ui.input, live typo highlighting);
-			// non-TUI modes keep the plain built-in input.
+				// non-TUI modes keep the plain built-in input.
 			const reason = choice === undefined
 				? undefined
 				: ctx.mode === "tui"
@@ -924,11 +954,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				return { content: [{ type: "text", text: "The user wants to keep planning. Do NOT implement. Wait for their feedback, revise the plan file, and call finish_plan again when ready." }], details: undefined };
 			}
-			state.planMode = false;
-			state.planFile = null;
-			state.planSessionId = null;
-			saveState(state);
-			applyTitle(ctx, state);
+			saveSessionState(sid, { ...ss, planMode: false, planFile: null });
+			applyTitle(ctx);
 			ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
 			// #10: no queued follow-up — the instruction goes into the tool result so the model
 			// implements in the SAME turn. A queued message would land later as a stale duplicate.
@@ -940,13 +967,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("away", {
 		description: "Unattended mode: /away [instruction] turns it on (dialogs auto-rejected), bare /away turns it off",
 		handler: async (args, ctx) => {
-			const state = loadState();
+			const sid = ctx.sessionManager.getSessionId();
+			const ss = loadSessionState(sid);
 			const instruction = (args ?? "").trim();
-			if (!instruction && state.unattendedMode) {
-				state.unattendedMode = false;
-				state.unattendedSessionId = null;
-				saveState(state);
-				applyTitle(ctx, state);
+			if (!instruction && ss.unattendedMode) {
+				saveSessionState(sid, { ...ss, unattendedMode: false });
+				applyTitle(ctx);
 				ctx.ui.notify("🌙 Unattended mode OFF — normal operation (dialogs ask again).", "info");
 				return;
 			}
@@ -954,12 +980,10 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Unattended mode is already OFF. /away [instruction] to start working while you're away.", "info");
 				return;
 			}
-			if (!state.unattendedMode) {
-				state.unattendedMode = true;
-				state.unattendedSessionId = ctx.sessionManager.getSessionId();
-				saveState(state);
-				applyTitle(ctx, state);
-				ctx.ui.notify("🌙 Unattended mode ON — all confirmation dialogs auto-rejected until /away or a new session.", "info");
+			if (!ss.unattendedMode) {
+				saveSessionState(sid, { ...ss, unattendedMode: true });
+				applyTitle(ctx);
+				ctx.ui.notify("🌙 Unattended mode ON (this console) — all confirmation dialogs auto-rejected until /away or a new session.", "info");
 			} else {
 				ctx.ui.notify("Already unattended — sending your instruction.", "info");
 			}
@@ -972,15 +996,16 @@ export default function (pi: ExtensionAPI) {
 		description: "Security guards: status, toggles, path/branch allowlists (see extension header for syntax)",
 		handler: async (args, ctx) => {
 			const state = loadState();
+			const ss = loadSessionState(ctx.sessionManager.getSessionId());
 			const [cmd, ...rest] = (args ?? "").trim().split(/\s+/);
 			const target = rest.join(" ");
 
 			const statusText = () =>
 				[
 					`🛡️ Guards (${STATE_FILE})`,
-					`  yolo    : ${state.yoloMode ? "🔥 ON (sandbox silenced)" : "off"}`,
-					`  unattended: ${state.unattendedMode ? "🌙 ON (dialogs auto-rejected, per-session)" : "off"}`,
-					`  plan    : ${state.planMode ? `📋 ON (${state.planFile ?? "no file bound"})` : "off"}`,
+					`  yolo    : ${ss.yoloMode ? "🔥 ON (this console — sandbox silenced)" : "off"}`,
+					`  unattended: ${ss.unattendedMode ? "🌙 ON (this console — dialogs auto-rejected)" : "off"}`,
+					`  plan    : ${ss.planMode ? `📋 ON (this console — ${ss.planFile ?? "no file bound"})` : "off"}`,
 					`  sandbox : ${state.sandboxEnabled ? "ON " : "OFF"}`,
 					`  push    : ${state.pushGuardEnabled ? "ON " : "OFF"}`,
 					`  allowed paths  : ${state.allowedPaths.length ? state.allowedPaths.join(", ") : "(none)"}`,
@@ -998,14 +1023,14 @@ export default function (pi: ExtensionAPI) {
 
 				case "yolo": {
 					const arg = (rest[0] ?? "").toLowerCase();
-					state.yoloMode = arg === "on" ? true : arg === "off" ? false : !state.yoloMode;
-					saveState(state);
-					applyTitle(ctx, state);
+					const next = arg === "on" ? true : arg === "off" ? false : !ss.yoloMode;
+					saveSessionState(ctx.sessionManager.getSessionId(), { ...ss, yoloMode: next });
+					applyTitle(ctx);
 					// #12: "info" (replaceable status line) for both directions — a "warning"
 					// notification is a permanent chat line that never gets cleared on exit.
 					ctx.ui.notify(
-						state.yoloMode
-							? "🔥 YOLO mode ON — path sandbox silenced (push guard still active). /guards yolo off to exit."
+						next
+							? "🔥 YOLO mode ON (this console) — path sandbox silenced (push guard still active). /guards yolo off to exit."
 							: "YOLO mode off — guards fully active.",
 						"info",
 					);

@@ -71,6 +71,9 @@ no post-enter confirmation: the text is sent exactly as typed.
 
 - Enter with `/plan on [task]` — one step: opens planning mode and hands the task
   over as the plan's starting point.
+- **Per console**: plan state lives in `~/.pi/agent/session-state/<session>.json`, so
+  other pi consoles on the same machine are unaffected; resuming a session keeps its
+  plan, new sessions start clean.
 - While active, only the plan file is writable: `~/.pi/agent/plans/<project>/PLAN.md`;
   reads and searches stay free.
 - The finished plan is presented via the **finish_plan** dialog — "✅ Approve & implement"
@@ -127,7 +130,9 @@ no post-enter confirmation: the text is sent exactly as typed.
 ![Yolo mode](imgs/YoloMode.png)
 
 - 🔥 YOLO mode silences the path sandbox — tool calls no longer ask about paths
-  outside the project. The **push guard stays active**.
+  outside the project. The **push guard stays active**. Like planning and unattended
+  mode, it is **per console**: state lives in `~/.pi/agent/session-state/<session>.json`,
+  so other pi consoles on the same machine keep asking.
 - The state is visible at all times in the window title (`🔥 YOLO — pi — <dir>`) and
   in the `/guards` status line, so you always know it's on.
 - Toggle: `/guards yolo on | off`.
@@ -144,9 +149,10 @@ no post-enter confirmation: the text is sent exactly as typed.
 - Every user message also carries an `[UNATTENDED MODE]` frame so the model knows you are
   away and should not wait for input — when it runs out of safe work it ends its turn
   with a summary instead of blocking.
-- Per-session: the mode auto-clears when a different session starts (resuming the same
-  session keeps it). YOLO silencing still wins — ops yolo already silences never reach a
-  dialog and keep passing silently.
+- **Per console**: unattended state lives in `~/.pi/agent/session-state/<session>.json`,
+  so other pi consoles on the same machine are unaffected; resuming the same session
+  keeps it, new sessions start clean. YOLO silencing still wins — ops yolo already
+  silences never reach a dialog and keep passing silently.
 - Visible in the window title (`🌙 AWAY — pi — <dir>`, combines with 🔥/📋), the footer
   marker, and the `/guards` status line.
 
