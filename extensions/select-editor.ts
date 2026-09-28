@@ -11,13 +11,17 @@
  * - Shift+Left/Right/Up/Down/Home/End (+ Ctrl+Shift word jumps) set a
  *   document-coordinate anchor, then synthesize the PLAIN movement sequence
  *   into super.handleInput() so pi's own grapheme-aware engine moves the caret.
- * - Plain arrows with an active selection collapse to the edge in the pressed
- *   direction (reference-impl policy); any other key clears the selection.
+ * - Standard editing semantics while a selection is active: typing / Backspace
+ *   / Delete REPLACE the selection (range deleted in place, caret collapses to
+ *   its start, then the key is processed normally). Plain arrows collapse to
+ *   the edge in the pressed direction; other keys clear the selection.
  * - Copy: Shift+Insert, Ctrl+Shift+C, or Ctrl+C while a non-collapsed
  *   selection exists (consumed — without a selection Ctrl+C falls through to
  *   pi's clear/exit, so double-Ctrl+C-to-exit is preserved). Uses pi's own
  *   exported copyToClipboard() (native → WSL interop → OSC 52).
- * - Feedback: "⬒ N" indicator on the editor's bottom border.
+ * - Visibility: the selected range is drawn with a gray background (ANSI-safe,
+ *   composes with spellcheck red and the inverted cursor), plus a "⬒ N"
+ *   indicator on the editor's bottom border.
  *
  * Editor ownership
  * spellcheck.ts ALSO installs a custom editor. Two owners would clobber each
@@ -34,7 +38,8 @@
 
 import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { SpellcheckEditor } from "./spellcheck";
+import { wordWrapLine } from "@earendil-works/pi-tui/dist/components/editor.js";
+import { SpellcheckEditor, styleColumnRange } from "./spellcheck";
 import { loadGuardState, updateGuardState } from "./lib/session-state";
 
 // ── Shared state (globalThis — jiti double-instance safe) ────────────────
@@ -109,20 +114,24 @@ class SelectingEditor extends SpellcheckEditor {
 		anyThis.tui?.requestRender?.();
 	}
 
-	private hasSelection(): boolean {
-		const a = this.anchor, c = this.caretPos();
-		return !!(a && c && (a.line !== c.line || a.col !== c.col));
-	}
-
-	/** Selected text in document order, or null when no/collapsed selection. */
-	getSelectedText(): string | null {
+	/** Normalized (document-order) selection range, or null when none/collapsed. */
+	private normRange(): { s: DocPos; e: DocPos } | null {
 		const a = this.anchor, c = this.caretPos();
 		if (!a || !c) return null;
 		if (a.line === c.line && a.col === c.col) return null;
+		const startFirst = a.line < c.line || (a.line === c.line && a.col <= c.col);
+		return { s: startFirst ? a : c, e: startFirst ? c : a };
+	}
+
+	private hasSelection(): boolean { return this.normRange() !== null; }
+
+	/** Selected text in document order, or null when no/collapsed selection. */
+	getSelectedText(): string | null {
+		const rng = this.normRange();
+		if (!rng) return null;
 		const st = (this as unknown as { state?: { lines: string[] } }).state;
 		if (!st) return null;
-		const startFirst = a.line < c.line || (a.line === c.line && a.col <= c.col);
-		const s = startFirst ? a : c, e = startFirst ? c : a;
+		const { s, e } = rng;
 		const parts: string[] = [];
 		for (let i = s.line; i <= e.line; i++) {
 			const ln = st.lines[i] ?? "";
@@ -140,6 +149,32 @@ class SelectingEditor extends SpellcheckEditor {
 		}
 	}
 
+	/** Printable char / Backspace / Delete — the keys that edit text in place. */
+	private isEditingKey(data: string): boolean {
+		if (matchesKey(data, "backspace") || matchesKey(data, "delete")) return true;
+		return data.length === 1 && data.charCodeAt(0) >= 32;
+	}
+
+	/** Delete the active selection in place; caret collapses to its start. */
+	private deleteSelection(): boolean {
+		const rng = this.normRange();
+		if (!rng) return false;
+		const st = (this as unknown as { state?: { lines: string[] } }).state;
+		if (!st) return false;
+		const { s, e } = rng;
+		if (s.line === e.line) {
+			const ln = st.lines[s.line] ?? "";
+			st.lines[s.line] = ln.slice(0, s.col) + ln.slice(e.col);
+		} else {
+			const head = (st.lines[s.line] ?? "").slice(0, s.col);
+			const tail = (st.lines[e.line] ?? "").slice(e.col);
+			st.lines.splice(s.line, e.line - s.line + 1, head + tail);
+		}
+		this.anchor = null;
+		this.setCaret(s);
+		return true;
+	}
+
 	override handleInput(data: string): void {
 		// Copy keys — only with a live selection.
 		if (this.hasSelection()) {
@@ -154,6 +189,16 @@ class SelectingEditor extends SpellcheckEditor {
 				void this.copySelected(text);
 				return;
 			}
+		}
+
+		// Standard editing semantics with an active selection: typing / Backspace
+		// / Delete replace the selection — delete it in place, then process the
+		// key at the collapsed caret (Backspace/Delete are consumed).
+		if (this.hasSelection() && this.isEditingKey(data)) {
+			this.deleteSelection();
+			if (matchesKey(data, "backspace") || matchesKey(data, "delete")) return;
+			super.handleInput(data);
+			return;
 		}
 
 		// Shift-movement: start the selection, then let pi move the caret.
@@ -188,16 +233,87 @@ class SelectingEditor extends SpellcheckEditor {
 
 	override render(width: number): string[] {
 		const lines = super.render(width); // base + spellcheck layer
-		if (lines.length === 0) return lines;
+		if (lines.length < 3) return lines;
 		const text = this.getSelectedText();
-		if (text !== null) {
-			const label = ` \u2B12 ${[...text].length} `;
-			const last = lines.length - 1;
-			if (visibleWidth(lines[last]!) >= label.length) {
-				lines[last] = truncateToWidth(lines[last]!, width - label.length, "") + label;
-			}
+		if (text === null) return lines;
+
+		this.paintSelection(lines, width);
+
+		// Border indicator.
+		const label = ` \u2B12 ${[...text].length} `;
+		const last = lines.length - 1;
+		if (visibleWidth(lines[last]!) >= label.length) {
+			lines[last] = truncateToWidth(lines[last]!, width - label.length, "") + label;
 		}
 		return lines;
+	}
+
+	/**
+	 * Paint the selected range with a gray background on the rendered content
+	 * lines. Re-derives pi's layout (same rules as core render: fit → 1 line,
+	 * else wordWrapLine chunks) to map document coordinates onto visible
+	 * columns; if the derivation ever drifts from what core actually rendered,
+	 * a sanity check skips the highlight for that frame (indicator still works).
+	 */
+	private paintSelection(lines: string[], width: number): void {
+		try {
+			const rng = this.normRange();
+			if (!rng) return;
+			const ed = this as unknown as {
+				state?: { lines: string[] };
+				paddingX?: number;
+				scrollOffset?: number;
+				renderedVisibleLineCount?: number;
+				tui?: { terminal?: { rows?: number } };
+			};
+			const st = ed.state;
+			if (!st || typeof ed.scrollOffset !== "number" || typeof ed.renderedVisibleLineCount !== "number") return;
+
+			// Same width math as core render().
+			const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
+			const paddingX = Math.min(ed.paddingX ?? 0, maxPadding);
+			const contentWidth = Math.max(1, width - paddingX * 2);
+			const layoutWidth = Math.max(1, contentWidth - (paddingX ? 0 : 1));
+
+			// Layout entries: one per rendered content line, with the char range
+			// of the logical line it covers.
+			interface Entry { lineIdx: number; s: number; e: number; text: string }
+			const entries: Entry[] = [];
+			for (let i = 0; i < st.lines.length; i++) {
+				const ln = st.lines[i] ?? "";
+				if (visibleWidth(ln) <= layoutWidth) {
+					entries.push({ lineIdx: i, s: 0, e: ln.length, text: ln });
+				} else {
+					for (const chunk of wordWrapLine(ln, layoutWidth)) {
+						if (!chunk) continue;
+						entries.push({ lineIdx: i, s: chunk.startIndex ?? 0, e: chunk.endIndex ?? (chunk.startIndex ?? 0), text: chunk.text });
+					}
+				}
+			}
+
+			const scrollOffset = ed.scrollOffset;
+			const visibleCount = ed.renderedVisibleLineCount;
+			const maxVisible = Math.max(5, Math.floor(((ed.tui?.terminal?.rows) ?? 24) * 0.3));
+			if (entries.length < scrollOffset + visibleCount || entries.length - (scrollOffset + visibleCount) > maxVisible) return;
+
+			const { s, e } = rng;
+			for (let r = scrollOffset; r < scrollOffset + visibleCount && r < entries.length; r++) {
+				const en = entries[r]!;
+				if (en.lineIdx < s.line || en.lineIdx > e.line) continue;
+				let cs = en.s, ce = en.e;
+				if (en.lineIdx === s.line && s.col > cs) cs = s.col;
+				if (en.lineIdx === e.line && e.col < ce) ce = e.col;
+				if (ce <= cs) continue;
+				// Char offsets → visible columns within the chunk text.
+				const colStart = paddingX + visibleWidth(en.text.slice(0, cs - en.s));
+				const colEnd = paddingX + visibleWidth(en.text.slice(0, ce - en.s));
+				if (colEnd <= colStart) continue;
+				const renderedIdx = 1 + (r - scrollOffset);
+				if (renderedIdx >= 1 && renderedIdx < lines.length - 1) {
+					lines[renderedIdx] = styleColumnRange(lines[renderedIdx]!, colStart, colEnd, "\x1b[48;5;236m", "\x1b[49m");
+				}
+			}
+		} catch { /* layout internals unavailable/changed — skip highlight */ }
 	}
 }
 

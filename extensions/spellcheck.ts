@@ -88,8 +88,12 @@ function items(line: string): Item[] {
 		if (ch === "\x1b") {
 			let j = i + 1;
 			if (line[j] === "[") {
-				while (j < line.length && !/[@-~]/.test(line[j])) j++;
+				// CSI: skip "[", consume params/intermediates (0x20-0x3f), then the
+				// final byte (0x40-0x7e). "[" itself is in 0x40-0x7e, so the final-byte
+				// scan must start AFTER it.
 				j++;
+				while (j < line.length && line.charCodeAt(j) >= 0x20 && line.charCodeAt(j) <= 0x3f) j++;
+				if (j < line.length) j++;
 			} else if (line[j] === "]") {
 				// OSC: ends with BEL or ST (ESC \)
 				while (j < line.length && line[j] !== "\x07" && !(line[j] === "\x1b" && line[j + 1] === "\\")) j++;
@@ -122,50 +126,53 @@ function plainAndCols(line: string): { plain: string; cols: number[] } {
 	return { plain, cols };
 }
 
+/**
+ * Wrap visible columns [colStart, colEnd) of a rendered (ANSI) line in an SGR
+ * style. ANSI-safe: zero-width sequences inside the range (cursor inversion,
+ * hardware-cursor markers, other styling) are preserved, and the style is
+ * re-asserted after any of them — so ranges that contain the cursor marker
+ * still get fully styled instead of being skipped or half-reset.
+ */
+export function styleColumnRange(line: string, colStart: number, colEnd: number, on: string, off: string): string {
+	if (colEnd <= colStart) return line;
+	const toks = items(line);
+	let out = "";
+	let col = 0;
+	let styled = false;
+	for (const t of toks) {
+		if (t.w === 0) {
+			out += t.s;
+			styled = false; // the sequence may have reset SGR state — re-assert later
+			continue;
+		}
+		const inRange = col >= colStart && col < colEnd;
+		if (inRange && !styled) out += on;
+		if (!inRange && styled) out += off;
+		out += t.s;
+		styled = inRange;
+		col += t.w;
+	}
+	if (styled) out += off;
+	return out;
+}
+
 /** Wrap flagged words in a rendered (ANSI) line with red + underline. */
 export function highlightLine(line: string, bad: Set<string>): string {
 	if (bad.size === 0) return line;
-	const its = items(line);
 	const { plain, cols } = plainAndCols(line);
-	let out = "";
+	let out = line;
 	let lastCol = 0;
-	let changed = false;
 	for (const m of plain.matchAll(/[A-Za-z]{3,}/g)) {
 		if (!bad.has(m[0].toLowerCase())) continue;
 		const start = cols[m.index] ?? 0;
 		if (start < lastCol) continue; // overlaps a previous highlight
 		const end = start + visibleWidth(m[0]);
-		// Segment must be pure visible chars (no cursor marker / styling inside).
-		let seg = "";
-		let col = 0;
-		for (const it of its) {
-			if (it.w === 0) continue;
-			if (col >= start && col < end) seg += it.s;
-			col += it.w;
-		}
-		if (seg.length !== m[0].length) continue; // interrupted by a sequence — skip
-		// Prefix: items in [lastCol, start), sequences preserved.
-		let prefix = "";
-		col = 0;
-		for (const it of its) {
-			if (col >= start) break;
-			if (col >= lastCol) prefix += it.s;
-			col += it.w;
-		}
-		// underline (4) + bright red (91) — light/whitish red, easy to see
-		out += prefix + "\x1b[4;91m" + seg + "\x1b[0m";
+		// underline (4) + bright red (91); off = underline-off + default fg so a
+		// cursor [0m reset inside the word doesn't kill the rest of it.
+		out = styleColumnRange(out, start, end, "[4;91m", "[24;39m");
 		lastCol = end;
-		changed = true;
 	}
-	if (!changed) return line;
-	// Suffix: everything from lastCol on.
-	let suffix = "";
-	let col = 0;
-	for (const it of its) {
-		if (col >= lastCol) suffix += it.s;
-		col += it.w;
-	}
-	return out + suffix;
+	return out;
 }
 
 export class SpellcheckEditor extends CustomEditor {
