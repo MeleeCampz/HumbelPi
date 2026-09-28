@@ -63,11 +63,28 @@ export function loadSessionState(sessionId: string): SessionState {
 	}
 }
 
-/** Atomic write (tmp + rename) so concurrent readers never see a partial file. */
+/**
+ * Atomic write (tmp + rename) so concurrent readers never see a partial file.
+ * Mirrors the de-facto standard npm/write-file-atomic: unique sibling tmp name
+ * (pid-disambiguated), fsync BEFORE the rename for crash durability, and tmp
+ * cleanup on failure. Synchronous by design — the files are ~100 bytes and pi's
+ * extension hooks here render synchronously anyway.
+ */
 function atomicWriteJson(file: string, data: unknown): void {
 	const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
-	fs.writeFileSync(tmp, JSON.stringify(data));
-	fs.renameSync(tmp, file);
+	try {
+		const fd = fs.openSync(tmp, "w");
+		try {
+			fs.writeSync(fd, JSON.stringify(data));
+			fs.fsyncSync(fd); // flush to disk before the rename — a crash in between must not leave an empty target
+		} finally {
+			fs.closeSync(fd);
+		}
+		fs.renameSync(tmp, file);
+	} catch (err) {
+		try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+		throw err;
+	}
 }
 
 /** Plain save of a full state object (callers that already hold the desired state). */
