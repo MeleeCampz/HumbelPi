@@ -3,5 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "description": "Humbel's personal pi coding agent setup: global extensions (guards/sandbox, backlog checklist, perf stats, working-task indicator, spellcheck, web search, ask-user).",
-  "keywords": ["pi-package"]
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "extensions/ask-user.ts",
+      "extensions/backlog.ts",
+      "extensions/guards.ts",
+      "extensions/perf-stats.ts",
+      "extensions/spellcheck.ts",
+      "extensions/web-search.ts",
+      "extensions/working-task.ts"
+    ]
+  }
 }

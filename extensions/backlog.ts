@@ -16,45 +16,23 @@
  * action writes the shared guard-state.json (schema owner: guards.ts).
  */
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+// #1: session state lives in the shared module (single writer, fresh RMW saves).
+// Importing ./guards only evaluates its top-level constants/functions — the default
+// export factory is NOT invoked, so nothing gets registered twice.
+import { GUARD_STATE_FILE, loadSessionState, updateSessionState } from "./lib/session-state";
+import { defaultPlanFile } from "./guards";
 
 type Marker = " " | "~" | "x";
 interface Entry { num: number; marker: Marker; text: string; }
 
 const ENTRY_RE = /^- \[( |~|x)\] (\d+)\. /;
 
-// ── Shared guard state (schema owner: guards.ts) ────────────────────────
-// The "plan" action flips planning mode on, exactly like `/plan on` does.
-// #4: plan state is PER SESSION — one small file per session id (same layout as
-// guards.ts). Consoles on the same machine are independent; this only ever
-// touches the current session's file. guard-state.json itself is only probed
-// as a "guards installed" sanity check.
-const GUARD_STATE_FILE = path.join(os.homedir(), ".pi", "agent", "guard-state.json");
-function loadGuardState(): unknown { try { return JSON.parse(fs.readFileSync(GUARD_STATE_FILE, "utf8")); } catch { return null; } }
-
-const SESSION_STATE_DIR = path.join(os.homedir(), ".pi", "agent", "session-state");
-interface SessionStateLite { planMode?: boolean; planFile?: string | null; unattendedMode?: boolean; [k: string]: unknown; }
-function sessionStatePath(sessionId: string): string {
-  return path.join(SESSION_STATE_DIR, `${sessionId.replace(/[^\w.-]/g, "_")}.json`);
-}
-function loadSessionStateLite(sessionId: string): SessionStateLite {
-  try { return JSON.parse(fs.readFileSync(sessionStatePath(sessionId), "utf8")) as SessionStateLite; } catch { return {}; }
-}
-function saveSessionStateLite(sessionId: string, s: SessionStateLite): void {
-  fs.mkdirSync(SESSION_STATE_DIR, { recursive: true });
-  fs.writeFileSync(sessionStatePath(sessionId), JSON.stringify(s));
-}
-
-// Duplicated from guards.ts — keep in sync with sanitizeProjectName/defaultPlanFile there.
-function sanitizeProjectName(name: string): string {
-  return name.replace(/[^\w.-]/g, "_") || "project";
-}
-function defaultPlanFile(cwd: string): string {
-  return path.join(os.homedir(), ".pi", "agent", "plans", sanitizeProjectName(path.basename(cwd)), "PLAN.md");
-}
+// #4: plan state is PER SESSION (see ./lib/session-state) — consoles on the same
+// machine are independent; this only ever touches the current session's file.
+// guard-state.json itself is only probed as a "guards installed" sanity check.
 
 // ── Backlog file helpers ────────────────────────────────────────────────
 
@@ -302,19 +280,23 @@ export default function (pi: ExtensionAPI) {
 
       const doPlan = async (nums: number[]): Promise<void> => {
         const lines = nums.map(entryRefLine);
-        if (!loadGuardState()) {
+        if (!fs.existsSync(GUARD_STATE_FILE)) {
           pi.sendUserMessage(`Planning mode is not set up on this machine — run /plan on first. Items to plan:\n${lines.join("\n")}`, { deliverAs: "followUp" });
           return;
         }
         const sid = ctx.sessionManager.getSessionId();
-        const ss = loadSessionStateLite(sid);
+        const ss = loadSessionState(sid);
         let justTurnedOn = false;
         if (!ss.planMode) {
-          if (!ss.planFile) {
-            ss.planFile = defaultPlanFile(ctx.cwd);
-            fs.mkdirSync(path.dirname(ss.planFile), { recursive: true });
-          }
-          saveSessionStateLite(sid, { ...ss, planMode: true });
+          // #1: fresh read-modify-write — never save a snapshot taken before the check above.
+          const saved = updateSessionState(s => {
+            if (!s.planFile) {
+              s.planFile = defaultPlanFile(ctx.cwd);
+              fs.mkdirSync(path.dirname(s.planFile), { recursive: true });
+            }
+            s.planMode = true;
+          });
+          ss.planFile = saved.planFile; // the messages below quote the pinned file
           ctx.ui.setTitle(`📋 PLAN — pi — ${path.basename(ctx.cwd) || "pi"}`);
           justTurnedOn = true;
         }

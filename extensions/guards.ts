@@ -66,105 +66,25 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
 import { createSpellcheckInputDialog } from "./spellcheck";
+// #1: all state IO lives in one shared module — fresh reads, atomic writes and
+// read-modify-write (update*) so a stale snapshot can never resurrect/clobber fields.
+import {
+	GUARD_STATE_FILE,
+	loadGuardState,
+	updateGuardState,
+	sessionStateFile,
+	loadSessionState,
+	updateSessionState,
+	type GuardState,
+} from "./lib/session-state";
 
-const STATE_FILE = path.join(os.homedir(), ".pi", "agent", "guard-state.json");
 const PROTECTED_BRANCHES = new Set(["main", "master"]);
 
-interface GuardState {
-	sandboxEnabled: boolean;
-	pushGuardEnabled: boolean;
-	allowedPaths: string[];
-	readOnlyPaths: string[];
-	allowedBranches: string[];
-}
-
-const DEFAULT_STATE: GuardState = {
-	sandboxEnabled: true,
-	pushGuardEnabled: true,
-	allowedPaths: [],
-	readOnlyPaths: [],
-	allowedBranches: [],
-};
-
-let stateCache: { mtimeMs: number; data: GuardState } | null = null;
-
-/**
- * Load guard state, cached by file mtime. The footer renders many times per
- * second and every tool_call loads state — the mtime check makes repeated
- * loads a single cheap statSync instead of readFileSync + JSON.parse.
- */
-function loadState(): GuardState {
-	try {
-		const st = fs.statSync(STATE_FILE);
-		if (stateCache && st.mtimeMs === stateCache.mtimeMs) return stateCache.data;
-		const s = { ...DEFAULT_STATE, ...JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) };
-		if (!Array.isArray(s.readOnlyPaths)) s.readOnlyPaths = [];
-		stateCache = { mtimeMs: st.mtimeMs, data: s };
-		return s;
-	} catch {
-		return { ...DEFAULT_STATE, allowedPaths: [], readOnlyPaths: [], allowedBranches: [] };
-	}
-}
-
-function saveState(s: GuardState): void {
-	fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-	// One-way migration (#4): plan/unattended moved to per-session files — strip the
-	// legacy keys (they may still be present on objects parsed from an old file).
-	const { planMode: _pm, planFile: _pf, planSessionId: _ps, unattendedMode: _um, unattendedSessionId: _us, yoloMode: _yo, ...clean } = s as GuardState & Record<string, unknown>;
-	fs.writeFileSync(STATE_FILE, JSON.stringify(clean, null, 2));
-	stateCache = null; // force re-read on next load
-}
-
-// ── Per-session state (plan + unattended) — #4 ────────────────────────
-// Used to live in the global guard-state.json, so every console on the machine
-// enforced other consoles' plan/unattended state. Now each session owns a small
-// file keyed by its id: consoles are independent, resuming a session keeps its
-// state, new sessions start clean.
-const SESSION_STATE_DIR = path.join(os.homedir(), ".pi", "agent", "session-state");
-interface SessionState { planMode: boolean; planFile: string | null; unattendedMode: boolean; yoloMode: boolean }
-const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false, yoloMode: false };
-
-const sessionStateCache = new Map<string, { mtimeMs: number; data: SessionState }>();
-let sessionStatePruned = false;
-
-function sessionStateFile(sessionId: string): string {
-	return path.join(SESSION_STATE_DIR, `${sessionId.replace(/[^\w.-]/g, "_")}.json`);
-}
-
-/** Delete session-state files not touched in 30 days (no session_end event to hook). */
-function pruneOldSessionState(): void {
-	if (sessionStatePruned) return;
-	sessionStatePruned = true;
-	try {
-		const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-		for (const f of fs.readdirSync(SESSION_STATE_DIR)) {
-			if (!f.endsWith(".json")) continue;
-			const p = path.join(SESSION_STATE_DIR, f);
-			try { if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p); } catch { /* keep going */ }
-		}
-	} catch { /* dir missing — nothing to prune */ }
-}
-
-function loadSessionState(sessionId: string): SessionState {
-	pruneOldSessionState();
-	const file = sessionStateFile(sessionId);
-	try {
-		const st = fs.statSync(file);
-		const cached = sessionStateCache.get(sessionId);
-		if (cached && st.mtimeMs === cached.mtimeMs) return cached.data;
-		const s = { ...DEFAULT_SESSION_STATE, ...JSON.parse(fs.readFileSync(file, "utf8")) };
-		sessionStateCache.set(sessionId, { mtimeMs: st.mtimeMs, data: s });
-		return s;
-	} catch {
-		return { ...DEFAULT_SESSION_STATE };
-	}
-}
-
-function saveSessionState(sessionId: string, s: SessionState): void {
-	fs.mkdirSync(SESSION_STATE_DIR, { recursive: true });
-	fs.writeFileSync(sessionStateFile(sessionId), JSON.stringify(s));
-	sessionStateCache.delete(sessionId); // force re-read on next load
-}
+// #4: plan/unattended/yolo state is per session (own file keyed by session id) and
+// lives in ./lib/session-state together with the machine-global guard state.
+// #1: no mtime caches there — every read is fresh, every save is atomic, and all
+// mutations go through update*() read-modify-write so a snapshot loaded before an
+// awaited dialog can never write stale fields back.
 
 // ── shell tokenization (quote/escape aware) ─────────────────────
 // Reference approach: character-by-character scanning as done by
@@ -434,18 +354,28 @@ export function bashWriteTargets(command: string): string[] | null {
 	return targets;
 }
 
-function sanitizeProjectName(name: string): string {
+export function sanitizeProjectName(name: string): string {
 	return name.replace(/[^\w.-]/g, "_") || "project";
 }
 
-/** Plans live outside the repo so git status stays clean. */
-function defaultPlanFile(cwd: string): string {
+/** Plans live outside the repo so git status stays clean. (Exported — backlog.ts reuses it.) */
+export function defaultPlanFile(cwd: string): string {
 	return path.join(os.homedir(), ".pi", "agent", "plans", sanitizeProjectName(path.basename(cwd)), "PLAN.md");
 }
 
 /** Shared implementation instruction (used by /plan approve, /plan implement and finish_plan). */
 function implementationInstruction(file: string): string {
 	return `PLAN APPROVED. The plan at ${file} is accepted. Implement it now, using the plan as your detailed guideline: follow its steps in order, honor its decisions and constraints, and only deviate when something is genuinely impossible (then say why first). Report progress as you go — one short line per completed step (e.g., "✅ Step 2 done: …"). Start with step 1.`;
+}
+
+/**
+ * #1: belt-and-braces after an approval path flips planning mode off — re-read the
+ * state file and warn loudly if it still says ON, so this bug class is never silent.
+ */
+function verifyPlanModeOff(ctx: ExtensionContext, sid: string): void {
+	if (loadSessionState(sid).planMode) {
+		ctx.ui.notify("⚠️ Planning mode did NOT turn off — the session-state file still says ON. Run /plan off and check for other writers to that file.", "warning");
+	}
 }
 
 // ── git push helpers ────────────────────────────────────────────
@@ -509,7 +439,7 @@ function createGuardFooter(ctx: any): (tui: any, theme: any, footerData: any) =>
 	return (_tui: any, theme: any, footerData: any) => ({
 		dispose() {},
 		render(width: number): string[] {
-			const state = loadState();
+			const state = loadGuardState();
 			const ss = loadSessionState(ctx.sessionManager.getSessionId());
 			const marker = [ss.unattendedMode ? "🌙" : null, ss.yoloMode ? "🔥" : null, ss.planMode ? "📋" : null].filter(Boolean).join(" ") || "🛡️";
 
@@ -623,7 +553,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
-		const state = loadState();
+		const state = loadGuardState();
 		const ss = loadSessionState(ctx.sessionManager.getSessionId());
 		const cwd = ctx.cwd;
 
@@ -718,20 +648,26 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (decision === "block") return { block: true, reason: `Blocked by user: ${label} (${group.paths.join(", ")})` };
 					if (decision === "always" || decision === "ro") {
+						// #1: fresh read-modify-write — the dialog await above is exactly where
+						// another console could have written; never save a pre-dialog snapshot.
+						updateGuardState(s => {
+							if (decision === "always") {
+								for (const p of savable) if (!s.allowedPaths.includes(p)) s.allowedPaths.push(p);
+								// upgrade: drop read-only grants now covered by a full grant
+								s.readOnlyPaths = s.readOnlyPaths.filter((r) => !s.allowedPaths.some((a) => grantCovers(a, r)));
+							} else {
+								for (const p of savable) if (!s.readOnlyPaths.includes(p)) s.readOnlyPaths.push(p);
+							}
+						});
 						if (decision === "always") {
-							for (const s of savable) if (!state.allowedPaths.includes(s)) state.allowedPaths.push(s);
-							// upgrade: drop read-only grants now covered by a full grant
-							state.readOnlyPaths = state.readOnlyPaths.filter((r) => !state.allowedPaths.some((a) => grantCovers(a, r)));
 							ctx.ui.notify(group.kind === "ro"
 								? `Upgraded to full access (was read-only): ${savable.join(", ")}`
 								: isWrite
 									? `Always allowed (full access): ${savable.join(", ")}`
 									: `Full access granted (reads AND writes): ${savable.join(", ")}`, "info");
 						} else {
-							for (const s of savable) if (!state.readOnlyPaths.includes(s)) state.readOnlyPaths.push(s);
 							ctx.ui.notify(`Read-only granted: ${savable.join(", ")} (reads free, writes still ask)`, "info");
 						}
-						saveState(state);
 					}
 				}
 			}
@@ -763,8 +699,8 @@ export default function (pi: ExtensionAPI) {
 					);
 					if (decision === "block") return { block: true, reason: `Blocked by user: ${label}` };
 					if (decision === "always") {
-						for (const b of flagged) if (!state.allowedBranches.includes(b)) state.allowedBranches.push(b);
-						saveState(state);
+						// #1: fresh RMW (a dialog await happened above)
+						updateGuardState(s => { for (const b of flagged) if (!s.allowedBranches.includes(b)) s.allowedBranches.push(b); });
 						ctx.ui.notify(`Always allowed push to: ${flagged.join(", ")}`, "info");
 					}
 				}
@@ -805,14 +741,23 @@ export default function (pi: ExtensionAPI) {
 			switch (cmd) {
 				case undefined:
 				case "":
-				case "status":
+				case "status": {
+					// #1: show the raw on-disk state so disk vs. behavior can be cross-checked
+					const file = sessionStateFile(sid);
+					let raw = "(no state file yet)";
+					try { raw = fs.readFileSync(file, "utf8"); } catch { /* missing */ }
 					ctx.ui.notify(
-						ss.planMode
-							? `📋 Planning mode ON (this console) — plan file: ${ss.planFile ?? "(unbound)"}. finish_plan or /plan approve to implement, /plan reject [reason] to revise.`
-							: "Planning mode OFF. Start with: /plan on [task]",
+						[
+							ss.planMode
+								? `📋 Planning mode ON (this console) — plan file: ${ss.planFile ?? "(unbound)"}. finish_plan or /plan approve to implement, /plan reject [reason] to revise.`
+								: "Planning mode OFF. Start with: /plan on [task]",
+							`state file: ${file}`,
+							raw,
+						].join("\n"),
 						"info",
 					);
 					break;
+				}
 
 				case "on": {
 					if (ss.planMode) {
@@ -824,11 +769,14 @@ export default function (pi: ExtensionAPI) {
 						}
 						break;
 					}
-					if (!ss.planFile) {
-						ss.planFile = defaultPlanFile(ctx.cwd);
-						fs.mkdirSync(path.dirname(ss.planFile), { recursive: true });
-					}
-					saveSessionState(sid, { ...ss, planMode: true });
+					const savedOn = updateSessionState(s => {
+						if (!s.planFile) {
+							s.planFile = defaultPlanFile(ctx.cwd);
+							fs.mkdirSync(path.dirname(s.planFile), { recursive: true });
+						}
+						s.planMode = true;
+					});
+					ss.planFile = savedOn.planFile; // the messages below quote the pinned file
 					applyTitle(ctx);
 					ctx.ui.notify(`📋 Planning mode ON — plan file: ${ss.planFile}. Reads and web search stay free; all other writes are blocked.`, "info");
 					pi.sendUserMessage(
@@ -841,7 +789,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "off":
-					saveSessionState(sid, { ...ss, planMode: false });
+					updateSessionState(s => { s.planMode = false; });
 					applyTitle(ctx);
 					ctx.ui.notify("Planning mode OFF — normal operation (implementation allowed).", "info");
 					break;
@@ -856,7 +804,8 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`Plan file not found: ${file}\nUsage: /plan approve [path/to/plan.md]`, "warning");
 						break;
 					}
-					saveSessionState(sid, { ...ss, planMode: false, planFile: null });
+					updateSessionState(s => { s.planMode = false; s.planFile = null; });
+					verifyPlanModeOff(ctx, sid);
 					applyTitle(ctx);
 					ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
 					pi.sendUserMessage(implementationInstruction(file), { deliverAs: "followUp" });
@@ -889,7 +838,8 @@ export default function (pi: ExtensionAPI) {
 						break;
 					}
 					if (ss.planMode) {
-						saveSessionState(sid, { ...ss, planMode: false, planFile: null });
+						updateSessionState(s => { s.planMode = false; s.planFile = null; });
+						verifyPlanModeOff(ctx, sid);
 						applyTitle(ctx);
 					}
 					ctx.ui.notify(`🚀 Implementing ${file} (planning mode off)`, "info");
@@ -954,7 +904,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				return { content: [{ type: "text", text: "The user wants to keep planning. Do NOT implement. Wait for their feedback, revise the plan file, and call finish_plan again when ready." }], details: undefined };
 			}
-			saveSessionState(sid, { ...ss, planMode: false, planFile: null });
+			updateSessionState(s => { s.planMode = false; s.planFile = null; });
+			verifyPlanModeOff(ctx, sid);
 			applyTitle(ctx);
 			ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
 			// #10: no queued follow-up — the instruction goes into the tool result so the model
@@ -971,7 +922,7 @@ export default function (pi: ExtensionAPI) {
 			const ss = loadSessionState(sid);
 			const instruction = (args ?? "").trim();
 			if (!instruction && ss.unattendedMode) {
-				saveSessionState(sid, { ...ss, unattendedMode: false });
+				updateSessionState(s => { s.unattendedMode = false; });
 				applyTitle(ctx);
 				ctx.ui.notify("🌙 Unattended mode OFF — normal operation (dialogs ask again).", "info");
 				return;
@@ -981,7 +932,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (!ss.unattendedMode) {
-				saveSessionState(sid, { ...ss, unattendedMode: true });
+				updateSessionState(s => { s.unattendedMode = true; });
 				applyTitle(ctx);
 				ctx.ui.notify("🌙 Unattended mode ON (this console) — all confirmation dialogs auto-rejected until /away or a new session.", "info");
 			} else {
@@ -995,14 +946,15 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("guards", {
 		description: "Security guards: status, toggles, path/branch allowlists (see extension header for syntax)",
 		handler: async (args, ctx) => {
-			const state = loadState();
-			const ss = loadSessionState(ctx.sessionManager.getSessionId());
+			const sid = ctx.sessionManager.getSessionId();
+			let state = loadGuardState();
+			const ss = loadSessionState(sid);
 			const [cmd, ...rest] = (args ?? "").trim().split(/\s+/);
 			const target = rest.join(" ");
 
 			const statusText = () =>
 				[
-					`🛡️ Guards (${STATE_FILE})`,
+					`🛡️ Guards (${GUARD_STATE_FILE})`,
 					`  yolo    : ${ss.yoloMode ? "🔥 ON (this console — sandbox silenced)" : "off"}`,
 					`  unattended: ${ss.unattendedMode ? "🌙 ON (this console — dialogs auto-rejected)" : "off"}`,
 					`  plan    : ${ss.planMode ? `📋 ON (this console — ${ss.planFile ?? "no file bound"})` : "off"}`,
@@ -1024,7 +976,7 @@ export default function (pi: ExtensionAPI) {
 				case "yolo": {
 					const arg = (rest[0] ?? "").toLowerCase();
 					const next = arg === "on" ? true : arg === "off" ? false : !ss.yoloMode;
-					saveSessionState(ctx.sessionManager.getSessionId(), { ...ss, yoloMode: next });
+					updateSessionState(s => { s.yoloMode = next; });
 					applyTitle(ctx);
 					// #12: "info" (replaceable status line) for both directions — a "warning"
 					// notification is a permanent chat line that never gets cleared on exit.
@@ -1037,16 +989,18 @@ export default function (pi: ExtensionAPI) {
 					break;
 				}
 
-				case "toggle":
-					if (rest[0] === "sandbox") state.sandboxEnabled = !state.sandboxEnabled;
-					else if (rest[0] === "push") state.pushGuardEnabled = !state.pushGuardEnabled;
-					else {
+				case "toggle": {
+					if (rest[0] !== "sandbox" && rest[0] !== "push") {
 						ctx.ui.notify("Usage: /guards toggle sandbox|push", "warning");
 						return;
 					}
-					saveState(state);
+					state = updateGuardState(s => {
+						if (rest[0] === "sandbox") s.sandboxEnabled = !s.sandboxEnabled;
+						else s.pushGuardEnabled = !s.pushGuardEnabled;
+					});
 					ctx.ui.notify(statusText(), "info");
 					break;
+				}
 
 				case "allow-path": {
 					if (!target) {
@@ -1054,8 +1008,7 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					const abs = resolveProjectPath(target, ctx.cwd);
-					if (!state.allowedPaths.includes(abs)) state.allowedPaths.push(abs);
-					saveState(state);
+					updateGuardState(s => { if (!s.allowedPaths.includes(abs)) s.allowedPaths.push(abs); });
 					ctx.ui.notify(`Allowed path: ${abs}`, "info");
 					break;
 				}
@@ -1063,13 +1016,11 @@ export default function (pi: ExtensionAPI) {
 				case "revoke-path": {
 					const norm = (p: string) => p.toLowerCase().replace(/\\/g, "/").replace(/\/$/, "");
 					const want = norm(resolveProjectPath(target || "", ctx.cwd));
-					const before = state.allowedPaths.length;
-					state.allowedPaths = state.allowedPaths.filter((p) => norm(p) !== want);
-					if (state.allowedPaths.length === before) {
+					if (!state.allowedPaths.some((p) => norm(p) === want)) {
 						ctx.ui.notify(`No allowlist entry matched: ${target}`, "warning");
 						return;
 					}
-					saveState(state);
+					state = updateGuardState(s => { s.allowedPaths = s.allowedPaths.filter((p) => norm(p) !== want); });
 					ctx.ui.notify(statusText(), "info");
 					break;
 				}
@@ -1079,8 +1030,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("Usage: /guards allow-branch <name>", "warning");
 						return;
 					}
-					if (!state.allowedBranches.includes(target)) state.allowedBranches.push(target);
-					saveState(state);
+					updateGuardState(s => { if (!s.allowedBranches.includes(target)) s.allowedBranches.push(target); });
 					ctx.ui.notify(`Push to '${target}' no longer requires confirmation.`, "info");
 					break;
 
@@ -1090,8 +1040,7 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					const abs = resolveProjectPath(target, ctx.cwd);
-					if (!state.readOnlyPaths.includes(abs)) state.readOnlyPaths.push(abs);
-					saveState(state);
+					updateGuardState(s => { if (!s.readOnlyPaths.includes(abs)) s.readOnlyPaths.push(abs); });
 					ctx.ui.notify(`Read-only granted: ${abs} (reads free, writes still ask)`, "info");
 					break;
 				}
@@ -1099,25 +1048,28 @@ export default function (pi: ExtensionAPI) {
 				case "revoke-ro-path": {
 					const norm = (p: string) => p.toLowerCase().replace(/\\/g, "/").replace(/\/$/, "");
 					const want = norm(resolveProjectPath(target || "", ctx.cwd));
-					const before = state.readOnlyPaths.length;
-					state.readOnlyPaths = state.readOnlyPaths.filter((p) => norm(p) !== want);
-					if (state.readOnlyPaths.length === before) {
+					if (!state.readOnlyPaths.some((p) => norm(p) === want)) {
 						ctx.ui.notify(`No read-only entry matched: ${target}`, "warning");
 						return;
 					}
-					saveState(state);
+					state = updateGuardState(s => { s.readOnlyPaths = s.readOnlyPaths.filter((p) => norm(p) !== want); });
 					ctx.ui.notify(statusText(), "info");
 					break;
 				}
 
 				case "revoke-branch":
-					state.allowedBranches = state.allowedBranches.filter((b) => b !== target);
-					saveState(state);
+					state = updateGuardState(s => { s.allowedBranches = s.allowedBranches.filter((b) => b !== target); });
 					ctx.ui.notify(statusText(), "info");
 					break;
 
 				case "reset":
-					saveState({ ...DEFAULT_STATE, allowedPaths: [], readOnlyPaths: [], allowedBranches: [] });
+					state = updateGuardState(s => {
+						s.sandboxEnabled = true;
+						s.pushGuardEnabled = true;
+						s.allowedPaths = [];
+						s.readOnlyPaths = [];
+						s.allowedBranches = [];
+					});
 					ctx.ui.notify("Guards reset: both ON, all grants cleared.", "info");
 					break;
 
