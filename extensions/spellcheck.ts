@@ -12,16 +12,20 @@
  * - Detection  : simple dictionary check — any unknown word is highlighted.
  *                (Suggestion/correction logic was deliberately dropped; may be
  *                re-added later as a separate feature.)
- * - Skipped    : slash commands (/…), CamelCase / ALLCAPS tokens, words with
- *                digits or symbols, words ≤ 2 letters.
+ * - Skipped    : slash command NAMES (the argument text after the first token IS
+ *                checked), CamelCase / ALLCAPS tokens, words with digits or symbols,
+ *                words ≤ 2 letters.
+ * - Everywhere : also highlights free-text dialogs — createSpellcheckInputDialog()
+ *                is used by ask-user.ts ("Other" answer) and guards.ts (plan feedback)
+ *                instead of pi's plain ctx.ui.input.
  * - Toggle     : /spellcheck on | off | status
  */
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { CustomEditor, keyText, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Container, Input, Spacer, Text, matchesKey, visibleWidth, type Focusable } from "@earendil-works/pi-tui";
 
 // The dictionary ships next to this extension file — works both as a loose file in
 // ~/.pi/agent/extensions/ and when loaded from a pi package directory. Fall back to
@@ -30,10 +34,15 @@ const LEGACY_EXT_DIR = path.join(os.homedir(), ".pi", "agent", "extensions");
 export const WORDS_FILE = [path.join(__dirname, "words-en.txt"), path.join(LEGACY_EXT_DIR, "words-en.txt")].find((f) => fs.existsSync(f)) ?? path.join(LEGACY_EXT_DIR, "words-en.txt");
 const IGNORE_FILE = path.join(os.homedir(), ".pi", "agent", "spell-ignore.txt");
 
-let dict: Set<string> | null = null;
+// Shared state on globalThis: pi loads each extension file through jiti with
+// moduleCache disabled, so a relative import of this file from another extension
+// may be a SEPARATE module instance. The enabled flag and dictionary cache must
+// live outside the module for /spellcheck, the main editor and the dialogs to agree.
+interface SpellState { enabled: boolean; dict: Set<string> | null }
+const STATE: SpellState = ((globalThis as Record<string, unknown>).__humbel_pi_spellcheck ??= { enabled: true, dict: null }) as SpellState;
 
 function getDict(): Set<string> {
-	if (dict) return dict;
+	if (STATE.dict) return STATE.dict;
 	const s = new Set<string>();
 	for (const f of [WORDS_FILE, IGNORE_FILE]) {
 		try {
@@ -45,7 +54,7 @@ function getDict(): Set<string> {
 			/* missing file — keep going */
 		}
 	}
-	dict = s;
+	STATE.dict = s;
 	return s;
 }
 
@@ -168,7 +177,10 @@ class SpellcheckEditor extends CustomEditor {
 		const text = this.getText();
 		if (text !== this.cacheText) {
 			this.cacheText = text;
-			this.bad = text.startsWith("/") ? new Set() : unknownWords(text, getDict());
+			// Slash commands: the command name is not prose, but the argument text IS
+			// (e.g. /backlog <idea>, /plan on [task], /plan reject [reason]) — check it.
+			const args = text.startsWith("/") ? text.slice(text.indexOf(" ") + 1) : text;
+			this.bad = STATE.enabled ? unknownWords(args, getDict()) : new Set();
 		}
 		if (this.bad.size === 0) return lines;
 		for (let i = 0; i < lines.length; i++) {
@@ -178,15 +190,92 @@ class SpellcheckEditor extends CustomEditor {
 	}
 }
 
-export default function (pi: ExtensionAPI) {
-	let enabled = true;
+// ── Spellchecked single-line input (for dialogs) ─────────────────────────
 
+/** pi-tui Input that highlights unknown words in place while typing. */
+class SpellInput extends Input {
+	private cacheText = "\u0000";
+	private bad: Set<string> = new Set();
+
+	render(width: number): string[] {
+		const lines = super.render(width);
+		if (!STATE.enabled) return lines;
+		const text = this.getValue();
+		if (text !== this.cacheText) {
+			this.cacheText = text;
+			this.bad = unknownWords(text, getDict());
+		}
+		if (this.bad.size === 0) return lines;
+		for (let i = 0; i < lines.length; i++) {
+			lines[i] = highlightLine(lines[i]!, this.bad);
+		}
+		return lines;
+	}
+}
+
+/**
+ * Single-line input dialog with live typo highlighting — a lookalike of pi's built-in
+ * extension input (what ctx.ui.input shows) for use via ctx.ui.custom. Enter submits,
+ * Esc cancels (undefined). Renders plain when spellcheck is toggled off.
+ *
+ * Deliberately does NOT use pi's DynamicBorder/keyHint — those read pi's internal theme
+ * singleton; everything here is styled with the theme passed in by ctx.ui.custom.
+ */
+class SpellcheckInputDialog extends Container implements Focusable {
+	private readonly input: SpellInput;
+	private _focused = false;
+
+	get focused() { return this._focused; }
+	set focused(value: boolean) { this._focused = value; this.input.focused = value; }
+
+	constructor(
+		private readonly theme: { fg(color: string, text: string): string },
+		title: string,
+		placeholder: string,
+		private readonly done: (value: string | undefined) => void,
+	) {
+		super();
+		this.input = new SpellInput({ placeholder });
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(this.theme.fg("accent", title), 1, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(this.input);
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(`${this.theme.fg("dim", keyText("tui.select.confirm"))} ${this.theme.fg("muted", "submit")}  ${this.theme.fg("dim", keyText("tui.select.cancel"))} ${this.theme.fg("muted", "cancel")}`, 1, 0));
+		this.addChild(new Spacer(1));
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, "enter") || data === "\n") { this.done(this.input.getValue()); return; }
+		if (matchesKey(data, "escape")) { this.done(undefined); return; }
+		this.input.handleInput(data);
+	}
+
+	override render(width: number): string[] {
+		const border = this.theme.fg("border", "─".repeat(Math.max(4, width)));
+		return [border, ...super.render(width), border];
+	}
+
+	dispose(): void {}
+}
+
+/** Factory for ctx.ui.custom — see SpellcheckInputDialog. */
+export function createSpellcheckInputDialog(
+	theme: { fg(color: string, text: string): string },
+	title: string,
+	placeholder: string,
+	done: (value: string | undefined) => void,
+): SpellcheckInputDialog {
+	return new SpellcheckInputDialog(theme, title, placeholder, done);
+}
+
+export default function (pi: ExtensionAPI) {
 	const install = (ctx: Parameters<Parameters<ExtensionAPI["on"]>[1]>[1]) => {
 		ctx.ui.setEditorComponent((tui, theme, kb) => new SpellcheckEditor(tui, theme, kb));
 	};
 
 	pi.on("session_start", (_event, ctx) => {
-		if (enabled) install(ctx);
+		if (STATE.enabled) install(ctx);
 	});
 
 	pi.registerCommand("spellcheck", {
@@ -194,15 +283,15 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const a = (args ?? "").trim();
 			if (a === "on") {
-				enabled = true;
+				STATE.enabled = true;
 				install(ctx);
 				ctx.ui.notify("Spellcheck highlighting: ON", "info");
 			} else if (a === "off") {
-				enabled = false;
+				STATE.enabled = false;
 				ctx.ui.setEditorComponent(undefined);
 				ctx.ui.notify("Spellcheck highlighting: OFF", "info");
 			} else {
-				ctx.ui.notify(`Spellcheck highlighting: ${enabled ? "ON" : "OFF"}  (toggle with /spellcheck on|off)`, "info");
+				ctx.ui.notify(`Spellcheck highlighting: ${STATE.enabled ? "ON" : "OFF"}  (toggle with /spellcheck on|off)`, "info");
 			}
 		},
 	});

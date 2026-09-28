@@ -13,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createSpellcheckInputDialog } from "./spellcheck";
 
 const OTHER = "Other — I'll type my own answer";
 
@@ -86,7 +87,11 @@ export default function (pi: ExtensionAPI) {
 			if (choice !== OTHER) {
 				return { content: [{ type: "text", text: `User chose: ${choice}` }], details: undefined };
 			}
-			const custom = await ctx.ui.input("Your answer", "Type your own answer…");
+			// TUI: spellchecked input dialog (same look as ctx.ui.input, live typo highlighting);
+			// non-TUI modes keep the plain built-in input.
+			const custom = ctx.mode === "tui"
+				? await ctx.ui.custom<string | undefined>((_tui, theme, _kb, done) => createSpellcheckInputDialog(theme, "Your answer", "Type your own answer…", done))
+				: await ctx.ui.input("Your answer", "Type your own answer…");
 			if (custom === undefined || custom.trim() === "") {
 				return {
 					content: [{ type: "text", text: "User chose 'Other' but gave no answer. Do not proceed with this decision; ask again or pick the safest option and say so." }],

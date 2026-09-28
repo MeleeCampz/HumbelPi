@@ -56,9 +56,12 @@ no post-enter confirmation: the text is sent exactly as typed.
 
 ![Spellcheck highlighting](imgs/SpellCheck.png)
 
+- Works **everywhere you type free text**: the main editor, slash-command arguments
+  (e.g. `/backlog <idea>`, `/plan reject [reason]`) and the free-text dialogs — the
+  `ask_user` “Other” answer and the plan-feedback input (“✏️ Keep planning”).
 - Dictionary: `extensions/words-en.txt` (~370k words, bundled); personal additions go
   to `~/.pi/agent/spell-ignore.txt` (one word per line — names, identifiers, project terms).
-- Skipped: slash commands, CamelCase / ALLCAPS tokens, words with digits or symbols,
+- Skipped: slash command names, CamelCase / ALLCAPS tokens, words with digits or symbols,
   words ≤ 2 letters.
 - Toggle: `/spellcheck on | off | status`.
 

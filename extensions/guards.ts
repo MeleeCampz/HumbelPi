@@ -58,8 +58,9 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { Type } from "typebox";
-import type { ExtensionAPI, ToolCallEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
+import { createSpellcheckInputDialog } from "./spellcheck";
 
 const STATE_FILE = path.join(os.homedir(), ".pi", "agent", "guard-state.json");
 const PROTECTED_BRANCHES = new Set(["main", "master"]);
@@ -906,7 +907,13 @@ export default function (pi: ExtensionAPI) {
 			const choice = await ctx.ui.select(`📋 Plan ready — approve?\n\nFile:     ${file}\n\n${params.summary}`, ["✅ Approve & implement", "✏️ Keep planning"]);
 			if (choice === undefined || !/approve/i.test(choice)) {
 				// #13: refusal reason inline — no extra manual turn
-				const reason = choice === undefined ? undefined : await ctx.ui.input("✏️ What should change in the plan?", "e.g. use SQLite instead of JSON, drop step 3…");
+				// TUI: spellchecked input dialog (same look as ctx.ui.input, live typo highlighting);
+			// non-TUI modes keep the plain built-in input.
+			const reason = choice === undefined
+				? undefined
+				: ctx.mode === "tui"
+					? await ctx.ui.custom<string | undefined>((_tui, theme, _kb, done) => createSpellcheckInputDialog(theme, "✏️ What should change in the plan?", "e.g. use SQLite instead of JSON, drop step 3…", done))
+					: await ctx.ui.input("✏️ What should change in the plan?", "e.g. use SQLite instead of JSON, drop step 3…");
 				if (reason && reason.trim()) {
 					pi.sendUserMessage(
 						`The plan is REJECTED.\nUser feedback: ${reason.trim()}\n\nDo NOT implement anything from it. We are still in planning mode — revise ${file} accordingly and call finish_plan again when ready.`,
