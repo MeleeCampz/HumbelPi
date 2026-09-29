@@ -38,8 +38,8 @@ cd /path/to/any/project
 sbxpi
 ```
 
-`sbxpi` is a self-locating shim from the repo's `bin/` directory (one-time
-setup below) that launches `tools/sbx-pi.sh`, which:
+`sbxpi` is a self-locating shim from the repo's `bin/` directory (setup in
+[docs/sbxpi.md](docs/sbxpi.md)) that launches `tools/sbx-pi.sh`, which:
 
 1. Creates a sandbox from Docker's official pi kit (`docker.io/sbx/pi-kit:latest`),
    with `HUMBLE_PI_YOLO=1` baked in so yolo mode is on by default inside (see
@@ -59,70 +59,16 @@ setup below) that launches `tools/sbx-pi.sh`, which:
    session** in that folder (`pi --continue`). With no prior session it simply
    starts fresh; `sbxpi --new` always starts a fresh one.
 
-### One-time setup (per machine)
+### Setup & day-to-day
 
-- Docker Desktop with [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/install/)
-  enabled and the `sbx` CLI signed in (`sbx` on PATH or in
-  `%LOCALAPPDATA%\DockerSandboxes\bin`).
-- A bash and Node.js — on Windows that means Git for Windows (the scripts run
-  under its bash; WSL's `System32\bash.exe` won't do, the shims pin Git Bash
-  explicitly). On Linux/macOS your existing bash/node are fine.
-- **Add `<this repo>\bin` to your PATH** — that's it. The directory contains a
-  self-locating `sbxpi` shim per shell family (`sbxpi` for bash-family shells,
-  `sbxpi.ps1` for PowerShell, `sbxpi.cmd` for cmd), so the command works in
-  **any terminal on any OS** with no per-shell configuration:
-  - Windows: *Settings → Environment variables* (user `Path`), or in PowerShell:
-    ```powershell
-    $p = [Environment]::GetEnvironmentVariable('Path','User')
-    [Environment]::SetEnvironmentVariable('Path', "$p;C:\path\to\HumbelPi\bin", 'User')
-    ```
-    (avoid `setx` — it silently truncates values over 1024 characters)
-  - Linux/macOS: `export PATH="$PATH:/path/to/HumbelPi/bin"` in your shell rc
+Requirements in short: the standalone [`sbx` CLI](https://docs.docker.com/ai/sandboxes/install/)
+(signed in — **no Docker Desktop needed**, sbx ships its own microVM runtime),
+bash + Node.js, and `<this repo>\bin` on your PATH so `sbxpi` works in any
+terminal on any OS.
 
-  New terminals pick the entry up on launch; already-open windows keep the old
-  environment.
-
-  If you can't touch PATH, the fallback is a per-shell wrapper — e.g. a
-  PowerShell profile function calling
-  `& '<repo>\bin\sbxpi.ps1' @args` — but the PATH entry is the one-size-fits-all
-  solution.
-
-### Managing sandboxes
-
-| Command | Effect |
-|---|---|
-| `sbx ls` | list sandboxes (name, agent, status, workspace) |
-| `sbx run --name <n>` | attach to one |
-| `sbx stop <n>` | pause, keep the VM (fast restart) |
-| `sbx rm <n>` / `sbx rm --force <n…>` | delete — removes the VM and everything in it |
-| `sbx prune` | delete all stopped sandboxes |
-
-### How it works / gotchas
-
-- **The workspace is a live read-write mount** — the sandboxed pi edits your real
-  files. For isolation from your working tree, create with `sbx create --clone`
-  (agent works on a private clone; not yet wired into `sbxpi`).
-- **Reaching the local model:** all egress from the microVM is dialed by a proxy on
-  the host, and `host.docker.internal` resolves to your machine — so
-  `127.0.0.1:8888` (the VM's own loopback) fails while `host.docker.internal:8888`
-  reaches llama-server. No extra network-policy rules needed.
-- Sandboxes persist until `sbx rm`; re-running `sbxpi` just re-provisions and
-  re-attaches (resuming the last session), so model-config changes on the host
-  propagate on your next launch. `sbxpi --new` skips the resume.
-- Don't launch from your home directory — that mounts your entire profile
-  read-write into the VM.
-- **Paths above the workspace are VM-local:** the parent directories you see in
-  the VM (`/c/...` up the tree) are plain scaffold directories, *not* views of
-  your host folders. Anything the agent creates there (stray `AGENTS.md`,
-  scratch dirs) lives only inside the VM and dies with it — when the model
-  narrates "I can access the parent folder", that is contained.
-- **No Anthropic, by design:** Docker's pi kit bakes in egress allows for
-  `api.anthropic.com` / `platform.claude.com` and asks interactively whether to
-  bind an Anthropic credential when a sandbox is created. Since we run a local
-  model, `sbxpi` runs the create with detached stdin so sbx takes the default
-  (no binding, no prompt), and adds per-sandbox **deny** rules for both hosts
-  (deny outranks the kit's read-only allows). `registry.npmjs.org` stays
-  allowed — pi needs it for package installs.
+Full one-time setup (per OS), the sandbox management commands (`sbx ls / run /
+stop / rm / prune`) and how-it-works/gotchas live in
+[**docs/sbxpi.md**](docs/sbxpi.md).
 
 ## What's inside
 
@@ -149,6 +95,8 @@ imgs/                screenshots used in the sections below
 .githooks/pre-push   secret scan that runs on every push (this repo is public)
 bin/
   sbxpi, .ps1, .cmd  PATH launcher shims — `sbxpi` in any terminal/OS
+docs/
+  sbxpi.md           sbxpi setup (per OS), sandbox management, gotchas
 tools/
   sbx-pi.sh          one-command sandbox launcher — see "Real sandbox" below
   sbx-local-model.sh wires a sandbox's pi to the host's local model
