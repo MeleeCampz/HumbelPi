@@ -4,6 +4,37 @@ Personal [pi coding agent](https://github.com/badlogic/pi-mono) setup, distribut
 [pi package](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/packages.md).
 Everything here is **extensions** — the pi installation itself is never modified.
 
+What you get:
+
+- 🔒 **Guards** — a path sandbox and a git push guard gate risky operations with
+  permission dialogs ([file access](#sandbox--file-access-outside-the-project),
+  [push guard](#push-guard))
+- 🔥 **Yolo mode** — silence the path sandbox for a session; on by default inside
+  sandboxes ([yolo mode](#yolo-mode))
+- 🌙 **Unattended mode** — `/away [instruction]` keeps the agent working while you're
+  away, dialogs auto-reject ([unattended mode](#unattended-mode))
+- 📋 **Planning mode** — plan first, approve via dialog, then implement with progress
+  reporting ([planning mode](#planning-mode))
+- ✅ **Backlog** — a multi-select task checklist with plan/implement/done actions
+  ([backlog](#backlog))
+- ✍️ **Spellcheck** — live typo highlighting while you type ([spellcheck](#spellcheck))
+- 🔎 **Web search**, 💬 **ask_user** dialogs, 📈 **perf stats** in the footer
+
+Two ways to run it: plainly on your machine (install below), or — recommended — inside
+a real sandbox with one command: [Real sandbox (sbxpi)](#real-sandbox-docker-sandboxes-sbx).
+
+## Getting started
+
+```bash
+# 1. pi itself (pristine, unmodified)
+npm i -g @earendil-works/pi-coding-agent
+
+# 2. this package
+pi install git:github.com/MeleeCampz/HumbelPi
+```
+
+That's it — the extensions load into every pi session on this machine.
+
 ## ⚠️ The guards are not a real sandbox
 
 The path sandbox in `guards.ts` is a **heuristic**. It scans bash commands token by
@@ -71,85 +102,6 @@ stop / rm / prune`) and sbxpi-specific notes/gotchas live in
 [**docs/sbxpi.md**](docs/sbxpi.md) — for how Docker Sandboxes itself works, see
 the [official docs](https://docs.docker.com/ai/sandboxes/).
 
-## What's inside
-
-```
-extensions/
-  guards.ts        sandbox + git-push guard, yolo mode, unattended mode (/away [instruction]),
-                   planning mode (/plan on [task]), per-group permission dialogs,
-                   custom footer (perf stats), title sync
-  backlog.ts       /backlog checklist: multi-select + actions (plan/implement/done/delete/clear)
-  perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
-  working-task.ts  working_task tool — model sets/clears the current task in the working indicator
-  spellcheck.ts    spelling checks for user messages (dictionary: extensions/words-en.txt)
-  web-search.ts    web search tool
-  ask-user.ts      structured ask_user dialog
-imgs/                screenshots used in the sections below
-  SpellCheck.png         spellcheck highlighting
-  Planning_Mode.png      planning mode
-  Backlog.png            /backlog checklist
-  Guards_FileAccess.png  sandbox file-access dialog
-  GitPushGuard.png       push-guard dialog
-  YoloMode.png           yolo mode (title + status)
-  PerfIndicator.png      perf stats in the footer
-  SampleQuestion.png     ask_user dialog
-.githooks/pre-push   secret scan that runs on every push (this repo is public)
-bin/
-  sbxpi, .ps1, .cmd  PATH launcher shims — `sbxpi` in any terminal/OS
-docs/
-  sbxpi.md           sbxpi setup (per OS), sandbox management, gotchas
-tools/
-  sbx-pi.sh          one-command sandbox launcher — see "Real sandbox" below
-  sbx-local-model.sh wires a sandbox's pi to the host's local model
-```
-
-## Spellcheck
-
-`spellcheck.ts` replaces pi's editor with a subclass that highlights likely typos
-**live, in place, while you type** — red + underlined, like a web form. No prompts,
-no post-enter confirmation: the text is sent exactly as typed.
-
-![Spellcheck highlighting](imgs/SpellCheck.png)
-
-- Works **everywhere you type free text**: the main editor, slash-command arguments
-  (e.g. `/backlog <idea>`, `/plan reject [reason]`) and the free-text dialogs — the
-  `ask_user` “Other” answer and the plan-feedback input (“✏️ Keep planning”).
-- Dictionary: `extensions/words-en.txt` (~370k words, bundled); personal additions go
-  to `~/.pi/agent/spell-ignore.txt` (one word per line — names, identifiers, project terms).
-- Skipped: slash command names, CamelCase / ALLCAPS tokens, words with digits or symbols,
-  words ≤ 2 letters.
-- Toggle: `/spellcheck on | off | status`.
-
-## Planning mode
-
-![Planning mode](imgs/Planning_Mode.png)
-
-- Enter with `/plan on [task]` — one step: opens planning mode and hands the task
-  over as the plan's starting point.
-- **Per console**: plan state lives in `~/.pi/agent/session-state/<session>.json`, so
-  other pi consoles on the same machine are unaffected; resuming a session keeps its
-  plan, new sessions start clean.
-- While active, only the plan file is writable: `~/.pi/agent/plans/<project>/PLAN.md`;
-  reads and searches stay free.
-- The finished plan is presented via the **finish_plan** dialog — "✅ Approve & implement"
-  starts implementation immediately; "✏️ Keep planning" asks for a short refusal reason
-  that is fed back to the agent.
-- Planning state also syncs into the window title, so it's visible at a glance.
-
-## Backlog
-
-![Backlog checklist](imgs/Backlog.png)
-
-- Bare `/backlog` opens the project's task list (`.pi/backlog.md`) as a multi-select
-  checklist; `/backlog <idea>` appends a new item.
-- Navigate with ↑↓ / `j` `k`, toggle items with `x` or space, ⏎ confirms the selection,
-  esc cancels. Long items expand inline with `e` or → (word-wrapped full text);
-  several can be open at once.
-- After confirming, pick an action for the selected items: **plan** (hands them to
-  planning mode), **implement**, **mark done**, or **delete** — plus bottom rows for
-  clearing completed / all entries.
-- Status markers per item: `[ ]` open, `[~]` in progress, `[x]` done (rendered dimmed).
-
 ## Sandbox — file access outside the project
 
 ![Sandbox file-access dialog](imgs/Guards_FileAccess.png)
@@ -168,7 +120,7 @@ no post-enter confirmation: the text is sent exactly as typed.
 - Honest limitation: bash commands are scanned *heuristically* for the paths they
   touch — the sandbox is a guardrail, not a hard boundary. See
   [⚠️ The guards are not a real sandbox](#-the-guards-are-not-a-real-sandbox) —
-  for real isolation, use the [Docker Sandboxes setup below](#real-sandbox-docker-sandboxes-sbx).
+  for real isolation, use the [Docker Sandboxes setup above](#real-sandbox-docker-sandboxes-sbx).
 
 ## Push guard
 
@@ -219,12 +171,52 @@ no post-enter confirmation: the text is sent exactly as typed.
 - Visible in the window title (`🌙 AWAY — pi — <dir>`, combines with 🔥/📋), the footer
   marker, and the `/guards` status line.
 
-## Web search
+## Planning mode
 
-- Registers a `web_search` tool in every project.
-- Backends are tried in order: `BRAVE_API_KEY` (Brave Search API) →
-  `TAVILY_API_KEY` (Tavily) → DuckDuckGo HTML (no key required).
-- For full page content after a search, the agent just curls the URL.
+![Planning mode](imgs/Planning_Mode.png)
+
+- Enter with `/plan on [task]` — one step: opens planning mode and hands the task
+  over as the plan's starting point.
+- **Per console**: plan state lives in `~/.pi/agent/session-state/<session>.json`, so
+  other pi consoles on the same machine are unaffected; resuming a session keeps its
+  plan, new sessions start clean.
+- While active, only the plan file is writable: `~/.pi/agent/plans/<project>/PLAN.md`;
+  reads and searches stay free.
+- The finished plan is presented via the **finish_plan** dialog — "✅ Approve & implement"
+  starts implementation immediately; "✏️ Keep planning" asks for a short refusal reason
+  that is fed back to the agent.
+- Planning state also syncs into the window title, so it's visible at a glance.
+
+## Backlog
+
+![Backlog checklist](imgs/Backlog.png)
+
+- Bare `/backlog` opens the project's task list (`.pi/backlog.md`) as a multi-select
+  checklist; `/backlog <idea>` appends a new item.
+- Navigate with ↑↓ / `j` `k`, toggle items with `x` or space, ⏎ confirms the selection,
+  esc cancels. Long items expand inline with `e` or → (word-wrapped full text);
+  several can be open at once.
+- After confirming, pick an action for the selected items: **plan** (hands them to
+  planning mode), **implement**, **mark done**, or **delete** — plus bottom rows for
+  clearing completed / all entries.
+- Status markers per item: `[ ]` open, `[~]` in progress, `[x]` done (rendered dimmed).
+
+## Spellcheck
+
+`spellcheck.ts` replaces pi's editor with a subclass that highlights likely typos
+**live, in place, while you type** — red + underlined, like a web form. No prompts,
+no post-enter confirmation: the text is sent exactly as typed.
+
+![Spellcheck highlighting](imgs/SpellCheck.png)
+
+- Works **everywhere you type free text**: the main editor, slash-command arguments
+  (e.g. `/backlog <idea>`, `/plan reject [reason]`) and the free-text dialogs — the
+  `ask_user` “Other” answer and the plan-feedback input (“✏️ Keep planning”).
+- Dictionary: `extensions/words-en.txt` (~370k words, bundled); personal additions go
+  to `~/.pi/agent/spell-ignore.txt` (one word per line — names, identifiers, project terms).
+- Skipped: slash command names, CamelCase / ALLCAPS tokens, words with digits or symbols,
+  words ≤ 2 letters.
+- Toggle: `/spellcheck on | off | status`.
 
 ## Ask user
 
@@ -233,6 +225,13 @@ no post-enter confirmation: the text is sent exactly as typed.
 - The `ask_user` tool lets the agent check in before making an important assumption:
   it presents a list of concrete options plus a free-text "Other" escape hatch. Your
   answer comes back as the tool result and the agent proceeds with exactly that.
+
+## Web search
+
+- Registers a `web_search` tool in every project.
+- Backends are tried in order: `BRAVE_API_KEY` (Brave Search API) →
+  `TAVILY_API_KEY` (Tavily) → DuckDuckGo HTML (no key required).
+- For full page content after a search, the agent just curls the URL.
 
 ## Performance stats
 
@@ -244,14 +243,27 @@ no post-enter confirmation: the text is sent exactly as typed.
   when possible.
 - Measured client-side from pi's events — providers don't report server-side timing.
 
-## New machine setup
+## What's inside
 
-```bash
-# 1. pi itself (pristine, unmodified)
-npm i -g @earendil-works/pi-coding-agent
-
-# 2. this package
-pi install git:github.com/MeleeCampz/HumbelPi
+```
+extensions/
+  guards.ts        sandbox + git-push guard, yolo mode, unattended mode (/away [instruction]),
+                   planning mode (/plan on [task]), per-group permission dialogs,
+                   custom footer (perf stats), title sync
+  backlog.ts       /backlog checklist: multi-select + actions (plan/implement/done/delete/clear)
+  perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
+  working-task.ts  working_task tool — model sets/clears the current task in the working indicator
+  spellcheck.ts    spelling checks for user messages (dictionary: extensions/words-en.txt)
+  web-search.ts    web search tool
+  ask-user.ts      structured ask_user dialog
+.githooks/pre-push   secret scan that runs on every push (this repo is public)
+bin/
+  sbxpi, .ps1, .cmd  PATH launcher shims — `sbxpi` in any terminal/OS
+docs/
+  sbxpi.md           sbxpi setup (per OS), sandbox management, gotchas
+tools/
+  sbx-pi.sh          one-command sandbox launcher — see "Real sandbox" above
+  sbx-local-model.sh wires a sandbox's pi to the host's local model
 ```
 
 ## Development on a machine that uses this repo directly
