@@ -62,20 +62,20 @@ sbxpi
 - Docker Desktop with [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/install/)
   enabled and the `sbx` CLI signed in (`sbx` on PATH or in
   `%LOCALAPPDATA%\DockerSandboxes\bin`).
-- Git for Windows (the scripts run under its bash) and Node.js.
-- A function in your PowerShell profile (`$PROFILE`) — adjust the script path to
-  your clone:
+- A bash and Node.js — on Windows that means Git for Windows (the scripts run
+  under its bash; WSL's `System32\bash.exe` won't do, the shims pin Git Bash
+  explicitly). On Linux/macOS your existing bash/node are fine.
+- **Add `<this repo>\bin` to your PATH** — that's it. The directory contains a
+  self-locating `sbxpi` shim per shell family (`sbxpi` for bash-family shells,
+  `sbxpi.ps1` for PowerShell, `sbxpi.cmd` for cmd), so the command works in
+  **any terminal on any OS** with no per-shell configuration:
+  - Windows: *Settings → Environment variables* (or `setx PATH "%PATH%;C:\path\to\HumbelPi\bin"`)
+  - Linux/macOS: `export PATH="$PATH:/path/to/HumbelPi/bin"` in your shell rc
 
-```powershell
-function sbxpi {
-  # Git Bash first — other bashes on PATH (e.g. WSL's System32\bash.exe)
-  # don't understand the /c/... path form the scripts use.
-  $gitBash = 'C:\Program Files\Git\usr\bin\bash.exe'
-  $bash = if (Test-Path $gitBash) { $gitBash } else { (Get-Command bash.exe -ErrorAction SilentlyContinue).Source }
-  if (-not $bash) { Write-Error 'No bash found. Install Git for Windows.'; return }
-  & $bash '/c/path/to/your/HumbelPi/tools/sbx-pi.sh' @args   # @args forwards e.g. --new
-}
-```
+  If you can't touch PATH, the fallback is a per-shell wrapper — e.g. a
+  PowerShell profile function calling
+  `& '<repo>\bin\sbxpi.ps1' @args` — but the PATH entry is the one-size-fits-all
+  solution.
 
 ### Managing sandboxes
 
@@ -137,6 +137,8 @@ imgs/                screenshots used in the sections below
   PerfIndicator.png      perf stats in the footer
   SampleQuestion.png     ask_user dialog
 .githooks/pre-push   secret scan that runs on every push (this repo is public)
+bin/
+  sbxpi, .ps1, .cmd  PATH launcher shims — `sbxpi` in any terminal/OS
 tools/
   sbx-pi.sh          one-command sandbox launcher — see "Real sandbox" below
   sbx-local-model.sh wires a sandbox's pi to the host's local model
