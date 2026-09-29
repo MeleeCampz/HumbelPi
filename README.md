@@ -47,8 +47,10 @@ sbxpi
    workspace**, and this repo **read-only**.
 3. Wires your local model: copies the provider from your host's
    `~/.pi/agent/models.json` into the sandbox (baseUrl rewritten to
-   `http://host.docker.internal:8888/v1`) and sets it as pi's default model.
-   Sandboxes deliberately don't import user-level `~/.pi` config, so this step exists.
+   `http://host.docker.internal:8888/v1`) and sets it as pi's default model —
+   merged into `settings.json`, so installed packages and preferences survive
+   re-provisioning. Sandboxes deliberately don't import user-level `~/.pi`
+   config, so this step exists.
 4. Installs HumbelPi from the read-only mount — guards, backlog, `/away`, perf stats
    and friends run **inside** the VM, as a second layer on top of the real boundary.
 5. Drops you into pi's TUI, already on your model — and **continues your last
@@ -99,6 +101,11 @@ function sbxpi {
   propagate on your next launch. `sbxpi --new` skips the resume.
 - Don't launch from your home directory — that mounts your entire profile
   read-write into the VM.
+- **Paths above the workspace are VM-local:** the parent directories you see in
+  the VM (`/c/...` up the tree) are plain scaffold directories, *not* views of
+  your host folders. Anything the agent creates there (stray `AGENTS.md`,
+  scratch dirs) lives only inside the VM and dies with it — when the model
+  narrates "I can access the parent folder", that is contained.
 - **No Anthropic, by design:** Docker's pi kit bakes in egress allows for
   `api.anthropic.com` / `platform.claude.com` and asks interactively whether to
   bind an Anthropic credential when a sandbox is created. Since we run a local

@@ -63,14 +63,18 @@ bash "$DIR/sbx-local-model.sh" "$NAME"
 
 # Deny the kit's baked-in Anthropic hosts (deny outranks the kit's read-only
 # allows; npmjs.org stays allowed for pi's package installs). Idempotent.
-if ! "$SBX" policy ls "$NAME" --wide 2>/dev/null | grep -q "deny.*api.anthropic.com"; then
+# (Capture-then-grep: under pipefail, `cmd | grep -q` can fail via SIGPIPE
+# when grep exits early, flipping the condition on every run.)
+POLICY_LS=$("$SBX" policy ls "$NAME" --wide 2>/dev/null || true)
+if ! grep -q "deny.*api.anthropic.com" <<<"$POLICY_LS"; then
   "$SBX" policy deny network --protocol tcp --sandbox "$NAME" api.anthropic.com >/dev/null 2>&1
   "$SBX" policy deny network --protocol tcp --sandbox "$NAME" platform.claude.com >/dev/null 2>&1
 fi
 
 # Install this package from its mount (read-only extra, or the workspace
 # itself when the folder is this repo). No-op if already installed.
-if "$SBX" exec "$NAME" -- pi list 2>/dev/null | grep -qF "$(basename "$REPO")"; then
+PI_LIST=$("$SBX" exec "$NAME" -- pi list 2>/dev/null || true)
+if grep -qF "$(basename "$REPO")" <<<"$PI_LIST"; then
   echo "[skip] $(basename "$REPO") already installed in $NAME"
 else
   "$SBX" exec "$NAME" -- bash -c "cd '$REPO' && pi install ." && echo "[ok] $(basename "$REPO") installed in $NAME"

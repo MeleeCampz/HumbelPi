@@ -68,13 +68,23 @@ console.log("unsloth-studio/" + p.models[0].id);
 
 "$SBX" exec "$NAME" -- bash -c 'mkdir -p ~/.pi/agent && cat > ~/.pi/agent/models.json <<EOF
 '"$PROVIDER_JSON"'
-EOF
-cat > ~/.pi/agent/settings.json <<EOF
-{"defaultProvider": "unsloth-studio", "defaultModel": "'"${DEFAULT_MODEL#unsloth-studio/}"'"}
 EOF'
+
+# Merge the default model into settings.json — a full overwrite would wipe
+# everything pi wrote there (packages, theme, changelog version, ...), which
+# is what made `pi install .` look like it had to re-run on every launch.
+"$SBX" exec "$NAME" -- node -e '
+const fs = require("fs"), os = require("os"), path = require("path");
+const f = path.join(os.homedir(), ".pi", "agent", "settings.json");
+let s = {};
+try { s = JSON.parse(fs.readFileSync(f, "utf8")); } catch {}
+s.defaultProvider = "unsloth-studio";
+s.defaultModel = process.argv[1];
+fs.writeFileSync(f, JSON.stringify(s, null, 2) + "\n");
+' "${DEFAULT_MODEL#unsloth-studio/}"
 
 if [ "$INSTALL_PI" = 1 ]; then
   "$SBX" exec "$NAME" -- bash -c 'if [ -f package.json ]; then pi install .; else echo "[skip] no package.json in workspace"; fi'
 fi
 
-echo "[done] sandbox $NAME can now use: pi --model unsloth-studio/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
+echo "[done] sandbox $NAME can now use: pi --model $DEFAULT_MODEL"
