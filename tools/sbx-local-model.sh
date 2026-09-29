@@ -10,6 +10,15 @@
 #   --install-pi  also run `pi install .` in the sandbox's workspace (if it is a pi package)
 set -euo pipefail
 
+# bash.exe launched directly from PowerShell inherits a minimal PATH —
+# restore Git Bash's own tool dirs (see sbx-pi.sh).
+export PATH="/usr/bin:/bin:$PATH"
+
+# The interactive shell's PATH may also lack sbx/node — pin fallbacks (this machine).
+command -v sbx  >/dev/null 2>&1 || SBX="C:/Users/Tobias/AppData/Local/DockerSandboxes/bin/sbx.exe"
+command -v node >/dev/null 2>&1 || NODE="C:/Program Files/nodejs/node.exe"
+SBX="${SBX:-sbx}"; NODE="${NODE:-node}"
+
 NAME="${1:-}"; shift || true
 INSTALL_PI=0
 for a in "$@"; do
@@ -26,7 +35,7 @@ HOST_MODELS="${USERPROFILE:+$USERPROFILE/.pi/agent/models.json}"
 [ -f "${HOST_MODELS:-/nonexistent}" ] || HOST_MODELS="$HOME/.pi/agent/models.json"
 [ -f "$HOST_MODELS" ] || { echo "host models.json not found (looked in \$USERPROFILE and \$HOME)" >&2; exit 1; }
 
-PROVIDER_JSON=$(node -e '
+PROVIDER_JSON=$("$NODE" -e '
 const m = require(process.argv[1]);
 const p = m.providers && m.providers["unsloth-studio"];
 if (!p) { console.error("unsloth-studio provider not found in " + process.argv[1]); process.exit(1); }
@@ -34,12 +43,12 @@ p.baseUrl = "http://host.docker.internal:8888/v1";
 console.log(JSON.stringify({ providers: { "unsloth-studio": p } }, null, 2));
 ' "$HOST_MODELS")
 
-sbx exec "$NAME" -- bash -c 'mkdir -p ~/.pi/agent && cat > ~/.pi/agent/models.json <<EOF
+"$SBX" exec "$NAME" -- bash -c 'mkdir -p ~/.pi/agent && cat > ~/.pi/agent/models.json <<EOF
 '"$PROVIDER_JSON"'
 EOF'
 
 if [ "$INSTALL_PI" = 1 ]; then
-  sbx exec "$NAME" -- bash -c 'if [ -f package.json ]; then pi install .; else echo "[skip] no package.json in workspace"; fi'
+  "$SBX" exec "$NAME" -- bash -c 'if [ -f package.json ]; then pi install .; else echo "[skip] no package.json in workspace"; fi'
 fi
 
 echo "[done] sandbox $NAME can now use: pi --model unsloth-studio/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
