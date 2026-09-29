@@ -33,13 +33,13 @@ boundary, `tools/sbx-pi.sh` runs pi inside a
 [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) **microVM** — one
 command from any folder:
 
-```powershell
-cd C:\path\to\any\project
+```bash
+cd /path/to/any/project
 sbxpi
 ```
 
-`sbxpi` is a tiny function in your PowerShell profile (snippet below) that calls
-`tools/sbx-pi.sh`, which:
+`sbxpi` is a self-locating shim from the repo's `bin/` directory (one-time
+setup below) that launches `tools/sbx-pi.sh`, which:
 
 1. Creates a sandbox from Docker's official pi kit (`docker.io/sbx/pi-kit:latest`) —
    or reuses the existing one for this folder (sandboxes are named `pi-<folder>`).
@@ -69,8 +69,16 @@ sbxpi
   self-locating `sbxpi` shim per shell family (`sbxpi` for bash-family shells,
   `sbxpi.ps1` for PowerShell, `sbxpi.cmd` for cmd), so the command works in
   **any terminal on any OS** with no per-shell configuration:
-  - Windows: *Settings → Environment variables* (or `setx PATH "%PATH%;C:\path\to\HumbelPi\bin"`)
+  - Windows: *Settings → Environment variables* (user `Path`), or in PowerShell:
+    ```powershell
+    $p = [Environment]::GetEnvironmentVariable('Path','User')
+    [Environment]::SetEnvironmentVariable('Path', "$p;C:\path\to\HumbelPi\bin", 'User')
+    ```
+    (avoid `setx` — it silently truncates values over 1024 characters)
   - Linux/macOS: `export PATH="$PATH:/path/to/HumbelPi/bin"` in your shell rc
+
+  New terminals pick the entry up on launch; already-open windows keep the old
+  environment.
 
   If you can't touch PATH, the fallback is a per-shell wrapper — e.g. a
   PowerShell profile function calling
