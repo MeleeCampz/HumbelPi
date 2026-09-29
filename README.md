@@ -66,8 +66,11 @@ sbxpi
 
 ```powershell
 function sbxpi {
-  $bash = (Get-Command bash.exe -ErrorAction SilentlyContinue).Source
-  if (-not $bash) { $bash = 'C:\Program Files\Git\usr\bin\bash.exe' }
+  # Git Bash first — other bashes on PATH (e.g. WSL's System32\bash.exe)
+  # don't understand the /c/... path form the scripts use.
+  $gitBash = 'C:\Program Files\Git\usr\bin\bash.exe'
+  $bash = if (Test-Path $gitBash) { $gitBash } else { (Get-Command bash.exe -ErrorAction SilentlyContinue).Source }
+  if (-not $bash) { Write-Error 'No bash found. Install Git for Windows.'; return }
   & $bash '/c/path/to/your/HumbelPi/tools/sbx-pi.sh' @args   # @args forwards e.g. --new
 }
 ```
