@@ -56,6 +56,11 @@
  * ~/.pi/agent/session-state/<sessionId>.json. Consoles on the same machine are fully
  * independent; resuming a session keeps its state, new sessions start clean. Yolo mode,
  * sandbox grants and push-branch allowlists stay machine-global in guard-state.json.
+ *
+ * Yolo default: when HUMBLE_PI_YOLO=1 (baked into sbxpi sandboxes by tools/sbx-pi.sh
+ * via `sbx create --env`) new sessions start with yolo ON — the container is already
+ * the isolation boundary. /guards yolo off persists to the session file and keeps
+ * winning for that session.
  */
 
 import fs from "node:fs";

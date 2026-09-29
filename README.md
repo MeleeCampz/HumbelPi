@@ -41,8 +41,10 @@ sbxpi
 `sbxpi` is a self-locating shim from the repo's `bin/` directory (one-time
 setup below) that launches `tools/sbx-pi.sh`, which:
 
-1. Creates a sandbox from Docker's official pi kit (`docker.io/sbx/pi-kit:latest`) —
-   or reuses the existing one for this folder (sandboxes are named `pi-<folder>`).
+1. Creates a sandbox from Docker's official pi kit (`docker.io/sbx/pi-kit:latest`),
+   with `HUMBLE_PI_YOLO=1` baked in so yolo mode is on by default inside (see
+   [Yolo mode](#yolo-mode)) — or reuses the existing one for this folder (sandboxes
+   are named `pi-<folder>`).
 2. Mounts two things into the microVM: your current folder as a **read-write
    workspace**, and this repo **read-only**.
 3. Wires your local model: copies the provider from your host's
@@ -237,6 +239,12 @@ no post-enter confirmation: the text is sent exactly as typed.
   outside the project. The **push guard stays active**. Like planning and unattended
   mode, it is **per console**: state lives in `~/.pi/agent/session-state/<session>.json`,
   so other pi consoles on the same machine keep asking.
+- **Default ON in `sbxpi` sandboxes**: the `sbxpi` launcher creates every sandbox with
+  `HUMBLE_PI_YOLO=1` baked in (`sbx create --env`), and pi starts new sessions with yolo
+  mode already on there — in a proper sandbox the container IS the isolation boundary,
+  so the path guard would only add noise. Sandboxes without the variable keep the guards
+  fully active. A `/guards yolo off` sticks for that session (it's persisted to the
+  session-state file).
 - The state is visible at all times in the window title (`🔥 YOLO — pi — <dir>`) and
   in the `/guards` status line, so you always know it's on.
 - Toggle: `/guards yolo on | off`.

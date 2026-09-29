@@ -8,6 +8,11 @@
  *   • session-state/<sessionId>.json — per console/session: plan mode, unattended, yolo.
  *   • guard-state.json               — machine-global: sandbox/push guards + grants.
  *
+ * Yolo default: when HUMBLE_PI_YOLO=1 (baked into sbxpi sandboxes by tools/sbx-pi.sh
+ * via `sbx create --env`) sessions WITHOUT a state file yet start with yoloMode ON —
+ * the container is already the isolation boundary. A /guards yolo off persists to the
+ * session file and keeps winning for that session.
+ *
  * Why no mtime caches here (backlog #1): the files are ~100 bytes, reads are cheap
  * even at footer-render frequency, and stale-snapshot write-backs (load → await a
  * dialog → save the old object) used to resurrect planMode / clobber grants.
@@ -31,6 +36,18 @@ export interface SessionState {
 }
 
 export const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false, yoloMode: false };
+
+/**
+ * Yolo default: tools/sbx-pi.sh bakes HUMBLE_PI_YOLO=1 into the sandbox at create
+ * time (`sbx create --env`) — there the container IS the isolation boundary, so the
+ * path-sandbox guard is redundant and new sessions start with yolo mode ON.
+ */
+const YOLO_DEFAULT_ON = process.env.HUMBLE_PI_YOLO === "1";
+
+/** Defaults for a session with no state file yet: yolo ON when HUMBLE_PI_YOLO=1. */
+function freshSessionState(): SessionState {
+	return { ...DEFAULT_SESSION_STATE, yoloMode: YOLO_DEFAULT_ON };
+}
 
 let sessionStatePruned = false;
 
@@ -57,9 +74,9 @@ export function loadSessionState(sessionId: string): SessionState {
 	pruneOldSessionState();
 	try {
 		const s = JSON.parse(fs.readFileSync(sessionStateFile(sessionId), "utf8"));
-		return { ...DEFAULT_SESSION_STATE, ...s };
+		return { ...freshSessionState(), ...s };
 	} catch {
-		return { ...DEFAULT_SESSION_STATE };
+		return freshSessionState();
 	}
 }
 
