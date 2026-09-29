@@ -1,20 +1,39 @@
-# sbxpi — setup, management & gotchas
+# sbxpi — run pi in a sandbox
 
-Detailed companion to the [Real sandbox section of the README](../README.md#real-sandbox-docker-sandboxes-sbx):
-one-time setup per machine, day-to-day sandbox commands, and sbxpi-specific
-notes. Everything here assumes `sbxpi` does the launching — for how Docker
-Sandboxes itself works, see the [official docs](https://docs.docker.com/ai/sandboxes/).
+`sbxpi` launches [pi](https://github.com/badlogic/pi-mono) inside a
+[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) microVM with this
+repo installed and your local model wired up — one command, from any project
+folder:
+
+```bash
+cd /path/to/any/project
+sbxpi
+```
+
+- **First run in a folder** creates everything: the sandbox (named
+  `pi-<folder>`), the read-write workspace mount of your current folder, this
+  repo mounted read-only, your local model as pi's default, and HumbelPi
+  installed inside. Then it drops you into pi's TUI.
+- **Every later run** reuses that sandbox: it re-provisions (so host-side
+  model-config changes propagate), resumes your last session in the folder,
+  and attaches. `sbxpi --new` starts a fresh session instead of resuming.
+
+That's the whole workflow — `sbxpi` does all the launching; you never have to
+call `sbx create` yourself. For how Docker Sandboxes itself works, see the
+[official docs](https://docs.docker.com/ai/sandboxes/).
 
 ## One-time setup (per machine)
 
-- The [`sbx` CLI](https://docs.docker.com/ai/sandboxes/install/) — signed in. **No
-  Docker Desktop or Docker Engine needed**: sbx ships its own microVM runtime.
+Do this once before your first `sbxpi`:
+
+- The [`sbx` CLI](https://docs.docker.com/ai/sandboxes/install/) — signed in.
+  **No Docker Desktop or Docker Engine needed**: sbx ships its own microVM
+  runtime.
   - macOS (Sonoma 14+, Apple silicon): `brew trust docker/tap && brew install docker/tap/sbx`
   - Windows 11 (64-bit, Hypervisor Platform enabled): `winget install -h Docker.sbx`
-  - Linux: the standalone `docker-sbx` package (or Docker's convenience script with
-    `SBX=1` if you also want Docker Engine)
-  - After installing, sign in once (`sbx` prompts / `sbx login`); the CLI then lives
-    on your PATH or in `%LOCALAPPDATA%\DockerSandboxes\bin` (Windows default).
+  - Linux: the standalone `docker-sbx` package (or Docker's convenience script
+    with `SBX=1` if you also want Docker Engine)
+  - After installing, sign in once (`sbx` prompts / `sbx login`).
 - A bash and Node.js — on Windows that means Git for Windows (the scripts run
   under its bash; WSL's `System32\bash.exe` won't do, the shims pin Git Bash
   explicitly). On Linux/macOS your existing bash/node are fine.
@@ -24,12 +43,13 @@ Sandboxes itself works, see the [official docs](https://docs.docker.com/ai/sandb
   **any terminal on any OS** with no per-shell configuration. New terminals pick
   the entry up on launch.
 
-## Managing sandboxes
+## Day-to-day
 
 | Command | Effect |
 |---|---|
+| `sbxpi` | (re)launch pi in this folder's sandbox, resume last session |
+| `sbxpi --new` | same, but a fresh session |
 | `sbx ls` | list sandboxes (name, agent, status, workspace) |
-| `sbx run --name <n>` | attach to one |
 | `sbx stop <n>` | pause, keep the VM (fast restart) |
 | `sbx rm <n>` / `sbx rm --force <n…>` | delete — removes the VM and everything in it |
 | `sbx prune` | delete all stopped sandboxes |
@@ -39,9 +59,6 @@ Sandboxes itself works, see the [official docs](https://docs.docker.com/ai/sandb
 - **The workspace is a live read-write mount** — the sandboxed pi edits your real
   files. Don't launch from your home directory: that would mount your entire
   profile read-write into the VM.
-- Sandboxes persist until `sbx rm`; re-running `sbxpi` just re-provisions and
-  re-attaches (resuming the last session), so model-config changes on the host
-  propagate on your next launch. `sbxpi --new` skips the resume.
 - **Paths above the workspace are VM-local:** the parent directories you see in
   the VM (`/c/...` up the tree) are *not* views of your host folders — anything
   the agent creates there lives only inside the VM and dies with it. When the
