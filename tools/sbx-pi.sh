@@ -76,9 +76,12 @@ else
   "$SBX" exec "$NAME" -- bash -c "cd '$REPO' && pi install ." && echo "[ok] $(basename "$REPO") installed in $NAME"
 fi
 
+# NOTE: no "pi" after the "--" — the kit's entrypoint IS pi, and everything
+# after "--" is appended to it. Passing "pi" again would make pi treat it as
+# an initial prompt message (the model answers a stray "pi" on startup).
 if [ -t 0 ] && [ -t 1 ]; then
-  exec "$SBX" run --name "$NAME" -- pi $PI_ARGS
+  exec "$SBX" run --name "$NAME" -- $PI_ARGS
 fi
 echo
-echo "Attach with:  sbx run --name $NAME -- pi $PI_ARGS"
+echo "Attach with:  sbx run --name $NAME -- $PI_ARGS"
 echo "Remove with:  sbx rm $NAME"
