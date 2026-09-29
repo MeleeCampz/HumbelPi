@@ -14,9 +14,16 @@ set -euo pipefail
 # Git Bash's own tool dirs — add them so basename/tr/awk/grep resolve.
 export PATH="/usr/bin:/bin:$PATH"
 
-# The interactive shell's PATH may also lack sbx/node — pin fallbacks (this machine).
-command -v sbx >/dev/null 2>&1 || SBX="C:/Users/Tobias/AppData/Local/DockerSandboxes/bin/sbx.exe"
-SBX="${SBX:-sbx}"
+# The interactive shell's PATH may lack sbx — resolve it with a Windows fallback
+# (Docker Sandboxes' default install dir), else fail with a clear message.
+if command -v sbx >/dev/null 2>&1; then
+  SBX="sbx"
+elif [ -n "${LOCALAPPDATA:-}" ] && [ -f "$LOCALAPPDATA/DockerSandboxes/bin/sbx.exe" ]; then
+  SBX="$LOCALAPPDATA/DockerSandboxes/bin/sbx.exe"
+else
+  echo "error: sbx not found on PATH (looked in \$LOCALAPPDATA/DockerSandboxes/bin too). Install Docker Sandboxes or add it to PATH." >&2
+  exit 1
+fi
 
 FOLDER="${1:-$PWD}"
 [ -d "$FOLDER" ] || { echo "not a directory: $FOLDER" >&2; exit 1; }
@@ -39,12 +46,12 @@ fi
 
 bash "$DIR/sbx-local-model.sh" "$NAME"
 
-# Install HumbelPi from its mount (read-only extra, or the workspace itself
-# when the folder is this repo). No-op if already installed.
-if "$SBX" exec "$NAME" -- pi list 2>/dev/null | grep -q "HumbelPi"; then
-  echo "[skip] HumbelPi already installed in $NAME"
+# Install this package from its mount (read-only extra, or the workspace
+# itself when the folder is this repo). No-op if already installed.
+if "$SBX" exec "$NAME" -- pi list 2>/dev/null | grep -qF "$(basename "$REPO")"; then
+  echo "[skip] $(basename "$REPO") already installed in $NAME"
 else
-  "$SBX" exec "$NAME" -- bash -c "cd '$REPO' && pi install ." && echo "[ok] HumbelPi installed in $NAME"
+  "$SBX" exec "$NAME" -- bash -c "cd '$REPO' && pi install ." && echo "[ok] $(basename "$REPO") installed in $NAME"
 fi
 
 if [ -t 0 ] && [ -t 1 ]; then

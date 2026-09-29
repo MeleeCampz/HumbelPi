@@ -14,10 +14,24 @@ set -euo pipefail
 # restore Git Bash's own tool dirs (see sbx-pi.sh).
 export PATH="/usr/bin:/bin:$PATH"
 
-# The interactive shell's PATH may also lack sbx/node — pin fallbacks (this machine).
-command -v sbx  >/dev/null 2>&1 || SBX="C:/Users/Tobias/AppData/Local/DockerSandboxes/bin/sbx.exe"
-command -v node >/dev/null 2>&1 || NODE="C:/Program Files/nodejs/node.exe"
-SBX="${SBX:-sbx}"; NODE="${NODE:-node}"
+# The interactive shell's PATH may lack sbx/node — resolve each with common
+# install-location fallbacks (Windows), else fail with a clear message.
+if command -v sbx >/dev/null 2>&1; then
+  SBX="sbx"
+elif [ -n "${LOCALAPPDATA:-}" ] && [ -f "$LOCALAPPDATA/DockerSandboxes/bin/sbx.exe" ]; then
+  SBX="$LOCALAPPDATA/DockerSandboxes/bin/sbx.exe"
+else
+  echo "error: sbx not found on PATH (looked in \$LOCALAPPDATA/DockerSandboxes/bin too). Install Docker Sandboxes or add it to PATH." >&2
+  exit 1
+fi
+if command -v node >/dev/null 2>&1; then
+  NODE="node"
+elif [ -f "/c/Program Files/nodejs/node.exe" ]; then
+  NODE="/c/Program Files/nodejs/node.exe"
+else
+  echo "error: node not found on PATH (looked in C:\\Program Files\\nodejs too). Install Node.js or add it to PATH." >&2
+  exit 1
+fi
 
 NAME="${1:-}"; shift || true
 INSTALL_PI=0

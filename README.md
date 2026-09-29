@@ -23,6 +23,77 @@ run pi inside a proper sandbox:** a Docker container, a VM, a devcontainer, or a
 least strict OS-level user/permissions. The guards then become a second layer of
 convenience on top of a real boundary, not the boundary itself.
 
+This repo ships exactly that: [Real sandbox (Docker Sandboxes / sbx)](#real-sandbox-docker-sandboxes-sbx)
+— one command, pi running in a microVM with HumbelPi installed inside.
+
+## Real sandbox (Docker Sandboxes / sbx)
+
+[The guards](#-the-guards-are-not-a-real-sandbox) are a guardrail. For a real
+boundary, `tools/sbx-pi.sh` runs pi inside a
+[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) **microVM** — one
+command from any folder:
+
+```powershell
+cd C:\path\to\any\project
+sbxpi
+```
+
+`sbxpi` is a tiny function in your PowerShell profile (snippet below) that calls
+`tools/sbx-pi.sh`, which:
+
+1. Creates a sandbox from Docker's official pi kit (`docker.io/sbx/pi-kit:latest`) —
+   or reuses the existing one for this folder (sandboxes are named `pi-<folder>`).
+2. Mounts two things into the microVM: your current folder as a **read-write
+   workspace**, and this repo **read-only**.
+3. Wires your local model: copies the provider from your host's
+   `~/.pi/agent/models.json` into the sandbox (baseUrl rewritten to
+   `http://host.docker.internal:8888/v1`) and sets it as pi's default model.
+   Sandboxes deliberately don't import user-level `~/.pi` config, so this step exists.
+4. Installs HumbelPi from the read-only mount — guards, backlog, `/away`, perf stats
+   and friends run **inside** the VM, as a second layer on top of the real boundary.
+5. Drops you into pi's TUI, already on your model.
+
+### One-time setup (per machine)
+
+- Docker Desktop with [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/install/)
+  enabled and the `sbx` CLI signed in (`sbx` on PATH or in
+  `%LOCALAPPDATA%\DockerSandboxes\bin`).
+- Git for Windows (the scripts run under its bash) and Node.js.
+- A function in your PowerShell profile (`$PROFILE`) — adjust the script path to
+  your clone:
+
+```powershell
+function sbxpi {
+  $bash = (Get-Command bash.exe -ErrorAction SilentlyContinue).Source
+  if (-not $bash) { $bash = 'C:\Program Files\Git\usr\bin\bash.exe' }
+  & $bash '/c/path/to/your/HumbelPi/tools/sbx-pi.sh'
+}
+```
+
+### Managing sandboxes
+
+| Command | Effect |
+|---|---|
+| `sbx ls` | list sandboxes (name, agent, status, workspace) |
+| `sbx run --name <n>` | attach to one |
+| `sbx stop <n>` | pause, keep the VM (fast restart) |
+| `sbx rm <n>` / `sbx rm --force <n…>` | delete — removes the VM and everything in it |
+| `sbx prune` | delete all stopped sandboxes |
+
+### How it works / gotchas
+
+- **The workspace is a live read-write mount** — the sandboxed pi edits your real
+  files. For isolation from your working tree, create with `sbx create --clone`
+  (agent works on a private clone; not yet wired into `sbxpi`).
+- **Reaching the local model:** all egress from the microVM is dialed by a proxy on
+  the host, and `host.docker.internal` resolves to your machine — so
+  `127.0.0.1:8888` (the VM's own loopback) fails while `host.docker.internal:8888`
+  reaches llama-server. No extra network-policy rules needed.
+- Sandboxes persist until `sbx rm`; re-running `sbxpi` just re-provisions and
+  re-attaches, so model-config changes on the host propagate on your next launch.
+- Don't launch from your home directory — that mounts your entire profile
+  read-write into the VM.
+
 ## What's inside
 
 ```
@@ -46,6 +117,9 @@ imgs/                screenshots used in the sections below
   PerfIndicator.png      perf stats in the footer
   SampleQuestion.png     ask_user dialog
 .githooks/pre-push   secret scan that runs on every push (this repo is public)
+tools/
+  sbx-pi.sh          one-command sandbox launcher — see "Real sandbox" below
+  sbx-local-model.sh wires a sandbox's pi to the host's local model
 ```
 
 ## Spellcheck
@@ -113,7 +187,7 @@ no post-enter confirmation: the text is sent exactly as typed.
 - Honest limitation: bash commands are scanned *heuristically* for the paths they
   touch — the sandbox is a guardrail, not a hard boundary. See
   [⚠️ The guards are not a real sandbox](#-the-guards-are-not-a-real-sandbox) —
-  for real isolation, run pi in Docker/a VM.
+  for real isolation, use the [Docker Sandboxes setup below](#real-sandbox-docker-sandboxes-sbx).
 
 ## Push guard
 
