@@ -2,12 +2,15 @@
 # Launch a ready-to-work pi sandbox for any folder: mounts the folder as the
 # workspace, wires the local Unsloth Studio model, and prints the attach command.
 #
-# Usage: tools/sbx-pi.sh [folder] [sandbox-name]
+# Usage: tools/sbx-pi.sh [--new] [folder] [sandbox-name]
 #   folder        defaults to the current directory — run it from anywhere
 #   sandbox-name  defaults to pi-<folder basename>
+#   --new         start a fresh pi session instead of continuing the last one
 #
 # Re-running for an existing sandbox skips creation and just re-provisions.
-# In an interactive terminal, drops you straight into pi (sbx run) when done.
+# In an interactive terminal, drops you straight into pi (sbx run) when done —
+# by default it continues the last session in that folder (pi --continue);
+# with no prior session it simply starts fresh.
 set -euo pipefail
 
 # bash.exe launched directly from PowerShell inherits a minimal PATH without
@@ -25,11 +28,19 @@ else
   exit 1
 fi
 
-FOLDER="${1:-$PWD}"
+NEW=0; POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --new) NEW=1 ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+FOLDER="${POSITIONAL[0]:-$PWD}"
 [ -d "$FOLDER" ] || { echo "not a directory: $FOLDER" >&2; exit 1; }
 
 BASE=$(basename "$FOLDER")
-NAME="${2:-pi-$(echo "$BASE" | tr -cd 'A-Za-z0-9-')}"
+NAME="${POSITIONAL[1]:-pi-$(echo "$BASE" | tr -cd 'A-Za-z0-9-')}"
+if [ "$NEW" -eq 1 ]; then PI_ARGS=""; else PI_ARGS="--continue"; fi
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$DIR/.." && pwd)"
 
@@ -55,8 +66,8 @@ else
 fi
 
 if [ -t 0 ] && [ -t 1 ]; then
-  exec "$SBX" run --name "$NAME"
+  exec "$SBX" run --name "$NAME" -- pi $PI_ARGS
 fi
 echo
-echo "Attach with:  sbx run --name $NAME"
+echo "Attach with:  sbx run --name $NAME -- pi $PI_ARGS"
 echo "Remove with:  sbx rm $NAME"

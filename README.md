@@ -51,7 +51,9 @@ sbxpi
    Sandboxes deliberately don't import user-level `~/.pi` config, so this step exists.
 4. Installs HumbelPi from the read-only mount — guards, backlog, `/away`, perf stats
    and friends run **inside** the VM, as a second layer on top of the real boundary.
-5. Drops you into pi's TUI, already on your model.
+5. Drops you into pi's TUI, already on your model — and **continues your last
+   session** in that folder (`pi --continue`). With no prior session it simply
+   starts fresh; `sbxpi --new` always starts a fresh one.
 
 ### One-time setup (per machine)
 
@@ -66,7 +68,7 @@ sbxpi
 function sbxpi {
   $bash = (Get-Command bash.exe -ErrorAction SilentlyContinue).Source
   if (-not $bash) { $bash = 'C:\Program Files\Git\usr\bin\bash.exe' }
-  & $bash '/c/path/to/your/HumbelPi/tools/sbx-pi.sh'
+  & $bash '/c/path/to/your/HumbelPi/tools/sbx-pi.sh' @args   # @args forwards e.g. --new
 }
 ```
 
@@ -90,7 +92,8 @@ function sbxpi {
   `127.0.0.1:8888` (the VM's own loopback) fails while `host.docker.internal:8888`
   reaches llama-server. No extra network-policy rules needed.
 - Sandboxes persist until `sbx rm`; re-running `sbxpi` just re-provisions and
-  re-attaches, so model-config changes on the host propagate on your next launch.
+  re-attaches (resuming the last session), so model-config changes on the host
+  propagate on your next launch. `sbxpi --new` skips the resume.
 - Don't launch from your home directory — that mounts your entire profile
   read-write into the VM.
 
