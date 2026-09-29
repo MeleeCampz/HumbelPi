@@ -2,14 +2,15 @@
 # Launch a ready-to-work pi sandbox for any folder: mounts the folder as the
 # workspace, wires the local Unsloth Studio model, and prints the attach command.
 #
-# Usage: tools/sbx-pi.sh <folder> [sandbox-name]
+# Usage: tools/sbx-pi.sh [folder] [sandbox-name]
+#   folder        defaults to the current directory — run it from anywhere
 #   sandbox-name  defaults to pi-<folder basename>
 #
 # Re-running for an existing sandbox skips creation and just re-provisions.
+# In an interactive terminal, drops you straight into pi (sbx run) when done.
 set -euo pipefail
 
-FOLDER="${1:-}"
-[ -n "$FOLDER" ] || { echo "usage: $0 <folder> [sandbox-name]" >&2; exit 1; }
+FOLDER="${1:-$PWD}"
 [ -d "$FOLDER" ] || { echo "not a directory: $FOLDER" >&2; exit 1; }
 
 BASE=$(basename "$FOLDER")
@@ -24,6 +25,9 @@ fi
 
 bash "$DIR/sbx-local-model.sh" "$NAME"
 
+if [ -t 0 ] && [ -t 1 ]; then
+  exec sbx run --name "$NAME"
+fi
 echo
 echo "Attach with:  sbx run --name $NAME"
 echo "Remove with:  sbx rm $NAME"
