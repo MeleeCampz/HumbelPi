@@ -67,8 +67,9 @@ bash + Node.js, and `<this repo>\bin` on your PATH so `sbxpi` works in any
 terminal on any OS.
 
 Full one-time setup (per OS), the sandbox management commands (`sbx ls / run /
-stop / rm / prune`) and how-it-works/gotchas live in
-[**docs/sbxpi.md**](docs/sbxpi.md).
+stop / rm / prune`) and sbxpi-specific notes/gotchas live in
+[**docs/sbxpi.md**](docs/sbxpi.md) — for how Docker Sandboxes itself works, see
+the [official docs](https://docs.docker.com/ai/sandboxes/).
 
 ## What's inside
 
