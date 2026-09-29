@@ -43,8 +43,20 @@ p.baseUrl = "http://host.docker.internal:8888/v1";
 console.log(JSON.stringify({ providers: { "unsloth-studio": p } }, null, 2));
 ' "$HOST_MODELS")
 
+# Default model for the sandbox's pi (first model of the provider), so it
+# starts on the local model instead of pi's built-in default.
+DEFAULT_MODEL=$("$NODE" -e '
+const m = require(process.argv[1]);
+const p = m.providers && m.providers["unsloth-studio"];
+if (!p || !p.models || !p.models.length) process.exit(1);
+console.log("unsloth-studio/" + p.models[0].id);
+' "$HOST_MODELS")
+
 "$SBX" exec "$NAME" -- bash -c 'mkdir -p ~/.pi/agent && cat > ~/.pi/agent/models.json <<EOF
 '"$PROVIDER_JSON"'
+EOF
+cat > ~/.pi/agent/settings.json <<EOF
+{"defaultProvider": "unsloth-studio", "defaultModel": "'"${DEFAULT_MODEL#unsloth-studio/}"'"}
 EOF'
 
 if [ "$INSTALL_PI" = 1 ]; then
