@@ -100,10 +100,11 @@ function sbxpi {
 - Don't launch from your home directory — that mounts your entire profile
   read-write into the VM.
 - **No Anthropic, by design:** Docker's pi kit bakes in egress allows for
-  `api.anthropic.com` / `platform.claude.com` and an interactive credential
-  prompt at attach. Since we run a local model, `sbxpi` suppresses the prompt
-  (`SBX_PROMPT_CREDENTIALS=0`) and adds per-sandbox **deny** rules for both
-  hosts (deny outranks the kit's read-only allows). `registry.npmjs.org` stays
+  `api.anthropic.com` / `platform.claude.com` and asks interactively whether to
+  bind an Anthropic credential when a sandbox is created. Since we run a local
+  model, `sbxpi` runs the create with detached stdin so sbx takes the default
+  (no binding, no prompt), and adds per-sandbox **deny** rules for both hosts
+  (deny outranks the kit's read-only allows). `registry.npmjs.org` stays
   allowed — pi needs it for package installs.
 
 ## What's inside

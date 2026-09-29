@@ -17,11 +17,6 @@ set -euo pipefail
 # Git Bash's own tool dirs — add them so basename/tr/awk/grep resolve.
 export PATH="/usr/bin:/bin:$PATH"
 
-# The pi kit bakes in Anthropic egress allows and an interactive credential
-# prompt at attach. We run a local model, so never prompt for it (value may
-# need to be "false" on other sbx versions if "0" doesn't stick).
-export SBX_PROMPT_CREDENTIALS=0
-
 # The interactive shell's PATH may lack sbx — resolve it with a Windows fallback
 # (Docker Sandboxes' default install dir), else fail with a clear message.
 if command -v sbx >/dev/null 2>&1; then
@@ -57,7 +52,11 @@ HUMBLE_MOUNT=()
 if "$SBX" ls | awk '{print $1}' | grep -qx "$NAME"; then
   echo "[exists] sandbox $NAME already exists — re-provisioning only"
 else
-  "$SBX" create --name "$NAME" "docker.io/sbx/pi-kit:latest" "$FOLDER" "${HUMBLE_MOUNT[@]}"
+  # The pi kit asks interactively whether to bind an Anthropic credential at
+  # create time. We run a local model, so detach stdin: sbx takes the default
+  # (no binding) without prompting and just notes the credential was not
+  # injected. (Only create loses its stdin — the later attach keeps the TTY.)
+  "$SBX" create --name "$NAME" "docker.io/sbx/pi-kit:latest" "$FOLDER" "${HUMBLE_MOUNT[@]}" </dev/null
 fi
 
 bash "$DIR/sbx-local-model.sh" "$NAME"
