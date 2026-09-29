@@ -931,14 +931,21 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Unattended mode is already OFF. /away [instruction] to start working while you're away.", "info");
 				return;
 			}
+			// #5: mid-run instructions steer the active run (delivered before its next LLM call)
+			// instead of queueing as a follow-up that only lands after the whole run finishes.
+			const streaming = !ctx.isIdle();
 			if (!ss.unattendedMode) {
 				updateSessionState(sid, s => { s.unattendedMode = true; });
 				applyTitle(ctx);
-				ctx.ui.notify("🌙 Unattended mode ON (this console) — all confirmation dialogs auto-rejected until /away or a new session.", "info");
+				ctx.ui.notify(streaming
+					? "🌙 Unattended mode ON (this console) — instruction steered into the running turn; dialogs auto-rejected until /away or a new session."
+					: "🌙 Unattended mode ON (this console) — all confirmation dialogs auto-rejected until /away or a new session.", "info");
 			} else {
-				ctx.ui.notify("Already unattended — sending your instruction.", "info");
+				ctx.ui.notify(streaming
+					? "Already unattended — steering your instruction into the running turn."
+					: "Already unattended — sending your instruction.", "info");
 			}
-			pi.sendUserMessage(instruction, { deliverAs: "followUp" });
+			pi.sendUserMessage(instruction, { deliverAs: streaming ? "steer" : "followUp" });
 		},
 	});
 

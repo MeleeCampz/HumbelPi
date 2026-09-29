@@ -141,7 +141,9 @@ no post-enter confirmation: the text is sent exactly as typed.
 
 - For when you step away and want the agent to keep working: `/away [instruction]`
   turns unattended mode on and immediately hands your instruction to the agent as its
-  next message. Bare `/away` turns it off.
+  next message. If a run is already active, the instruction **steers** that run —
+  delivered before the agent's next LLM call so it can redirect immediately instead
+  of finishing the old task first. Bare `/away` turns it off.
 - While on, **every confirmation dialogue is auto-rejected instead of hanging**: the
   sandbox path dialog, the push guard, `ask_user`, and the `finish_plan` approval all
   decline automatically, and each rejection tells the model to pick the safest reasonable
