@@ -17,6 +17,11 @@ set -euo pipefail
 # Git Bash's own tool dirs — add them so basename/tr/awk/grep resolve.
 export PATH="/usr/bin:/bin:$PATH"
 
+# The pi kit bakes in Anthropic egress allows and an interactive credential
+# prompt at attach. We run a local model, so never prompt for it (value may
+# need to be "false" on other sbx versions if "0" doesn't stick).
+export SBX_PROMPT_CREDENTIALS=0
+
 # The interactive shell's PATH may lack sbx — resolve it with a Windows fallback
 # (Docker Sandboxes' default install dir), else fail with a clear message.
 if command -v sbx >/dev/null 2>&1; then
@@ -56,6 +61,13 @@ else
 fi
 
 bash "$DIR/sbx-local-model.sh" "$NAME"
+
+# Deny the kit's baked-in Anthropic hosts (deny outranks the kit's read-only
+# allows; npmjs.org stays allowed for pi's package installs). Idempotent.
+if ! "$SBX" policy ls "$NAME" --wide 2>/dev/null | grep -q "deny.*api.anthropic.com"; then
+  "$SBX" policy deny network --protocol tcp --sandbox "$NAME" api.anthropic.com >/dev/null 2>&1
+  "$SBX" policy deny network --protocol tcp --sandbox "$NAME" platform.claude.com >/dev/null 2>&1
+fi
 
 # Install this package from its mount (read-only extra, or the workspace
 # itself when the folder is this repo). No-op if already installed.
