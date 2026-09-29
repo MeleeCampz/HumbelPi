@@ -50,9 +50,14 @@ It can be bypassed, intentionally or not:
 - any tool or code path that isn't inspected token-by-token.
 
 **If you work with untrusted content, very capable models, or unattended runs —
-run pi inside a proper sandbox:** a Docker container, a VM, a devcontainer, or at
-least strict OS-level user/permissions. The guards then become a second layer of
-convenience on top of a real boundary, not the boundary itself.
+run pi inside a proper sandbox:** a microVM (Docker Sandboxes, Firecracker & co.),
+a VM, or at least strict OS-level user/permissions. The guards then become a
+second layer of convenience on top of a real boundary, not the boundary itself.
+
+Note: **a plain Docker container is NOT a real sandbox** — it only isolates via
+namespaces and cgroups on the *shared host kernel*, so a kernel exploit can escape
+it. MicroVMs (like Docker Sandboxes) give each sandbox its own kernel; that is what
+makes them a real boundary.
 
 This repo ships exactly that: [Real sandbox (Docker Sandboxes / sbx)](#real-sandbox-docker-sandboxes-sbx)
 — one command, pi running in a microVM with HumbelPi installed inside.

@@ -15,7 +15,8 @@
  *                        • known limitation: creating a brand-new directory tree
  *                          OUTSIDE the project is not flagged (nothing exists yet).
  *                      This is a guardrail, NOT a security boundary — for real
- *                      isolation run pi in a proper sandbox (Docker/VM/devcontainer).
+ *                      isolation run pi in a proper sandbox (microVM/VM — a plain
+ *                      Docker container shares the host kernel and is not one).
  *                      Two grant tiers:
  *                        • allowedPaths   — full access, never asks (read + write)
  *                        • readOnlyPaths  — reads pass silently; writes/edits/
@@ -975,7 +976,7 @@ export default function (pi: ExtensionAPI) {
 					`  allowed paths  : ${state.allowedPaths.length ? state.allowedPaths.join(", ") : "(none)"}`,
 					`  read-only paths : ${state.readOnlyPaths.length ? state.readOnlyPaths.join(", ") : "(none)"}`,
 					`  allowed branches: ${state.allowedBranches.length ? state.allowedBranches.join(", ") : "(none)"}`,
-					`  ⚠ heuristic guard only — for real isolation run pi in a proper sandbox (Docker/VM)`,
+					`  ⚠ heuristic guard only — for real isolation run pi in a microVM/VM (a plain Docker container is not one)`,
 				].join("\n");
 
 			switch (cmd) {
