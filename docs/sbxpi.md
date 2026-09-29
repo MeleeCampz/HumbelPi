@@ -20,22 +20,8 @@ the hood.
 - **Add `<this repo>\bin` to your PATH** — that's it. The directory contains a
   self-locating `sbxpi` shim per shell family (`sbxpi` for bash-family shells,
   `sbxpi.ps1` for PowerShell, `sbxpi.cmd` for cmd), so the command works in
-  **any terminal on any OS** with no per-shell configuration:
-  - Windows: *Settings → Environment variables* (user `Path`), or in PowerShell:
-    ```powershell
-    $p = [Environment]::GetEnvironmentVariable('Path','User')
-    [Environment]::SetEnvironmentVariable('Path', "$p;C:\path\to\HumbelPi\bin", 'User')
-    ```
-    (avoid `setx` — it silently truncates values over 1024 characters)
-  - Linux/macOS: `export PATH="$PATH:/path/to/HumbelPi/bin"` in your shell rc
-
-  New terminals pick the entry up on launch; already-open windows keep the old
-  environment.
-
-  If you can't touch PATH, the fallback is a per-shell wrapper — e.g. a
-  PowerShell profile function calling
-  `& '<repo>\bin\sbxpi.ps1' @args` — but the PATH entry is the one-size-fits-all
-  solution.
+  **any terminal on any OS** with no per-shell configuration. New terminals pick
+  the entry up on launch.
 
 ## Managing sandboxes
 
