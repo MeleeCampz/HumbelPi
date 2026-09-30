@@ -44,8 +44,9 @@
  *   /guards reset                  clear all grants, re-enable both guards
  *
  * 3. Planning mode — /plan on [task] | off | approve [file] | implement <file> | reject [reason]
- *    Only the pinned plan file may be written (default: ~/.pi/agent/plans/<project>/PLAN.md,
- *    outside the repo). finish_plan presents the finished plan for approval; approve or
+ *    Only the pinned plan file may be written (default: <project>/.pi/PLAN.md —
+ *    in the project, gitignored, next to the backlog). finish_plan presents the
+ *    finished plan for approval; approve or
  *    implement starts implementation with step-by-step progress reporting.
  * 4. Unattended mode — /away [instruction] | /away
  *    The user is away: every confirmation dialog (sandbox, push guard, ask_user,
@@ -360,13 +361,13 @@ export function bashWriteTargets(command: string): string[] | null {
 	return targets;
 }
 
-export function sanitizeProjectName(name: string): string {
-	return name.replace(/[^\w.-]/g, "_") || "project";
-}
-
-/** Plans live outside the repo so git status stays clean. (Exported — backlog.ts reuses it.) */
+/**
+ * Plans live in the project's .pi folder (gitignored, next to .pi/backlog.md) so
+ * they are easy to access — including when pi runs in a VM where the home dir is
+ * ephemeral. (Exported — backlog.ts reuses it.)
+ */
 export function defaultPlanFile(cwd: string): string {
-	return path.join(os.homedir(), ".pi", "agent", "plans", sanitizeProjectName(path.basename(cwd)), "PLAN.md");
+	return path.join(cwd, ".pi", "PLAN.md");
 }
 
 /** Shared implementation instruction (used by /plan approve, /plan implement and finish_plan). */

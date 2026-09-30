@@ -185,8 +185,9 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
 - **Per console**: plan state lives in `~/.pi/agent/session-state/<session>.json`, so
   other pi consoles on the same machine are unaffected; resuming a session keeps its
   plan, new sessions start clean.
-- While active, only the plan file is writable: `~/.pi/agent/plans/<project>/PLAN.md`;
-  reads and searches stay free.
+- While active, only the plan file is writable: `<project>/.pi/PLAN.md` (in the
+  project, gitignored, next to the backlog — easy to access even when pi runs in a
+  VM); reads and searches stay free.
 - The finished plan is presented via the **finish_plan** dialog — "✅ Approve & implement"
   starts implementation immediately; "✏️ Keep planning" asks for a short refusal reason
   that is fed back to the agent.
