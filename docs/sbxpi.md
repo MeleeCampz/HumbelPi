@@ -73,3 +73,19 @@ Do this once before your first `sbxpi`:
   the microVM is the isolation boundary, the path guard would only add noise.
   `/guards yolo off` switches it back for a session; see
   [Yolo mode](../README.md#yolo-mode).
+- **Windows Terminal: Shift+Enter submits instead of inserting a newline.** WT
+  sends the same bytes for Shift+Enter as for plain Enter (`\r`), and pi inside
+  the VM cannot read modifier state (that Win32 detection only exists when pi
+  runs natively on Windows). Fix in your `settings.json` — bind Shift+Enter to a
+  `sendInput` action that injects a literal `\n`, which pi's editor treats as
+  "insert newline":
+  ```json
+  "actions": [
+    { "command": { "action": "sendInput", "input": "\n" }, "id": "User.sendNewLineInput" }
+  ],
+  "keybindings": [
+    { "id": "User.sendNewLineInput", "keys": "shift+enter" }
+  ]
+  ```
+  (A profile-level `sendInput` chord does NOT work for this — the keybinding
+  form is required. Until you set it, **Ctrl+J** inserts a newline.)
