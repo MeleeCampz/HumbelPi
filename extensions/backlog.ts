@@ -22,7 +22,7 @@ import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@ea
 // #1: session state lives in the shared module (single writer, fresh RMW saves).
 // Importing ./guards only evaluates its top-level constants/functions — the default
 // export factory is NOT invoked, so nothing gets registered twice.
-import { GUARD_STATE_FILE, loadSessionState, updateSessionState } from "./lib/session-state";
+import { loadSessionState, updateSessionState } from "./lib/session-state";
 import { defaultPlanFile } from "./guards";
 
 type Marker = " " | "~" | "x";
@@ -32,7 +32,8 @@ const ENTRY_RE = /^- \[( |~|x)\] (\d+)\. /;
 
 // #4: plan state is PER SESSION (see ./lib/session-state) — consoles on the same
 // machine are independent; this only ever touches the current session's file.
-// guard-state.json itself is only probed as a "guards installed" sanity check.
+// (#11: no guard-state.json probe — that file is absent on fresh machines even
+// though guards works fine with defaults, so it was a false-negative install check.)
 
 // ── Backlog file helpers ────────────────────────────────────────────────
 
@@ -174,7 +175,9 @@ function createChecklist(
       if (matchesKey(data, "escape")) { done(undefined); return; }
       if (matchesKey(data, "enter")) {
         if (cursor >= items.length) { done(ACTION_ROWS[cursor - items.length].id); return; }
-        done(selected.size > 0 ? [...selected].sort((a, b) => a - b) : undefined);
+        // #11: Enter with nothing selected picks the hovered item — no more silent confirm.
+        const pick = selected.size > 0 ? [...selected] : [items[cursor].num];
+        done(pick.sort((a, b) => a - b));
         return;
       }
       if (matchesKey(data, "up") || data === "k") { cursor = Math.max(0, cursor - 1); return; }
@@ -199,7 +202,7 @@ function createChecklist(
     render(width: number): string[] {
       const lines: string[] = [
         theme.fg("dim", `📋 Backlog — ${items.length} item(s) · select one or more`),
-        theme.fg("dim", "↑↓/jk move · x/space select · ← collapse / → expand (e toggles) · ⏎ confirm · esc cancel"),
+        theme.fg("dim", "↑↓/jk move · x/space select · ← collapse / → expand (e toggles) · ⏎ confirm (or pick hovered item) · esc cancel"),
       ];
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
@@ -280,10 +283,6 @@ export default function (pi: ExtensionAPI) {
 
       const doPlan = async (nums: number[]): Promise<void> => {
         const lines = nums.map(entryRefLine);
-        if (!fs.existsSync(GUARD_STATE_FILE)) {
-          pi.sendUserMessage(`Planning mode is not set up on this machine — run /plan on first. Items to plan:\n${lines.join("\n")}`, { deliverAs: "followUp" });
-          return;
-        }
         const sid = ctx.sessionManager.getSessionId();
         const ss = loadSessionState(sid);
         let justTurnedOn = false;
@@ -299,6 +298,11 @@ export default function (pi: ExtensionAPI) {
           ss.planFile = saved.planFile; // the messages below quote the pinned file
           ctx.ui.setTitle(`📋 PLAN — pi — ${path.basename(ctx.cwd) || "pi"}`);
           justTurnedOn = true;
+          // #11: belt-and-braces after flipping planning mode ON — re-read and warn
+          // loudly if it didn't land (mirror of verifyPlanModeOff in guards.ts).
+          if (!loadSessionState(sid).planMode) {
+            ctx.ui.notify("⚠️ Planning mode did NOT turn on — the session-state file still says OFF. Check ~/.pi/agent/session-state/ for other writers.", "warning");
+          }
         }
         const taskList = `Your task: plan these backlog items:\n${lines.join("\n")}\nDraft the plan for them now.`;
         if (justTurnedOn) {
