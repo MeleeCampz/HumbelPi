@@ -200,9 +200,14 @@ function createChecklist(
     },
 
     render(width: number): string[] {
+      // Static header lines must be truncated too — pi's renderer throws
+      // (and the TUI crashes) when ANY line exceeds the terminal width.
       const lines: string[] = [
-        theme.fg("dim", `📋 Backlog — ${items.length} item(s) · select one or more`),
-        theme.fg("dim", "↑↓/jk move · x/space select · ← collapse / → expand (e toggles) · ⏎ confirm (or pick hovered item) · esc cancel"),
+        theme.fg("dim", truncateToWidth(`📋 Backlog — ${items.length} item(s) · select one or more`, width)),
+        theme.fg("dim", truncateToWidth(
+          "↑↓/jk move · x/space select · ← collapse / → expand (e toggles) · ⏎ confirm (or pick hovered item) · esc cancel",
+          width,
+        )),
       ];
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
@@ -239,7 +244,9 @@ function createChecklist(
         const row = items.length + a;
         lines.push(theme.fg("dim", `${row === cursor ? "❯" : " "} ${ACTION_ROWS[a].label}`));
       }
-      return lines;
+      // Belt-and-braces: no line may ever exceed the terminal width, whatever
+      // its source (emoji width quirks, future edits). Measure ANSI-aware.
+      return lines.map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
     },
 
     invalidate(): void {},
