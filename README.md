@@ -9,8 +9,8 @@ What you get:
 - 🔒 **Guards** — a path sandbox and a git push guard gate risky operations with
   permission dialogs ([file access](#sandbox--file-access-outside-the-project),
   [push guard](#push-guard))
-- 🔥 **Yolo mode** — silence the path sandbox for a session; on by default inside
-  sandboxes ([yolo mode](#yolo-mode))
+- 🔥 **Yolo mode** — silence the path sandbox; a machine-wide setting that sticks
+  until you toggle it, on by default inside sandboxes ([yolo mode](#yolo-mode))
 - 🌙 **Unattended mode** — `/away [instruction]` keeps the agent working while you're
   away, dialogs auto-reject ([unattended mode](#unattended-mode))
 - 📋 **Planning mode** — plan first, approve via dialog, then implement with progress
@@ -142,15 +142,19 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
 ![Yolo mode](imgs/YoloMode.png)
 
 - 🔥 YOLO mode silences the path sandbox — tool calls no longer ask about paths
-  outside the project. The **push guard stays active**. Like planning and unattended
-  mode, it is **per console**: state lives in `~/.pi/agent/session-state/<session>.json`,
-  so other pi consoles on the same machine keep asking.
-- **Default ON in `sbxpi` sandboxes**: the `sbxpi` launcher creates every sandbox with
-  `HUMBLE_PI_YOLO=1` baked in (`sbx create --env`), and pi starts new sessions with yolo
-  mode already on there — in a proper sandbox the container IS the isolation boundary,
-  so the path guard would only add noise. Sandboxes without the variable keep the guards
-  fully active. A `/guards yolo off` sticks for that session (it's persisted to the
-  session-state file).
+  outside the project. The **push guard stays active**. It is a **machine-wide setting**
+  (unlike planning and unattended mode, which are per console): state lives in
+  `~/.pi/agent/guard-state.json`, so a toggle sticks until you explicitly change it —
+  across sessions, sandbox restarts, `/new` and `/resume`. It can no longer flip off
+  by accident when pi starts a fresh session (#14).
+- **Default ON in sandboxes**: yolo defaults on whenever a sandbox is detected —
+  `HUMBLE_PI_YOLO=1` (baked into every `sbxpi` sandbox at create time), the
+  `SANDBOX_NAME` env var docker-sandboxes sets, or `/run/sandbox` on disk. In a proper
+  sandbox the container IS the isolation boundary, so the path guard would only add
+  noise — and old sandboxes created before the env var existed are covered by the
+  other two signals. Outside a sandbox the default is off, guards fully active.
+  A `/guards yolo off` (or `on`) sets it explicitly and keeps winning; `/guards`
+  status shows whether the active value is `(set)` or a `(default: …)`.
 - The state is visible at all times in the window title (`🔥 YOLO — pi — <dir>`) and
   in the `/guards` status line, so you always know it's on.
 - Toggle: `/guards yolo on | off`.

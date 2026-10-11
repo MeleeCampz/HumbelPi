@@ -69,10 +69,11 @@ Do this once before your first `sbxpi`:
   model is reached via `host.docker.internal:8888`, which resolves to your host
   from inside the VM; no network-policy rules needed.)
 - **Yolo by default:** sandboxes created by `sbxpi` carry `HUMBLE_PI_YOLO=1`
-  (baked in via `sbx create --env`), so new sessions start with yolo mode on —
-  the microVM is the isolation boundary, the path guard would only add noise.
-  `/guards yolo off` switches it back for a session; see
-  [Yolo mode](../README.md#yolo-mode).
+  (baked in via `sbx create --env`), and yolo defaults on whenever a sandbox is
+  detected (`SANDBOX_NAME` / `/run/sandbox` cover older sandboxes too) — the microVM
+  is the isolation boundary, the path guard would only add noise. Yolo is a
+  machine-wide setting: `/guards yolo off` sticks until toggled back (across
+  sessions and restarts); see [Yolo mode](../README.md#yolo-mode).
 - **Windows Terminal: Shift+Enter submits instead of inserting a newline.** WT
   sends the same bytes for Shift+Enter as for plain Enter (`\r`), and pi inside
   the VM cannot read modifier state (that Win32 detection only exists when pi

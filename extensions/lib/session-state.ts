@@ -5,13 +5,15 @@
  * content (update*), and every write is atomic (tmp + rename) so a reader never
  * sees a partial file.
  *
- *   • session-state/<sessionId>.json — per console/session: plan mode, unattended, yolo.
- *   • guard-state.json               — machine-global: sandbox/push guards + grants.
+ *   • session-state/<sessionId>.json — per console/session: plan mode, unattended.
+ *   • guard-state.json               — machine-global: sandbox/push guards + grants + yolo.
  *
- * Yolo default: when HUMBLE_PI_YOLO=1 (baked into sbxpi sandboxes by tools/sbx-pi.sh
- * via `sbx create --env`) sessions WITHOUT a state file yet start with yoloMode ON —
- * the container is already the isolation boundary. A /guards yolo off persists to the
- * session file and keeps winning for that session.
+ * Yolo (#14): a MACHINE-GLOBAL setting in guard-state.json — a /guards yolo toggle
+ * sticks until explicitly changed, across sessions, restarts, /new and /resume. Its
+ * default is dynamic (yoloDefaultOn()): ON when we detect a sandbox (HUMBLE_PI_YOLO=1,
+ * SANDBOX_NAME set, or /run/sandbox present) — the container is already the isolation
+ * boundary, so the path-sandbox guard would only add noise. An explicit value in the
+ * file always wins over the default.
  *
  * Why no mtime caches here (backlog #1): the files are ~100 bytes, reads are cheap
  * even at footer-render frequency, and stale-snapshot write-backs (load → await a
@@ -32,21 +34,27 @@ export interface SessionState {
 	planMode: boolean;
 	planFile: string | null;
 	unattendedMode: boolean;
-	yoloMode: boolean;
 }
 
-export const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false, yoloMode: false };
+export const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false };
 
 /**
- * Yolo default: tools/sbx-pi.sh bakes HUMBLE_PI_YOLO=1 into the sandbox at create
- * time (`sbx create --env`) — there the container IS the isolation boundary, so the
- * path-sandbox guard is redundant and new sessions start with yolo mode ON.
+ * Yolo default (#14): ON when we detect a sandbox — the container IS the isolation
+ * boundary, so the path-sandbox guard is redundant. Detection covers:
+ *   • HUMBLE_PI_YOLO=1 — baked in by tools/sbx-pi.sh at create time (`sbx create --env`)
+ *   • SANDBOX_NAME     — set by docker-sandboxes in every sandbox (also old sandboxes
+ *                        created before the env var existed)
+ *   • /run/sandbox     — present in direct/clone-mode sandboxes
  */
-const YOLO_DEFAULT_ON = process.env.HUMBLE_PI_YOLO === "1";
+export function yoloDefaultOn(): boolean {
+	return process.env.HUMBLE_PI_YOLO === "1"
+		|| Boolean(process.env.SANDBOX_NAME)
+		|| fs.existsSync("/run/sandbox");
+}
 
-/** Defaults for a session with no state file yet: yolo ON when HUMBLE_PI_YOLO=1. */
+/** Defaults for a session with no state file yet. */
 function freshSessionState(): SessionState {
-	return { ...DEFAULT_SESSION_STATE, yoloMode: YOLO_DEFAULT_ON };
+	return { ...DEFAULT_SESSION_STATE };
 }
 
 let sessionStatePruned = false;
@@ -74,7 +82,9 @@ export function loadSessionState(sessionId: string): SessionState {
 	pruneOldSessionState();
 	try {
 		const s = JSON.parse(fs.readFileSync(sessionStateFile(sessionId), "utf8"));
-		return { ...freshSessionState(), ...s };
+		// #14 one-way migration: strip the legacy per-session yolo key (now global).
+		const { yoloMode: _legacyYolo, ...clean } = s as SessionState & Record<string, unknown>;
+		return { ...freshSessionState(), ...clean };
 	} catch {
 		return freshSessionState();
 	}
@@ -107,7 +117,9 @@ function atomicWriteJson(file: string, data: unknown): void {
 /** Plain save of a full state object (callers that already hold the desired state). */
 export function saveSessionState(sessionId: string, s: SessionState): void {
 	fs.mkdirSync(SESSION_STATE_DIR, { recursive: true });
-	atomicWriteJson(sessionStateFile(sessionId), s);
+	// #14 one-way migration: never persist the legacy per-session yolo key again.
+	const { yoloMode: _legacyYolo, ...clean } = s as SessionState & Record<string, unknown>;
+	atomicWriteJson(sessionStateFile(sessionId), clean);
 }
 
 /**
@@ -134,6 +146,8 @@ export interface GuardState {
 	allowedBranches: string[];
 	/** Shift-select in the input editor (select-editor.ts). Defaults ON. */
 	selectionMode?: boolean;
+	/** Yolo mode (#14): machine-global; default is dynamic — see yoloDefaultOn(). */
+	yoloMode: boolean;
 }
 
 export const DEFAULT_GUARD_STATE: GuardState = {
@@ -143,16 +157,44 @@ export const DEFAULT_GUARD_STATE: GuardState = {
 	readOnlyPaths: [],
 	allowedBranches: [],
 	selectionMode: true,
+	yoloMode: false,
 };
+
+/**
+ * #14 one-way migration: when guard-state.json has no explicit yoloMode key yet, seed
+ * it from the most recently modified session-state file (the old per-console setting),
+ * falling back to the sandbox default. Persisted on the next save; an explicit value
+ * in the file always wins over both.
+ */
+function migrateLegacyYolo(raw: Record<string, unknown>): boolean {
+	if (typeof raw.yoloMode === "boolean") return raw.yoloMode;
+	let best: { mtimeMs: number; yolo: boolean } | null = null;
+	try {
+		for (const f of fs.readdirSync(SESSION_STATE_DIR)) {
+			if (!f.endsWith(".json")) continue;
+			const p = path.join(SESSION_STATE_DIR, f);
+			try {
+				const s = JSON.parse(fs.readFileSync(p, "utf8"));
+				if (typeof s?.yoloMode !== "boolean") continue;
+				const mtimeMs = fs.statSync(p).mtimeMs;
+				if (!best || mtimeMs > best.mtimeMs) best = { mtimeMs, yolo: s.yoloMode };
+			} catch { /* unreadable/corrupt — skip */ }
+		}
+	} catch { /* dir missing — nothing to migrate */ }
+	return best?.yolo ?? yoloDefaultOn();
+}
 
 /** Fresh read of the global guard state — defaults when missing or corrupt. Never cached. */
 export function loadGuardState(): GuardState {
 	try {
-		const s = { ...DEFAULT_GUARD_STATE, ...JSON.parse(fs.readFileSync(GUARD_STATE_FILE, "utf8")) };
+		const raw = JSON.parse(fs.readFileSync(GUARD_STATE_FILE, "utf8")) as Record<string, unknown>;
+		const s = { ...DEFAULT_GUARD_STATE, ...raw } as GuardState;
 		if (!Array.isArray(s.readOnlyPaths)) s.readOnlyPaths = [];
+		s.yoloMode = migrateLegacyYolo(raw);
 		return s;
 	} catch {
-		return { ...DEFAULT_GUARD_STATE, allowedPaths: [], readOnlyPaths: [], allowedBranches: [] };
+		// No file yet — still run the one-way migration (it falls back to the default).
+		return { ...DEFAULT_GUARD_STATE, allowedPaths: [], readOnlyPaths: [], allowedBranches: [], yoloMode: migrateLegacyYolo({}) };
 	}
 }
 
@@ -165,8 +207,9 @@ export function updateGuardState(mutate: (s: GuardState) => void): GuardState {
 	const s = loadGuardState();
 	mutate(s);
 	fs.mkdirSync(path.dirname(GUARD_STATE_FILE), { recursive: true });
-	// Strip legacy keys that pre-#4 versions may have left behind.
-	const { planMode: _pm, planFile: _pf, planSessionId: _ps, unattendedMode: _um, unattendedSessionId: _us, yoloMode: _yo, ...clean } = s as GuardState & Record<string, unknown>;
+	// Strip legacy keys that pre-#4 versions may have left behind. (#14: yoloMode is a
+	// FIRST-CLASS global field again — do NOT strip it here.)
+	const { planMode: _pm, planFile: _pf, planSessionId: _ps, unattendedMode: _um, unattendedSessionId: _us, ...clean } = s as GuardState & Record<string, unknown>;
 	atomicWriteJson(GUARD_STATE_FILE, clean);
 	return s;
 }

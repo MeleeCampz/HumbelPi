@@ -56,10 +56,12 @@ else
   # create time. We run a local model, so detach stdin: sbx takes the default
   # (no binding) without prompting and just notes the credential was not
   # injected. (Only create loses its stdin — the later attach keeps the TTY.)
-  # --env HUMBLE_PI_YOLO=1: yolo-by-default. pi's guards extension starts new
-  # sessions with yolo ON when this var is set — in a proper sandbox the
-  # container IS the isolation boundary, so the path-sandbox guard would only
-  # add noise. Baked in at create time, so every attach method picks it up.
+  # --env HUMBLE_PI_YOLO=1: yolo-by-default (one of three signals — see
+  # yoloDefaultOn() in extensions/lib/session-state.ts). In a proper sandbox the
+  # container IS the isolation boundary, so the path-sandbox guard would only add
+  # noise. Baked in at create time so every attach method picks it up; sandboxes
+  # created before this flag existed still get yolo ON via SANDBOX_NAME / /run/sandbox
+  # detection, so no re-creation is needed.
   "$SBX" create --name "$NAME" --env HUMBLE_PI_YOLO=1 "docker.io/sbx/pi-kit:latest" "$FOLDER" "${HUMBLE_MOUNT[@]}" </dev/null
 fi
 

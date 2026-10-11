@@ -59,10 +59,11 @@
  * independent; resuming a session keeps its state, new sessions start clean. Yolo mode,
  * sandbox grants and push-branch allowlists stay machine-global in guard-state.json.
  *
- * Yolo default: when HUMBLE_PI_YOLO=1 (baked into sbxpi sandboxes by tools/sbx-pi.sh
- * via `sbx create --env`) new sessions start with yolo ON — the container is already
- * the isolation boundary. /guards yolo off persists to the session file and keeps
- * winning for that session.
+ * #14: yolo is a MACHINE-GLOBAL setting — a /guards yolo toggle sticks until explicitly
+ * changed (across sessions, restarts, /new, /resume). Its default is dynamic
+ * (yoloDefaultOn()): ON when a sandbox is detected (HUMBLE_PI_YOLO=1 baked in by
+ * tools/sbx-pi.sh, SANDBOX_NAME set by docker-sandboxes, or /run/sandbox present) —
+ * the container is already the isolation boundary. An explicit file value always wins.
  */
 
 import fs from "node:fs";
@@ -82,13 +83,14 @@ import {
 	sessionStateFile,
 	loadSessionState,
 	updateSessionState,
+	yoloDefaultOn,
 	type GuardState,
 } from "./lib/session-state";
 
 const PROTECTED_BRANCHES = new Set(["main", "master"]);
 
-// #4: plan/unattended/yolo state is per session (own file keyed by session id) and
-// lives in ./lib/session-state together with the machine-global guard state.
+// #4: plan/unattended state is per session (own file keyed by session id); yolo is
+// machine-global (#14). Both live in ./lib/session-state.
 // #1: no mtime caches there — every read is fresh, every save is atomic, and all
 // mutations go through update*() read-modify-write so a snapshot loaded before an
 // awaited dialog can never write stale fields back.
@@ -387,6 +389,14 @@ function verifyPlanModeOff(ctx: ExtensionContext, sid: string): void {
 
 // ── git push helpers ────────────────────────────────────────────
 
+/**
+ * #14: whether guard-state.json stores an EXPLICIT yoloMode value (vs. the dynamic
+ * sandbox default applied in loadGuardState) — /guards status shows which is active.
+ */
+function yoloIsExplicit(): boolean {
+	try { return typeof (JSON.parse(fs.readFileSync(GUARD_STATE_FILE, "utf8")) as Record<string, unknown>).yoloMode === "boolean"; } catch { return false; }
+}
+
 /** Async git — never blocks the TUI event loop (execSync did). */
 function git(cwd: string, args: string[]): Promise<string | null> {
 	return new Promise((resolve) => {
@@ -425,7 +435,8 @@ function applyTitle(ctx: ExtensionContext): void {
 	// #12: 🛡️ shown in the normal state; away + yolo + plan combine instead of hiding each other.
 	// Away/yolo/plan are all per-session (#4).
 	const s = loadSessionState(ctx.sessionManager.getSessionId());
-	const marker = [s.unattendedMode ? "🌙 AWAY" : null, s.yoloMode ? "🔥 YOLO" : null, s.planMode ? "📋 PLAN" : null].filter(Boolean).join(" · ");
+	const g = loadGuardState(); // #14: yolo is machine-global
+	const marker = [s.unattendedMode ? "🌙 AWAY" : null, g.yoloMode ? "🔥 YOLO" : null, s.planMode ? "📋 PLAN" : null].filter(Boolean).join(" · ");
 	ctx.ui.setTitle(marker ? `${marker} — pi — ${dir}` : `🛡️ pi — ${dir}`);
 }
 
@@ -448,7 +459,8 @@ function createGuardFooter(ctx: any): (tui: any, theme: any, footerData: any) =>
 		render(width: number): string[] {
 			const state = loadGuardState();
 			const ss = loadSessionState(ctx.sessionManager.getSessionId());
-			const marker = [ss.unattendedMode ? "🌙" : null, ss.yoloMode ? "🔥" : null, ss.planMode ? "📋" : null].filter(Boolean).join(" ") || "🛡️";
+			// #14: yolo marker comes from the machine-global guard state, not the session file.
+			const marker = [ss.unattendedMode ? "🌙" : null, state.yoloMode ? "🔥" : null, ss.planMode ? "📋" : null].filter(Boolean).join(" ") || "🛡️";
 
 			// --- line 1: marker + pwd (+ branch, session name) ---
 			let cwd = ctx.sessionManager.getCwd();
@@ -585,7 +597,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		// ── 1. path sandbox ──
-		if (state.sandboxEnabled && !ss.yoloMode) {
+		if (state.sandboxEnabled && !state.yoloMode) { // #14: yolo is machine-global
 			let suspects: string[] = [];
 			let isWrite = false;
 			// The pinned plan file is already vetted by the planning gate — never prompt for it.
@@ -969,7 +981,7 @@ export default function (pi: ExtensionAPI) {
 			const statusText = () =>
 				[
 					`🛡️ Guards (${GUARD_STATE_FILE})`,
-					`  yolo    : ${ss.yoloMode ? "🔥 ON (this console — sandbox silenced)" : "off"}`,
+					`  yolo    : ${state.yoloMode ? "🔥 ON (sandbox silenced)" : "off"} ${yoloIsExplicit() ? "(set)" : `(default: ${yoloDefaultOn() ? "sandbox detected" : "no sandbox"})`}`,
 					`  unattended: ${ss.unattendedMode ? "🌙 ON (this console — dialogs auto-rejected)" : "off"}`,
 					`  plan    : ${ss.planMode ? `📋 ON (this console — ${ss.planFile ?? "no file bound"})` : "off"}`,
 					`  sandbox : ${state.sandboxEnabled ? "ON " : "OFF"}`,
@@ -989,15 +1001,16 @@ export default function (pi: ExtensionAPI) {
 
 				case "yolo": {
 					const arg = (rest[0] ?? "").toLowerCase();
-					const next = arg === "on" ? true : arg === "off" ? false : !ss.yoloMode;
-					updateSessionState(sid, s => { s.yoloMode = next; });
+					// #14: machine-global — the toggle sticks until explicitly changed.
+					const next = arg === "on" ? true : arg === "off" ? false : !state.yoloMode;
+					updateGuardState(s => { s.yoloMode = next; });
 					applyTitle(ctx);
 					// #12: "info" (replaceable status line) for both directions — a "warning"
 					// notification is a permanent chat line that never gets cleared on exit.
 					ctx.ui.notify(
 						next
-							? "🔥 YOLO mode ON (this console) — path sandbox silenced (push guard still active). /guards yolo off to exit."
-							: "YOLO mode off — guards fully active.",
+							? "🔥 YOLO mode ON (machine-wide) — path sandbox silenced (push guard still active). /guards yolo off to exit."
+							: "YOLO mode off (machine-wide) — guards fully active.",
 						"info",
 					);
 					break;
