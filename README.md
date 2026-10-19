@@ -17,6 +17,8 @@ What you get:
   reporting ([planning mode](#planning-mode))
 - ✅ **Backlog** — a multi-select task checklist with plan/implement/done actions
   ([backlog](#backlog))
+- 🖱️ **Shift select** — standard shift+arrow text selection with clipboard copy in the
+  input editor, where pi's shift keys are dead by default ([shift select](#shift-select))
 - ✍️ **Spellcheck** — live typo highlighting while you type ([spellcheck](#spellcheck))
 - 🔎 **Web search**, 💬 **ask_user** dialogs, 📈 **perf stats** in the footer
 
@@ -83,9 +85,11 @@ sbxpi
    are named `pi-<folder>`).
 2. Mounts two things into the microVM: your current folder as a **read-write
    workspace**, and this repo **read-only**.
-3. Wires your local model: copies the provider from your host's
-   `~/.pi/agent/models.json` into the sandbox (baseUrl rewritten to
-   `http://host.docker.internal:8888/v1`) and sets it as pi's default model —
+3. Wires your local model: copies **every locally hosted provider** from your
+   host's `~/.pi/agent/models.json` into the sandbox (baseUrl host rewritten to
+   `host.docker.internal`, port/path kept — e.g. `http://host.docker.internal:8889/v1`
+   for Strata) and sets a default model — `strata` if defined, else
+   `unsloth-studio` —
    merged into `settings.json`, so installed packages and preferences survive
    re-provisioning. Sandboxes deliberately don't import user-level `~/.pi`
    config, so this step exists.
@@ -211,6 +215,29 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
   clearing completed / all entries.
 - Status markers per item: `[ ]` open, `[~]` in progress, `[x]` done (rendered dimmed).
 
+## Shift select
+
+`select-editor.ts` replaces pi's editor with a subclass that turns the input into a
+normal text editor for selection: pi's shift+arrow keys are dead by default, this makes
+them select text — and lets you copy it to the system clipboard. It composes with
+spellcheck (it extends the spellchecking editor, so typo highlighting keeps working).
+
+- **Select:** hold `Shift` + `← → ↑ ↓ Home End` to extend the selection from the caret;
+  `Ctrl+Shift+←/→` jumps by words. The selected range is drawn with a gray background
+  and a `⬒ N` character-count indicator on the editor's bottom border.
+- **Copy:** `Shift+Insert`, `Ctrl+Shift+C`, or plain `Ctrl+C` while a selection exists
+  (without a selection `Ctrl+C` still does pi's normal thing — double-Ctrl+C to clear).
+- **Select all:** `Ctrl+A`. Note this is repurposed from pi's stock "jump to line start";
+  `/select off` restores the stock binding.
+- **Editing with a selection:** standard semantics — typing, `Backspace` or `Delete`
+  replaces the selected text (with two-step undo: first `Ctrl+Z` restores the deleted
+  range, second restores everything). Plain arrows collapse to the edge in the pressed
+  direction; any other key just clears the selection.
+- Works on wrapped lines and with emoji/multi-byte input (grapheme-aware — the caret
+  movement is pi's own engine; the extension only tracks the selection endpoints).
+- Toggle: `/select on | off | status` — **on by default**, persisted in the guard state,
+  re-applied automatically on every session start.
+
 ## Spellcheck
 
 `spellcheck.ts` replaces pi's editor with a subclass that highlights likely typos
@@ -263,6 +290,7 @@ extensions/
   backlog.ts       /backlog checklist: multi-select + actions (plan/implement/done/delete/clear)
   perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
   working-task.ts  working_task tool — model sets/clears the current task in the working indicator
+  select-editor.ts shift+arrow text selection + clipboard copy in the input (/select)
   spellcheck.ts    spelling checks for user messages (dictionary: extensions/words-en.txt)
   web-search.ts    web search tool
   ask-user.ts      structured ask_user dialog
