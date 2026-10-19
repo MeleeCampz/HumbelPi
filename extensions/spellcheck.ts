@@ -215,7 +215,10 @@ export class SpellcheckEditor extends CustomEditor {
 			this.cacheText = text;
 			// Slash commands: the command name is not prose, but the argument text IS
 			// (e.g. /backlog <idea>, /plan on [task], /plan reject [reason]) — check it.
-			const args = text.startsWith("/") ? text.slice(text.indexOf(" ") + 1) : text;
+			// #8: no space yet → there is nothing after the command name → check
+			// nothing (slice(0) used to leak the "/cmd" prefix itself into the check).
+			const sp = text.indexOf(" ");
+			const args = text.startsWith("/") ? (sp === -1 ? "" : text.slice(sp + 1)) : text;
 			this.bad = STATE.enabled ? unknownWords(args, getDict()) : new Set();
 		}
 		if (this.bad.size === 0) return lines;
