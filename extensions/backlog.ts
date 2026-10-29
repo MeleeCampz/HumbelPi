@@ -23,7 +23,9 @@ import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@ea
 // Importing ./guards only evaluates its top-level constants/functions — the default
 // export factory is NOT invoked, so nothing gets registered twice.
 import { loadSessionState, updateSessionState } from "./lib/session-state";
-import { defaultPlanFile } from "./guards";
+// #13: via the dependency-free lib module — importing ./guards here would drag
+// the whole extension graph (typebox, pi-coding-agent) into test runs.
+import { defaultPlanFile } from "./lib/plan-file";
 
 type Marker = " " | "~" | "x";
 interface Entry { num: number; marker: Marker; text: string; }
@@ -156,7 +158,8 @@ const USAGE = `📋 Backlog usage:
 
 export type ChecklistResult = number[] | undefined | "clear-done" | "clear-all";
 
-function createChecklist(
+// Exported for tools/test-backlog-scroll.ts (scrolling/height-budget tests).
+export function createChecklist(
   items: Entry[],
   theme: { fg(color: string, text: string): string },
   done: (result: ChecklistResult) => void,
@@ -209,7 +212,36 @@ function createChecklist(
           width,
         )),
       ];
-      for (let i = 0; i < items.length; i++) {
+
+      // Height budget: the dialog must always fit the terminal, or the bottom
+      // action rows scroll off-screen on long backlogs. Fixed rows = 2 header +
+      // 1 separator + ACTION_ROWS; reserve 2 more for the "more above/below"
+      // indicators. Re-read rows each render so live resizes are respected.
+      const termRows = (typeof process !== "undefined" && process.stdout?.rows) || 24;
+      const fixedRows = 3 + ACTION_ROWS.length;
+      const listBudget = Math.max(3, termRows - fixedRows - 2);
+
+      // Row span of each item at this width (expanded items wrap to several).
+      const prefixPlain = (i: number): string =>
+        `${" "} [${selected.has(items[i].num) ? "x" : " "}] #${items[i].num} ${
+          items[i].marker === "x" ? "✓" : items[i].marker === "~" ? "◐" : "○"} `;
+      const spans = items.map((it, i) =>
+        expanded.has(it.num)
+          ? wrapTextWithAnsi(it.text, Math.max(10, width - visibleWidth(prefixPlain(i)))).length
+          : 1,
+      );
+
+      // Cursor-anchored window: grow backwards then forwards from the hovered
+      // item while the budget holds. No scroll keys — ↑/jk already walk the full
+      // list; the view follows. (Cursor on an action row anchors at the last item.)
+      const anchor = Math.min(cursor, items.length - 1);
+      let start = anchor;
+      let used = Math.min(spans[anchor], listBudget);
+      for (let i = anchor - 1; i >= 0 && used + spans[i] <= listBudget; i--) { used += spans[i]; start = i; }
+      let end = anchor;
+      for (let i = anchor + 1; i < items.length && used + spans[i] <= listBudget; i++) { used += spans[i]; end = i; }
+
+      for (let i = start; i <= end; i++) {
         const it = items[i];
         const box = selected.has(it.num) ? "x" : " ";
         // Status glyph + color per state, placed BEFORE the text so truncation can
@@ -226,10 +258,12 @@ function createChecklist(
           : t; // open → default color
         const prefix = `${i === cursor ? "❯" : " "} [${box}] #${it.num} ${glyphColored} `;
         if (expanded.has(it.num)) {
-          // #9: full text, word-wrapped — continuation lines align with the text column
+          // #9: full text, word-wrapped — continuation lines align with the text column.
+          // An expanded item taller than the whole budget is clipped to it
+          // (← collapses it back).
           const indent = visibleWidth(prefix);
           const wrapped = wrapTextWithAnsi(it.text, Math.max(10, width - indent));
-          wrapped.forEach((w, wi) => {
+          wrapped.slice(0, listBudget).forEach((w, wi) => {
             const line = wi === 0 ? prefix + colorText(w) : " ".repeat(indent) + colorText(w);
             lines.push(line);
           });
@@ -239,6 +273,9 @@ function createChecklist(
           lines.push(prefix + colorText(text));
         }
       }
+      if (start > 0) lines.push(theme.fg("dim", `↑ ${start} more above`));
+      if (end < items.length - 1) lines.push(theme.fg("dim", `↓ ${items.length - 1 - end} more below`));
+
       lines.push(theme.fg("dim", "─".repeat(Math.max(4, Math.min(width, 60)))));
       for (let a = 0; a < ACTION_ROWS.length; a++) {
         const row = items.length + a;

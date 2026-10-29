@@ -74,6 +74,9 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
 import { createSpellcheckInputDialog } from "./spellcheck";
+// #12/#13: the plan-file location is shared with backlog.ts via a dependency-free
+// lib module (keeps the extension import graph light for tests).
+import { defaultPlanFile } from "./lib/plan-file";
 // #1: all state IO lives in one shared module — fresh reads, atomic writes and
 // read-modify-write (update*) so a stale snapshot can never resurrect/clobber fields.
 import {
@@ -361,15 +364,6 @@ export function bashWriteTargets(command: string): string[] | null {
 		targets.push(target);
 	}
 	return targets;
-}
-
-/**
- * Plans live in the project's .pi folder (gitignored, next to .pi/backlog.md) so
- * they are easy to access — including when pi runs in a VM where the home dir is
- * ephemeral. (Exported — backlog.ts reuses it.)
- */
-export function defaultPlanFile(cwd: string): string {
-	return path.join(cwd, ".pi", "PLAN.md");
 }
 
 /** Shared implementation instruction (used by /plan approve, /plan implement and finish_plan). */
