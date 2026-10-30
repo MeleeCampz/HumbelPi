@@ -311,6 +311,9 @@ docs/
 tools/
   sbx-pi.sh          one-command sandbox launcher — see "Real sandbox" above
   sbx-local-model.sh wires a sandbox's pi to the host's local model
+  test-*.ts          regression tests — npx tsx tools/test-ask-flow.ts |
+                     test-backlog-scroll.ts (needs pi's own node_modules on NODE_PATH) |
+                     test-yolo.ts | test-secret-scan.ts
 ```
 
 ## Development on a machine that uses this repo directly
@@ -326,6 +329,13 @@ The `pre-push` hook (`.githooks/pre-push`, enabled per clone via
 git config core.hooksPath .githooks) runs tools/secret-scan.js on every push:
 API keys, non-placeholder apiKey values, PEM private keys, Bearer tokens,
 user-specific paths. It aborts the push if anything looks private.
+
+It scans **what a push can actually carry** — the index, plus untracked files that are not
+gitignored (one `git add -A` away from being public) — rather than the whole working tree.
+pi writes plan and session files under `.pi/` that legitimately contain your own
+`C:\Users\…` paths and are never pushed, so a filesystem-wide scan aborted *every* push on a
+false positive. Audit ignored files deliberately with `node tools/secret-scan.js --all`.
+Regression test: `tools/test-secret-scan.ts`.
 
 ## Troubleshooting
 
