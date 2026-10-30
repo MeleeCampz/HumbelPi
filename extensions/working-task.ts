@@ -21,6 +21,22 @@ export default function (pi: ExtensionAPI) {
     try { ctx.ui.setWorkingMessage?.(); } catch { /* non-interactive mode */ }
   });
 
+  // #1: pi also keeps the message across RUNS. Press-tested behaviour (pi 1.4.0):
+  //   run 1  → agent calls working_task("Rebuild guards") → spinner shows it
+  //   run 2  → new user prompt, no working_task call yet → spinner shows
+  //            "Rebuild guards" again, i.e. the LAST run's task, until the model
+  //            happens to call working_task again. That is why "updating the current
+  //            task often doesn't work" — what you see is stale text from earlier work.
+  // A prompt typed while idle (streamingBehavior undefined) starts a new unit of work,
+  // so reset there. Messages that arrive mid-run (steer / followUp) and messages an
+  // extension injects (guards' /plan approve instruction, backlog actions, …) keep the
+  // current task text — they are the same unit of work.
+  pi.on("input", (e, ctx) => {
+    if (e.source === "extension") return;
+    if (e.streamingBehavior !== undefined) return;
+    try { ctx.ui.setWorkingMessage?.(); } catch { /* non-interactive mode */ }
+  });
+
   pi.registerTool({
     name: "working_task",
     label: "Working task",

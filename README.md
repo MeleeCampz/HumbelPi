@@ -298,6 +298,7 @@ extensions/
   backlog.ts       /backlog checklist: multi-select + actions (plan/implement/done/delete/clear)
   perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
   working-task.ts  working_task tool — model sets/clears the current task in the working indicator
+                   (pi keeps the text across runs, so it is cleared when a new prompt starts one — #1)
   select-editor.ts shift+arrow text selection + clipboard copy in the input (/select)
   spellcheck.ts    spelling checks for user messages (dictionary: extensions/words-en.txt)
   web-search.ts    web search tool
