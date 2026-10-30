@@ -147,6 +147,18 @@ const USER_DIR = "C:" + "/Users/" + "Ada";
 		mod.scanText("a.md", `open ${USER_DIR}/thing`).join(" | "));
 	check("scanText does not invent a hit for clean text", mod.scanText("a.md", "nothing to see").length === 0);
 
+	// HA long-lived tokens (and any other JWT) are the shape a "pasted it into the docs" leak takes.
+	const JWT = "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" + "." + "eyJoaWQiOiJ0b2JpYXMifQ" + "." + "sig_Zm9vYmFyYmF6MTIzNDU2Nzg5MA";
+	check("a JWT (Home Assistant long-lived token shape) is flagged",
+		mod.scanText("profile.ps1", `$env:HUMBLE_PI_HA_TOKEN = "${JWT}"`).some((h: string) => h.includes("JWT token")),
+		mod.scanText("profile.ps1", `$env:HUMBLE_PI_HA_TOKEN = "${JWT}"`).join(" | "));
+	check("short eyJ-prefixed words are not JWTs (no noise on base64-ish text)",
+		mod.scanText("a.md", "eyJ short eyJhbGciOiJub3RhbG9uZy5leUp").length === 0,
+		mod.scanText("a.md", "eyJ short eyJhbGciOiJub3RhbG9uZy5leUp").join(" | "));
+	write(dir, "profile.ps1", `$env:HUMBLE_PI_HA_TOKEN = "${JWT}"\n`);
+	check("a committed PowerShell profile with a token aborts the push",
+		mentions(mod.scan(dir, "git").hits, "JWT token"), mod.scan(dir, "git").hits.join(" | ").slice(0, 200));
+
 	// ── the guard's own test file must stay free of literal look-alike secrets ──
 	const selfSrc = fs.readFileSync(fileURLToPath(import.meta.url), "utf8");
 	check("this test file's own source is clean (fixtures are concatenated, not literal)",

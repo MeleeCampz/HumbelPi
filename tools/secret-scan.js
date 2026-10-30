@@ -41,6 +41,9 @@ const PATTERNS = [
 	["sk-… key", /sk-[A-Za-z0-9_-]{16,}/g],
 	["PEM private key", /BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY/g],
 	["Bearer token", /Bearer [A-Za-z0-9._~+-]{16,}/g],
+	// JWTs (Home Assistant long-lived tokens, OAuth access tokens, Slack signin tokens…) — these
+	// are the shape a "just paste the token in the README" accident takes.
+	["JWT token", /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}/g],
 	["Windows user path", /[A-Za-z]:[\\/]Users[\\/][A-Za-z0-9._-]+/g],
 ];
 

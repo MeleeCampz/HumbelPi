@@ -119,6 +119,48 @@ else
   "$SBX" exec "$NAME" -- bash -c "cd '$REPO' && pi install ." && echo "[ok] $(basename "$REPO") installed in $NAME"
 fi
 
+# --- notification config for the container ----------------------------------
+# done-notify reads $HOME/.pi/agent/notify.env inside the container. Env vars are not enough here:
+# a container's environment is frozen at `sbx create`, so HUMBLE_PI_HA_* you set in your PowerShell
+# profile afterwards — or on a host you did not create the sandbox from — simply never arrive, and
+# the extension reports "remote: not configured". The file works for sandboxes that already exist
+# and needs no recreation. Keys only are echoed; values (the token) never are.
+NOTIFY_KEYS=(
+  HUMBLE_PI_HA_URL HUMBLE_PI_HA_TOKEN HUMBLE_PI_HA_SERVICE HUMBLE_PI_HA_EXTRA
+  HUMBLE_PI_NOTIFY_LOCAL HUMBLE_PI_NOTIFY_REMOTE
+  HUMBLE_PI_NOTIFY_LONG_RUN_S HUMBLE_PI_NOTIFY_IDLE_S HUMBLE_PI_NOTIFY_MIN_RUN_S
+  HUMBLE_PI_NOTIFY_TIMEOUT_MS
+)
+# Allow-list rather than a deny pattern: the value is interpolated into a shell command run inside
+# the container, and getting this wrong would be an injection hole in a launcher script. Single
+# quotes are the one character that would actually break out of the quoted argument, so they are not
+# in the set. (An earlier version of this used `tr -d` and the set began with "-", which tr read as
+# an option: the sanitiser failed open and every value passed. A regex in [[ ]] cannot fail open
+# like that, and the regression test proves this specific value is rejected.)
+SAFE_VALUE='^[A-Za-z0-9 ._:/@+(){}="-]+$'
+SYNCED=()
+SYNCED_KEYS=()
+for key in "${NOTIFY_KEYS[@]}"; do
+  val="${!key:-}"
+  [ -z "$val" ] && continue
+  if [[ ! "$val" =~ $SAFE_VALUE ]]; then
+    echo "[warn] $key contains characters this script will not interpolate — skipped (set it inside the sandbox instead)"
+    continue
+  fi
+  SYNCED+=("$key=$val")
+  SYNCED_KEYS+=("$key")
+done
+if [ "${#SYNCED[@]}" -gt 0 ]; then
+  WRITE='mkdir -p "$HOME/.pi/agent" && : > "$HOME/.pi/agent/notify.env"'
+  for kv in "${SYNCED[@]}"; do WRITE+=" && printf '%s\n' '$kv' >> \"\$HOME/.pi/agent/notify.env\""; done
+  WRITE+=' && chmod 600 "$HOME/.pi/agent/notify.env"'
+  if "$SBX" exec "$NAME" -- bash -c "$WRITE" >/dev/null 2>&1; then
+    echo "[ok] notify config synced to $NAME: ${SYNCED_KEYS[*]}"
+  else
+    echo "[warn] could not write ~/.pi/agent/notify.env in $NAME"
+  fi
+fi
+
 # NOTE: no "pi" after the "--" — the kit's entrypoint IS pi, and everything
 # after "--" is appended to it. Passing "pi" again would make pi treat it as
 # an initial prompt message (the model answers a stray "pi" on startup).

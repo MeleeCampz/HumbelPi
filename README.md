@@ -303,6 +303,8 @@ extensions/
   spellcheck.ts    spelling checks for user messages (dictionary: extensions/words-en.txt)
   web-search.ts    web search tool
   ask-user.ts      structured ask_user dialog
+  done-notify.ts   finish/waiting notifications: terminal toast + bell, Home Assistant push
+                   when pi needs you and you are not at the machine (/notify)
 .githooks/pre-push   secret scan that runs on every push (this repo is public)
 bin/
   sbxpi, .ps1, .cmd  PATH launcher shims — `sbxpi` in any terminal/OS
@@ -336,6 +338,95 @@ pi writes plan and session files under `.pi/` that legitimately contain your own
 `C:\Users\…` paths and are never pushed, so a filesystem-wide scan aborted *every* push on a
 false positive. Audit ignored files deliberately with `node tools/secret-scan.js --all`.
 Regression test: `tools/test-secret-scan.ts`.
+
+## Notifications: "it's done" and "it needs me"
+
+`done-notify.ts` adds `/notify status | services | on | off | test [text]` and fires two tiers:
+
+```
+local   every run end, and every time a dialog opens: OSC 9 → Windows Terminal raises a native
+        toast, then BEL → tab + taskbar flash, plus a sound if your profile allows it
+        (Windows Terminal settings.json: "bellNotification": "all"). They are just bytes on
+        stdout, so they survive sbxpi too: the container's pi writes into the same WT window.
+remote  one POST to Home Assistant's notify service, so the ping reaches your phone / dashboard
+        / TTS / lights when you are not at this machine.
+```
+
+When the phone is buzzed — the whole point is not to buzz you for work you are watching: always
+when pi is blocked on you (a guards approval, a /plan question, an ask_user), otherwise only for
+a run longer than `HUMBLE_PI_NOTIFY_LONG_RUN_S` (90s) when nobody has typed in this session for
+`HUMBLE_PI_NOTIFY_IDLE_S` (30s). pi enables terminal focus reporting (?1004h) but never tells
+extensions whether the window is focused, so presence is measured by the last human-typed
+message. That is a proxy, not a sensor — said out loud rather than hidden in a flag.
+
+Config lives in your PowerShell profile (`$PROFILE`), not in this repo:
+
+```powershell
+$env:HUMBLE_PI_HA_URL     = "http://homeassistant.local:8123"
+$env:HUMBLE_PI_HA_TOKEN   = "…"   # HA long-lived token (profile → Security). Never committed.
+$env:HUMBLE_PI_HA_SERVICE = "notify.mobile_app_<your_device>"   # exactly what /notify services prints first
+$env:HUMBLE_PI_NOTIFY_LONG_RUN_S = "90"  # 0 disables the duration rule
+$env:HUMBLE_PI_NOTIFY_IDLE_S     = "30"  # 0 disables the presence heuristic
+$env:HUMBLE_PI_NOTIFY_MIN_RUN_S  = "0"   # skip the toast for trivially short runs
+$env:HUMBLE_PI_NOTIFY_LOCAL      = "osc9,bell"
+$env:HUMBLE_PI_NOTIFY_REMOTE     = "1"   # 0 = terminal only
+$env:HUMBLE_PI_HA_EXTRA          = '{"data":{"tag":"pi","group":"pi"}}'  # raw JSON merged in the payload
+```
+
+Those reach a **native** `pi`. They do not reach a sandbox: a container's environment is fixed at
+`sbx create`, so `HUMBLE_PI_HA_*` you set in your profile afterwards — or on a host other than the
+one the sandbox was created from — are not inside it, and the only thing you get is "not configured",
+which reads like a broken extension rather than a frozen environment. So config may also come from a
+file the extension reads itself:
+
+```text
+$HOME/.pi/agent/notify.env        # same KEY=value syntax, # comments, quotes allowed
+$env:HUMBLE_PI_HA_ENV_FILE        # move it anywhere
+```
+
+Only `HUMBLE_PI_*` keys are read from it — a config file that could also set `PATH` would be a worse
+bug than the one it fixes. Real environment variables always beat the file, so a one-off
+`HUMBLE_PI_HA_SERVICE=… pi` still wins, and `/notify status` names the file it read and which keys
+came from it. `tools/sbx-pi.sh` writes that file into the sandbox on every launch from whatever the
+host has: it echoes key names only (never the token), and refuses any value containing shell
+metacharacters, because those values are interpolated into a command executed inside the container.
+
+Leave `HUMBLE_PI_HA_SERVICE` unset and the target is `persistent_notification.create`: it exists on
+every install, always accepts `{title, message}`, and never fails — but it lands in HA's own
+notification tray and will never buzz a phone, and `/notify status` says so instead of letting you
+assume otherwise. `notify.notify` is deliberately *not* the default: HA describes it as shorthand
+for "the first notify thing I can find", it is integration-specific, and current versions can fail
+it outright (core#111015). One more way to earn a 400: `persistent_notification.create` accepts only
+`title`, `message`, `notification_id`, so do not send `HUMBLE_PI_HA_EXTRA` at it.
+
+`/notify test` sends one of each and reports what happened; `/notify services` asks your HA which
+services it actually accepts and prints the exact `HUMBLE_PI_HA_SERVICE` value to use — useful
+because HA's failure codes are precise about what you got wrong:
+
+```
+401  token wrong or expired          404  that service does not exist
+400  the service exists but {title, message} does not fit its schema
+```
+
+The call is `POST <HUMBLE_PI_HA_URL>/api/services/<domain>/<service>` — HA's REST route is
+`domain.service` → `domain/service`, **not** a trailing `/notify` (that shape answers 404; it is
+what my first version did, caught by probing a real instance). To check the
+terminal half without pi running:
+
+```powershell
+Write-Host "$([char]27)]9;hello from pi$([char]7)"   # toast
+Write-Host "$([char]7)"                              # bell (tab + taskbar flash)
+```
+
+Running pi in the sandbox: the container has to reach HA, so allow the HA host in the sandbox
+network policy and pass the token as container env (`-e HUMBLE_PI_HA_TOKEN=…`) instead of putting
+it in a file. A remote tier that cannot reach HA reports the failure in `/notify status` and
+never blocks or fails a run. Tests: `tools/test-done-notify.ts` (59 checks — policy decisions,
+terminal-safety of model-supplied text, the HA request shape, and a self-scan so its own fake token
+can never be re-written as a literal) and press scenarios k/l/m (real pi in a PTY against a
+HA-shaped fake that answers 404 off-route and 401 without a token: k proves the dialog ping and that
+a finished run buzzes when the heuristic is off; l proves the same finished run stays off the phone
+when you typed seconds ago; m proves `/notify services` reads the instance's real registry).
 
 ## Troubleshooting
 
