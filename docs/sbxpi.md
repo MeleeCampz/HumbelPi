@@ -66,7 +66,8 @@ Do this once before your first `sbxpi`:
 - **No Anthropic, by design:** `sbxpi` suppresses the pi kit's interactive
   credential prompt and adds per-sandbox **deny** rules for
   `api.anthropic.com` / `platform.claude.com` — we run a local model. (The local
-  model is reached via `host.docker.internal:8888`, which resolves to your host
+  model is reached via `host.docker.internal:8889` (Strata; `:8888` for the
+  Unsloth Studio fallback), which resolves to your host
   from inside the VM; no network-policy rules needed.)
 - **Yolo by default:** sandboxes created by `sbxpi` carry `HUMBLE_PI_YOLO=1`
   (baked in via `sbx create --env`), and yolo defaults on whenever a sandbox is

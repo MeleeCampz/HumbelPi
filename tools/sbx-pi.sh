@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Launch a ready-to-work pi sandbox for any folder: mounts the folder as the
-# workspace, wires the local Unsloth Studio model, and prints the attach command.
+# workspace, wires the local model (Unsloth Studio, or Strata as fallback), and prints the attach command.
 #
-# Usage: tools/sbx-pi.sh [--new] [folder] [sandbox-name]
+# Usage: tools/sbx-pi.sh [--new] [--gc] [folder] [sandbox-name]
 #   folder        defaults to the current directory — run it from anywhere
 #   sandbox-name  defaults to pi-<folder basename>
 #   --new         start a fresh pi session instead of continuing the last one
+#   --gc          deep-clean the sandbox (all caches incl. HF models &
+#                 Playwright browsers, /tmp older than a day) instead of the
+#                 light cleanup that runs on every launch
 #
 # Re-running for an existing sandbox skips creation and just re-provisions.
 # In an interactive terminal, drops you straight into pi (sbx run) when done —
@@ -28,10 +31,11 @@ else
   exit 1
 fi
 
-NEW=0; POSITIONAL=()
+NEW=0; GC=0; POSITIONAL=()
 for arg in "$@"; do
   case "$arg" in
     --new) NEW=1 ;;
+    --gc) GC=1 ;;
     *) POSITIONAL+=("$arg") ;;
   esac
 done
@@ -63,6 +67,35 @@ else
   # created before this flag existed still get yolo ON via SANDBOX_NAME / /run/sandbox
   # detection, so no re-creation is needed.
   "$SBX" create --name "$NAME" --env HUMBLE_PI_YOLO=1 "docker.io/sbx/pi-kit:latest" "$FOLDER" "${HUMBLE_MOUNT[@]}" </dev/null
+fi
+
+# --- disk guard -------------------------------------------------------------
+# The sandbox root FS is a fixed ~20G overlay. Agent sessions fill it with
+# package caches (uv, pip) and /tmp venvs/eval data until the VM won't even
+# boot (ENOSPC at overlayfs mount time → "docker daemon failed to start").
+# Light cleanup on every launch; --gc for a deep clean.
+# bash -c wrapper: sbx exec rewrites bare absolute-path args (a lone "/")
+# through MSYS path translation when launched from Git Bash.
+# Retries: the first exec after creation can race the cold VM boot.
+UP=0
+for _ in 1 2 3 4 5; do
+  "$SBX" exec "$NAME" -- bash -c 'df -h /' >/dev/null 2>&1 && { UP=1; break; }
+  sleep 6
+done
+if [ "$UP" -ne 1 ]; then
+  echo "error: sandbox $NAME will not start — its root FS is likely full." >&2
+  echo "Recreate it (host workspace files are safe):  sbx rm $NAME && sbxpi" >&2
+  exit 1
+fi
+if [ "$GC" -eq 1 ]; then
+  echo "[gc] deep-cleaning caches and /tmp in $NAME"
+  "$SBX" exec "$NAME" -- bash -c 'rm -rf "$HOME/.cache/pip" "$HOME/.cache/uv" "$HOME/.cache/huggingface" "$HOME/.cache/ms-playwright"; find /tmp -mindepth 1 -maxdepth 1 -mtime +0 -exec rm -rf {} + 2>/dev/null' || true
+else
+  "$SBX" exec "$NAME" -- bash -c 'rm -rf "$HOME/.cache/pip" "$HOME/.cache/uv"; find /tmp -mindepth 1 -maxdepth 1 -mtime +3 -exec rm -rf {} + 2>/dev/null' || true
+fi
+PCT=$("$SBX" exec "$NAME" -- bash -c 'df --output=pcent /' 2>/dev/null | tail -1 | tr -dc '0-9' || true)
+if [ -n "$PCT" ] && [ "$PCT" -ge 80 ]; then
+  echo "[warn] sandbox root FS at ${PCT}% — try: sbxpi --gc (deep clean), or recreate: sbx rm $NAME && sbxpi"
 fi
 
 bash "$DIR/sbx-local-model.sh" "$NAME"
