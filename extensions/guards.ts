@@ -73,7 +73,7 @@ import { execFile } from "node:child_process";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
-import { createSpellcheckInputDialog } from "./spellcheck";
+import { askWithOther } from "./lib/ask-flow";
 // #12/#13: the plan-file location is shared with backlog.ts via a dependency-free
 // lib module (keeps the extension import graph light for tests).
 import { defaultPlanFile } from "./lib/plan-file";
@@ -897,33 +897,37 @@ export default function (pi: ExtensionAPI) {
 			if (!ctx.hasUI) {
 				return { content: [{ type: "text", text: `No interactive UI available. Ask the user to run: /plan approve ${file}` }], details: undefined };
 			}
-			const choice = await ctx.ui.select(`📋 Plan ready — approve?\n\nFile:     ${file}\n\n${params.summary}`, ["✅ Approve & implement", "✏️ Keep planning"]);
-			if (choice === undefined || !/approve/i.test(choice)) {
-				// #13: refusal reason inline — no extra manual turn
-				// TUI: spellchecked input dialog (same look as ctx.ui.input, live typo highlighting);
-				// non-TUI modes keep the plain built-in input.
-			const reason = choice === undefined
-				? undefined
-				: ctx.mode === "tui"
-					? await ctx.ui.custom<string | undefined>((_tui, theme, _kb, done) => createSpellcheckInputDialog(theme, "✏️ What should change in the plan?", "e.g. use SQLite instead of JSON, drop step 3…", done))
-					: await ctx.ui.input("✏️ What should change in the plan?", "e.g. use SQLite instead of JSON, drop step 3…");
-				if (reason && reason.trim()) {
-					pi.sendUserMessage(
-						`The plan is REJECTED.\nUser feedback: ${reason.trim()}\n\nDo NOT implement anything from it. We are still in planning mode — revise ${file} accordingly and call finish_plan again when ready.`,
-						{ deliverAs: "followUp" },
-					);
-					ctx.ui.notify("📋 Feedback queued — revising the plan.", "info");
-					return { content: [{ type: "text", text: "Plan rejected with user feedback (queued as your next message). Do NOT implement. End your turn now; when the feedback arrives, revise the plan file and call finish_plan again." }], details: undefined };
-				}
-				return { content: [{ type: "text", text: "The user wants to keep planning. Do NOT implement. Wait for their feedback, revise the plan file, and call finish_plan again when ready." }], details: undefined };
+			// HumbelPi #3: this whole flow goes through askWithOther, so the feedback box can send
+			// you BACK to Approve / Keep planning (Esc) instead of being a dead end, and Ctrl+C is
+			// the deliberate cancel.
+			const outcome = await askWithOther(ctx, {
+				question: `📋 Plan ready — approve?\n\nFile:     ${file}\n\n${params.summary}`,
+				options: ["✅ Approve & implement", "✏️ Keep planning"],
+				otherLabel: "✏️ Keep planning",
+				answerTitle: "✏️ What should change in the plan?",
+				answerPlaceholder: "e.g. use SQLite instead of JSON, drop step 3…",
+				backLabel: "back to Approve / Keep planning",
+			});
+			if (outcome.kind === "option" && /approve/i.test(outcome.text)) {
+				updateSessionState(sid, s => { s.planMode = false; s.planFile = null; });
+				verifyPlanModeOff(ctx, sid);
+				applyTitle(ctx);
+				ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
+				// #10: no queued follow-up — the instruction goes into the tool result so the model
+				// implements in the SAME turn. A queued message would land later as a stale duplicate.
+				return { content: [{ type: "text", text: implementationInstruction(file) }], details: undefined };
 			}
-			updateSessionState(sid, s => { s.planMode = false; s.planFile = null; });
-			verifyPlanModeOff(ctx, sid);
-			applyTitle(ctx);
-			ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
-			// #10: no queued follow-up — the instruction goes into the tool result so the model
-			// implements in the SAME turn. A queued message would land later as a stale duplicate.
-			return { content: [{ type: "text", text: implementationInstruction(file) }], details: undefined };
+			if (outcome.kind === "custom") {
+				// #13: refusal reason inline — no extra manual turn
+				pi.sendUserMessage(
+					`The plan is REJECTED.\nUser feedback: ${outcome.text}\n\nDo NOT implement anything from it. We are still in planning mode — revise ${file} accordingly and call finish_plan again when ready.`,
+					{ deliverAs: "followUp" },
+				);
+				ctx.ui.notify("📋 Feedback queued — revising the plan.", "info");
+				return { content: [{ type: "text", text: "Plan rejected with user feedback (queued as your next message). Do NOT implement. End your turn now; when the feedback arrives, revise the plan file and call finish_plan again." }], details: undefined };
+			}
+			// "Keep planning" with no reason typed, or cancelled out (Ctrl+C / dismissed at the list).
+			return { content: [{ type: "text", text: "The user wants to keep planning. Do NOT implement. Wait for their feedback, revise the plan file, and call finish_plan again when ready." }], details: undefined };
 		},
 	});
 

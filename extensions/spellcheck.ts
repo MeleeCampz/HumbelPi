@@ -16,8 +16,9 @@
  *                checked), CamelCase / ALLCAPS tokens, words with digits or symbols,
  *                words ≤ 2 letters.
  * - Everywhere : also highlights free-text dialogs — createSpellcheckInputDialog()
- *                is used by ask-user.ts ("Other" answer) and guards.ts (plan feedback)
- *                instead of pi's plain ctx.ui.input.
+ *                is used by lib/ask-flow.ts (ask_user's "Other" answer and the plan
+ *                feedback box) instead of pi's plain ctx.ui.input. Those dialogs use
+ *                Enter submit / Esc back to the options / Ctrl+C cancel — see ask-loop.ts.
  * - Toggle     : /spellcheck on | off | status
  */
 
@@ -26,6 +27,9 @@ import os from "node:os";
 import path from "node:path";
 import { CustomEditor, keyText, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, Input, Spacer, Text, matchesKey, visibleWidth, type Focusable } from "@earendil-works/pi-tui";
+// Type-only import: no runtime edge, so spellcheck.ts stays free of an import cycle
+// (ask-flow.ts imports THIS file for the dialog factory).
+import type { DialogAnswer } from "./lib/ask-loop";
 
 // The dictionary ships next to this extension file — works both as a loose file in
 // ~/.pi/agent/extensions/ and when loaded from a pi package directory. Fall back to
@@ -254,8 +258,15 @@ class SpellInput extends Input {
 
 /**
  * Single-line input dialog with live typo highlighting — a lookalike of pi's built-in
- * extension input (what ctx.ui.input shows) for use via ctx.ui.custom. Enter submits,
- * Esc cancels (undefined). Renders plain when spellcheck is toggled off.
+ * extension input (what ctx.ui.input shows) for use via ctx.ui.custom.
+ *
+ * Keys (HumbelPi #3 / the ask_user "Other" door):
+ *   Enter   submit what is typed
+ *   Esc     go BACK to whatever preceded this dialog (the option list), carrying the text
+ *           so the draft is not lost — this is what used to be a one-way cancel
+ *   Ctrl+C  cancel the whole question
+ *
+ * Renders plain when spellcheck is toggled off.
  *
  * Deliberately does NOT use pi's DynamicBorder/keyHint — those read pi's internal theme
  * singleton; everything here is styled with the theme passed in by ctx.ui.custom.
@@ -271,22 +282,32 @@ class SpellcheckInputDialog extends Container implements Focusable {
 		private readonly theme: { fg(color: string, text: string): string },
 		title: string,
 		placeholder: string,
-		private readonly done: (value: string | undefined) => void,
+		private readonly done: (answer: DialogAnswer) => void,
+		options?: { draft?: string; backLabel?: string },
 	) {
 		super();
 		this.input = new SpellInput({ placeholder });
+		// A trip back to the option list and back here again must not lose what was typed.
+		// pi-tui's Input.setValue() clamps the caret to the START of the value, which would make
+		// the next character land before the restored draft ("SQLite" + typed " for the store"
+		// came back as "for the storeSQLite"). Feeding the draft through the input's own bracketed-
+		// paste path inserts it at the caret and leaves the caret after it, exactly like pasting.
+		if (options?.draft) this.input.handleInput(`\x1b[200~${options.draft}\x1b[201~`);
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(this.theme.fg("accent", title), 1, 0));
 		this.addChild(new Spacer(1));
 		this.addChild(this.input);
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(`${this.theme.fg("dim", keyText("tui.select.confirm"))} ${this.theme.fg("muted", "submit")}  ${this.theme.fg("dim", keyText("tui.select.cancel"))} ${this.theme.fg("muted", "cancel")}`, 1, 0));
+		const backLabel = options?.backLabel ?? "back to options";
+		this.addChild(new Text(`${this.theme.fg("dim", keyText("tui.select.confirm"))} ${this.theme.fg("muted", "submit")}  ${this.theme.fg("dim", "esc")} ${this.theme.fg("muted", backLabel)}  ${this.theme.fg("dim", "ctrl+c")} ${this.theme.fg("muted", "cancel")}`, 1, 0));
 		this.addChild(new Spacer(1));
 	}
 
 	handleInput(data: string): void {
-		if (matchesKey(data, "enter") || data === "\n") { this.done(this.input.getValue()); return; }
-		if (matchesKey(data, "escape")) { this.done(undefined); return; }
+		if (matchesKey(data, "enter") || data === "\n") { this.done({ text: this.input.getValue(), back: false }); return; }
+		// Esc = back to the option list, draft included. Ctrl+C = cancel the whole question.
+		if (matchesKey(data, "escape")) { this.done({ text: this.input.getValue(), back: true }); return; }
+		if (matchesKey(data, "ctrl+c")) { this.done({ back: false }); return; } // discards the draft
 		this.input.handleInput(data);
 	}
 
@@ -303,9 +324,10 @@ export function createSpellcheckInputDialog(
 	theme: { fg(color: string, text: string): string },
 	title: string,
 	placeholder: string,
-	done: (value: string | undefined) => void,
+	done: (answer: DialogAnswer) => void,
+	options?: { draft?: string; backLabel?: string },
 ): SpellcheckInputDialog {
-	return new SpellcheckInputDialog(theme, title, placeholder, done);
+	return new SpellcheckInputDialog(theme, title, placeholder, done, options);
 }
 
 // select-editor.ts is the single owner of the custom editor (it composes

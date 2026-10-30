@@ -198,7 +198,9 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
   VM); reads and searches stay free.
 - The finished plan is presented via the **finish_plan** dialog — "✅ Approve & implement"
   starts implementation immediately; "✏️ Keep planning" asks for a short refusal reason
-  that is fed back to the agent.
+  that is fed back to the agent. The reason box is **not** a dead end (#3): `esc` there puts
+  you back on Approve / Keep planning with what you typed kept, so you can still approve;
+  `ctrl+c` is the deliberate cancel. Same flow as `ask_user` (shared `extensions/lib/ask-loop.ts`).
 - Planning state also syncs into the window title, so it's visible at a glance.
 
 ## Backlog
@@ -262,6 +264,12 @@ no post-enter confirmation: the text is sent exactly as typed.
 - The `ask_user` tool lets the agent check in before making an important assumption:
   it presents a list of concrete options plus a free-text "Other" escape hatch. Your
   answer comes back as the tool result and the agent proceeds with exactly that.
+- Keys in the answer box: `enter` submits, **`esc` goes back to the option list** with what
+  you typed kept as a draft (change your mind without losing anything, then pick a preset),
+  `ctrl+c` cancels the question outright. In the option list itself `enter` picks and
+  `esc`/`ctrl+c` dismiss. In non-TUI modes (rpc/print) type `!back` or `!cancel` instead.
+- Loop + tests: `extensions/lib/ask-loop.ts` (pure) / `extensions/lib/ask-flow.ts` (ctx.ui
+  wiring); regression test `tools/test-ask-flow.ts` (`npx tsx tools/test-ask-flow.ts`).
 
 ## Web search
 
