@@ -14,13 +14,17 @@
  *                        which is UI-only — /notify services lists the names that reach a device)
  *   HUMBLE_PI_NOTIFY_LONG_RUN_S  a run must last this long to buzz the phone (default 90)
  *   HUMBLE_PI_NOTIFY_IDLE_S      no typing for this long counts as "not there" (default 30, 0 = off)
+ *   HUMBLE_PI_NOTIFY_WAIT_DELAY_S how long a dialog must go unanswered before it escalates (default 45)
  *   HUMBLE_PI_NOTIFY_MIN_RUN_S   skip the toast for trivially short runs (default 0 = every run)
  *   HUMBLE_PI_NOTIFY_LOCAL       osc9,bell  (either, or "none"-ish by picking one)
  *   HUMBLE_PI_NOTIFY_REMOTE      0 to disable the HA tier without touching the local one
  *
- * Policy (yours, chosen 2026-10-30): local on every run end; remote only when pi genuinely
- * needs you — a dialog is open (approval / ask_user / finish_plan question) — or a run outlived
- * the threshold while nobody has typed for the idle window. Rules live as pure functions in
+ * Policy (chosen 2026-10-30 and revised the same day after using it): local on every run end. Remote
+ * only when pi genuinely needs you and you are not at the keyboard — a dialog that has gone unanswered
+ * past the patience window while nobody has typed, or a run that outlived the duration threshold while
+ * nobody has typed. A dialog you answer inside that window produces a toast and a bell and no phone
+ * call; the first version pushed the instant any dialog opened, which meant a buzz for every 20-second
+ * task while sitting right in front of the screen. Rules live as pure functions in
  * extensions/lib/notify.ts and are tested in tools/test-done-notify.ts.
  *
  * Focus caveat, stated plainly: pi enables terminal focus reporting (?1004h) but never exposes
@@ -44,6 +48,7 @@ import {
 	sendHomeAssistant,
 	shouldNotifyRunEnd,
 	waitingText,
+	waitingEscalationMs,
 	withNotifyEnvFile,
 	type EnvSource,
 	type NotifyState,
@@ -112,11 +117,52 @@ function remotePing(message: string, title = "pi"): void {
 	});
 }
 
+/**
+ * A dialog is not a push. It becomes one only after it has gone unanswered long enough and nobody has
+ * typed, so the extension schedules a single timer for that moment — waitingEscalationMs() does the
+ * arithmetic — and re-arms or cancels it as things change. unref() because a pending escalation must
+ * never be the reason pi refuses to exit.
+ */
+let waitTimer: NodeJS.Timeout | null = null;
+
+function scheduleWaitPing(): void {
+	if (waitTimer) {
+		clearTimeout(waitTimer);
+		waitTimer = null;
+	}
+	const at = waitingEscalationMs(config(), STATE);
+	if (at === null) return;
+	const delay = Math.max(0, at - nowMs());
+	waitTimer = setTimeout(() => {
+		waitTimer = null;
+		// Re-decided at fire time, not at schedule time: the dialog may have been answered, dismissed,
+		// or you may have come back to the keyboard in the meantime.
+		const d = decideWaiting(config(), STATE, nowMs());
+		if (d) remotePing(d.message, "pi needs you");
+	}, delay).unref();
+}
+
+function cancelWaitPing(): void {
+	if (waitTimer) {
+		clearTimeout(waitTimer);
+		waitTimer = null;
+	}
+}
+
+/** What /notify status says about a dialog that is open but not yet worth a phone. */
+function escalationHint(): string {
+	const at = waitingEscalationMs(config(), STATE);
+	if (at === null) return " (no remote target)";
+	const s = Math.max(0, Math.round((at - nowMs()) / 1000));
+	return s <= 0 ? " (push armed now)" : ` (push at +${s}s unless you answer or type first)`;
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", () => {
 		const keep = STATE.lastActivityMs;
 		Object.assign(STATE, freshState(nowMs()));
 		STATE.lastActivityMs = keep;
+		cancelWaitPing();
 	});
 
 	pi.on("agent_start", () => {
@@ -144,13 +190,17 @@ export default function (pi: ExtensionAPI) {
 	// Approve/Keep-planning, ask_user's selector, /backlog pickers when they use ctx.ui.
 	pi.on("ui_prompt_start", (e) => {
 		STATE.dialogOpen = e.title ?? e.kind;
+		STATE.dialogOpenedMs = nowMs();
 		localPing(waitingText(STATE.dialogOpen));
-		const remote = decideWaiting(config(), STATE);
-		if (remote) remotePing(remote.message, "pi needs you");
+		scheduleWaitPing();
 	});
 
 	pi.on("ui_prompt_end", () => {
 		STATE.dialogOpen = null;
+		STATE.dialogOpenedMs = null;
+		// Answered, dismissed or cancelled is a private event: a push that lands after you already
+		// replied is worse than no push at all.
+		cancelWaitPing();
 	});
 
 	// Presence proxy: a human-typed message means somebody is at this keyboard. Messages an
@@ -158,6 +208,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("input", (e) => {
 		if (e.source === "extension") return;
 		STATE.lastActivityMs = nowMs();
+		// Re-armed rather than cancelled: typing proves you are here now, and if you then walk away the
+		// dialog should still escalate — measured from this keystroke, not from when it opened.
+		if (STATE.dialogOpen !== null) scheduleWaitPing();
 	});
 
 	pi.registerCommand("notify", {
@@ -171,6 +224,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (head === "on" || head === "off") {
 				overrideEnabled = head === "on";
+				if (!overrideEnabled) cancelWaitPing(); // silencing must also pull the plug on a pending escalation
 				report(ctx, `/notify ${head} — ${overrideEnabled ? "notifications on" : "notifications silenced until pi restarts"}`);
 				if (overrideEnabled) localPing("pi notifications on");
 				return;
@@ -236,9 +290,9 @@ export default function (pi: ExtensionAPI) {
 				...(cfg.haService === DEFAULTS.haService
 					? [`          that target is UI-only (HA's own tray, no push) — /notify services lists a notify.mobile_app_* that reaches a phone`]
 					: []),
-				`          buzz rules: dialog open = always; run ≥ ${cfg.longRunMs / 1000}s and idle ≥ ${cfg.idleMs / 1000}s`,
+				`          buzz rules: dialog unanswered ${cfg.waitDelayMs / 1000}s + no typing ${cfg.idleMs / 1000}s; or run ≥ ${cfg.longRunMs / 1000}s and idle ≥ ${cfg.idleMs / 1000}s`,
 				`          sent ${STATE.remoteSent}, failed ${STATE.remoteFailed}${STATE.lastError ? ` (last: ${STATE.lastError})` : ""}`,
-				`  now   : ${runFor === null ? "idle" : `run going ${fmtDuration(runFor)}`}, idle ${fmtDuration(nowMs() - STATE.lastActivityMs)}${STATE.dialogOpen ? `, blocked on "${STATE.dialogOpen}"` : ""}`,
+				`  now   : ${runFor === null ? "idle" : `run going ${fmtDuration(runFor)}`}, idle ${fmtDuration(nowMs() - STATE.lastActivityMs)}${STATE.dialogOpen ? `, blocked on "${STATE.dialogOpen}"${escalationHint()}` : ""}`,
 				...(haPath(cfg.haService) ? [] : [`  HUMBLE_PI_HA_SERVICE "${cfg.haService}" is not "domain.service"`]),
 				...(STATE.lastError ? [`  last failure — /notify services lists what this HA actually accepts`] : []),
 			].join("\n"));

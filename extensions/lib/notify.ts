@@ -41,6 +41,8 @@ export interface NotifyConfig {
 	longRunMs: number;
 	/** No human input for this long counts as "not there" (0 = heuristic disabled). */
 	idleMs: number;
+	/** How long a dialog must go unanswered before it is worth escalating to the phone. */
+	waitDelayMs: number;
 	/** Local notifications are skipped for runs shorter than this (0 = every run end). */
 	minRunMs: number;
 	timeoutMs: number;
@@ -54,6 +56,8 @@ export interface NotifyState {
 	lastActivityMs: number;
 	/** Title of the UI prompt pi is currently blocked on, or null. */
 	dialogOpen: string | null;
+	/** When that prompt opened. Kept separate from dialogOpen: the patience timer needs the time. */
+	dialogOpenedMs: number | null;
 	/** Counters for /notify status. */
 	localSent: number;
 	remoteSent: number;
@@ -64,6 +68,10 @@ export interface NotifyState {
 export const DEFAULTS = {
 	longRunS: 90,
 	idleS: 30,
+	// A dialog used to ping the phone immediately. That is what made a 20-second task buzz while the
+	// human sat right in front of the screen — the policy was revised the same day it shipped, see
+	// decideWaiting(). 45s of unanswered dialog is the patience floor.
+	waitDelayS: 45,
 	minRunS: 0,
 	timeoutMs: 4000,
 	// Not "notify.notify". HA documents that one as shorthand for "the first notify thing I can
@@ -96,6 +104,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): NotifyConfig {
 		haExtra: parseExtra(env.HUMBLE_PI_HA_EXTRA),
 		longRunMs: num(env.HUMBLE_PI_NOTIFY_LONG_RUN_S, DEFAULTS.longRunS) * 1000,
 		idleMs: num(env.HUMBLE_PI_NOTIFY_IDLE_S, DEFAULTS.idleS) * 1000,
+		waitDelayMs: num(env.HUMBLE_PI_NOTIFY_WAIT_DELAY_S, DEFAULTS.waitDelayS) * 1000,
 		minRunMs: num(env.HUMBLE_PI_NOTIFY_MIN_RUN_S, DEFAULTS.minRunS) * 1000,
 		timeoutMs: num(env.HUMBLE_PI_NOTIFY_TIMEOUT_MS, DEFAULTS.timeoutMs),
 	};
@@ -117,6 +126,7 @@ export function freshState(nowMs = Date.now()): NotifyState {
 		outcome: "completed",
 		lastActivityMs: nowMs,
 		dialogOpen: null,
+		dialogOpenedMs: null,
 		localSent: 0,
 		remoteSent: 0,
 		remoteFailed: 0,
@@ -208,13 +218,37 @@ export interface RemoteDecision {
 }
 
 /**
- * A dialog is open → pi is genuinely blocked on a human. Always worth a remote ping, even if
- * someone is sitting right there: an un-answered approval is the one state where doing nothing
- * costs the most. (Policy choice, 2026-10-30.)
+ * A dialog is open — pi is blocked on a human. Chosen 2026-10-30 and revised the same day after real
+ * use: this used to ping the phone the instant a dialog opened, which in practice meant a push for
+ * every short task, while the human was sitting directly in front of the screen. A blocked pi is the
+ * one state worth a push; a blocked pi that you are currently looking at is not.
+ *
+ * Escalation now needs both: the dialog has gone unanswered for waitDelayMs (patience — you had a
+ * chance to answer it), and nobody has typed for idleMs (presence — you are not at this keyboard).
+ * A dialog answered or dismissed inside that window is a private event: toast, bell, no phone.
  */
-export function decideWaiting(cfg: NotifyConfig, state: NotifyState): RemoteDecision | null {
-	if (!remoteConfigured(cfg) || !state.dialogOpen) return null;
+export function decideWaiting(cfg: NotifyConfig, state: NotifyState, nowMs = Date.now()): RemoteDecision | null {
+	if (!remoteConfigured(cfg) || state.dialogOpen === null) return null;
+	const opened = state.dialogOpenedMs ?? nowMs;
+	if (nowMs - opened < cfg.waitDelayMs) return null; // not unanswered yet — you may still be reading it
+	if (cfg.idleMs > 0 && nowMs - state.lastActivityMs < cfg.idleMs) return null; // somebody is here
 	return { reason: "waiting", message: waitingText(state.dialogOpen) };
+}
+
+/**
+ * The single moment both conditions above could first be true. The extension schedules one timer for
+ * this instead of polling, and cancels it when the dialog closes or you type.
+ *
+ * Away already (typed long ago) → the patience floor alone applies, so the phone hears about a blocked
+ * pi after waitDelayMs. Just typed → presence pushes it out to lastActivity + idleMs, which is the
+ * point: the push is for the person who left, not the person who is reading.
+ */
+export function waitingEscalationMs(cfg: NotifyConfig, state: NotifyState, nowMs = Date.now()): number | null {
+	if (!remoteConfigured(cfg) || state.dialogOpen === null) return null;
+	const opened = state.dialogOpenedMs ?? nowMs;
+	const byPatience = opened + cfg.waitDelayMs;
+	const byPresence = cfg.idleMs > 0 ? state.lastActivityMs + cfg.idleMs : byPatience;
+	return Math.max(byPatience, byPresence);
 }
 
 /**

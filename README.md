@@ -352,12 +352,16 @@ remote  one POST to Home Assistant's notify service, so the ping reaches your ph
         / TTS / lights when you are not at this machine.
 ```
 
-When the phone is buzzed — the whole point is not to buzz you for work you are watching: always
-when pi is blocked on you (a guards approval, a /plan question, an ask_user), otherwise only for
-a run longer than `HUMBLE_PI_NOTIFY_LONG_RUN_S` (90s) when nobody has typed in this session for
-`HUMBLE_PI_NOTIFY_IDLE_S` (30s). pi enables terminal focus reporting (?1004h) but never tells
-extensions whether the window is focused, so presence is measured by the last human-typed
-message. That is a proxy, not a sensor — said out loud rather than hidden in a flag.
+When the phone is buzzed — the whole point is not to buzz you for work you are watching. A dialog
+(a guards approval, a /plan question, an ask_user) escalates only after it has gone unanswered for
+`HUMBLE_PI_NOTIFY_WAIT_DELAY_S` (45s) **and** nobody has typed for `HUMBLE_PI_NOTIFY_IDLE_S` (30s). A
+finished run escalates only when it outlived `HUMBLE_PI_NOTIFY_LONG_RUN_S` (90s) under the same
+no-typing condition. Answer a dialog inside that window and it is a private event: toast, bell, no
+phone call. That is the revision, not the original design — the first version pushed the instant any
+dialog opened, which meant a buzz for every 20-second task while sitting right in front of the screen.
+pi enables terminal focus reporting (?1004h) but never tells extensions whether the window is focused,
+so presence is measured by the last human-typed message. That is a proxy, not a sensor — said out loud
+rather than hidden in a flag.
 
 Config lives in your PowerShell profile (`$PROFILE`), not in this repo:
 
@@ -367,6 +371,7 @@ $env:HUMBLE_PI_HA_TOKEN   = "…"   # HA long-lived token (profile → Security)
 $env:HUMBLE_PI_HA_SERVICE = "notify.mobile_app_<your_device>"   # exactly what /notify services prints first
 $env:HUMBLE_PI_NOTIFY_LONG_RUN_S = "90"  # 0 disables the duration rule
 $env:HUMBLE_PI_NOTIFY_IDLE_S     = "30"  # 0 disables the presence heuristic
+$env:HUMBLE_PI_NOTIFY_WAIT_DELAY_S = "45" # how long a dialog must go unanswered before it escalates
 $env:HUMBLE_PI_NOTIFY_MIN_RUN_S  = "0"   # skip the toast for trivially short runs
 $env:HUMBLE_PI_NOTIFY_LOCAL      = "osc9,bell"
 $env:HUMBLE_PI_NOTIFY_REMOTE     = "1"   # 0 = terminal only

@@ -32,6 +32,7 @@ import {
 	sendHomeAssistant,
 	shouldNotifyRunEnd,
 	waitingText,
+	waitingEscalationMs,
 	withNotifyEnvFile,
 	parseNotifyEnvFile,
 	notifyEnvFileCandidates,
@@ -73,8 +74,8 @@ interface Captured { url?: string; init?: any }
 	// ── config ──
 	const d = cfg();
 	check("defaults: both local channels, in order", d.local.join(",") === "osc9,bell", d.local.join(","));
-	check(`defaults: long run ${DEFAULTS.longRunS}s, idle ${DEFAULTS.idleS}s`,
-		d.longRunMs === 90_000 && d.idleMs === 30_000, `${d.longRunMs}/${d.idleMs}`);
+	check(`defaults: long run ${DEFAULTS.longRunS}s, idle ${DEFAULTS.idleS}s, patience ${DEFAULTS.waitDelayS}s`,
+		d.longRunMs === 90_000 && d.idleMs === 30_000 && d.waitDelayMs === 45_000, `${d.longRunMs}/${d.idleMs}/${d.waitDelayMs}`);
 	check("defaults: trivial runs still notify locally (minRunS 0)", d.minRunMs === 0);
 	check("defaults: remote target is HA's own tray, not the flaky notify.notify shorthand",
 		d.haService === "persistent_notification.create" && haPath(d.haService) === "/api/services/persistent_notification/create", d.haService);
@@ -97,14 +98,50 @@ interface Captured { url?: string; init?: any }
 		&& Object.keys(cfg({ HUMBLE_PI_HA_EXTRA: "[1,2]" }).haExtra).length === 0
 		&& Object.keys(cfg({ HUMBLE_PI_HA_EXTRA: "{oops" }).haExtra).length === 0);
 
-	// ── remote policy: a dialog is the unconditional case ──
-	const wait = decideWaiting(cfg(), state({ dialogOpen: "Approve this plan?" }));
-	check("open dialog pings remotely, always", wait?.reason === "waiting" && wait?.message === "pi needs you — Approve this plan?", JSON.stringify(wait));
-	check("no dialog open → no waiting ping", decideWaiting(cfg(), state()) === null);
-	check("waiting ping respects an unconfigured remote tier",
-		decideWaiting(readConfig({} as NodeJS.ProcessEnv), state({ dialogOpen: "x" })) === null);
-	check("waiting ping respects HUMBLE_PI_NOTIFY_REMOTE=0",
-		decideWaiting(cfg({ HUMBLE_PI_NOTIFY_REMOTE: "0" }), state({ dialogOpen: "x" })) === null);
+	// ── remote policy: a dialog escalates, it does not ping ──
+	// Revised 2026-10-30, same day it shipped, after real use: an open dialog used to buzz the phone the
+	// instant it opened, which in practice meant a push for every short task while the human sat directly
+	// in front of the screen. Escalation now needs patience AND absence.
+	const OPEN = 1_000_000;
+	const away = { dialogOpen: "Approve this plan?", dialogOpenedMs: OPEN, lastActivityMs: OPEN - 300_000 };
+	const justTyped = { dialogOpen: "Approve this plan?", dialogOpenedMs: OPEN, lastActivityMs: OPEN + 30_000 };
+	const stillHere = { dialogOpen: "Approve this plan?", dialogOpenedMs: OPEN, lastActivityMs: OPEN + 500_000 };
+
+	check("dialog, unanswered 45s, nobody typing → escalate",
+		decideWaiting(cfg(), state(away), OPEN + 45_000)?.reason === "waiting",
+		JSON.stringify(decideWaiting(cfg(), state(away), OPEN + 45_000)));
+	check("one second short of the patience window → no push", decideWaiting(cfg(), state(away), OPEN + 44_999) === null);
+	check("the escalation still names what pi is blocked on",
+		decideWaiting(cfg(), state(away), OPEN + 45_000)?.message === "pi needs you — Approve this plan?",
+		decideWaiting(cfg(), state(away), OPEN + 45_000)?.message ?? "(none)");
+	check("you are at the keyboard (typed 10s ago) → no push, open as long as it likes",
+		decideWaiting(cfg(), state(stillHere), OPEN + 510_000) === null);
+	check("patience alone is not enough: absence is the second half of the rule",
+		decideWaiting(cfg(), state({ ...justTyped, lastActivityMs: OPEN + 440_000 }), OPEN + 450_000) === null);
+	check("no dialog open → nothing to escalate", decideWaiting(cfg(), state(), OPEN + 90_000) === null);
+	check("waiting escalation respects an unconfigured remote tier",
+		decideWaiting(readConfig({} as NodeJS.ProcessEnv), state(away), OPEN + 90_000) === null);
+	check("waiting escalation respects HUMBLE_PI_NOTIFY_REMOTE=0",
+		decideWaiting(cfg({ HUMBLE_PI_NOTIFY_REMOTE: "0" }), state(away), OPEN + 90_000) === null);
+	check("a zero long-run threshold does not disable the waiting path",
+		decideWaiting(cfg({ HUMBLE_PI_NOTIFY_LONG_RUN_S: "0" }), state(away), OPEN + 45_000)?.reason === "waiting");
+
+	// Scheduling: one timer, armed at the earliest instant both halves could be true, so the extension
+	// sleeps instead of polling and the decision is re-made when it fires.
+	check("away already → patience floor decides (+45s)", waitingEscalationMs(cfg(), state(away), OPEN) === OPEN + 45_000,
+		String(waitingEscalationMs(cfg(), state(away), OPEN)));
+	check("typed 30s after it opened → absence pushes the floor out to +60s",
+		waitingEscalationMs(cfg(), state(justTyped), OPEN) === OPEN + 60_000, String(waitingEscalationMs(cfg(), state(justTyped), OPEN)));
+	check("idle rule disabled (0) → patience alone", waitingEscalationMs(cfg({ HUMBLE_PI_NOTIFY_IDLE_S: "0" }), state(justTyped), OPEN) === OPEN + 45_000);
+	check("HUMBLE_PI_NOTIFY_WAIT_DELAY_S moves the patience floor",
+		waitingEscalationMs(cfg({ HUMBLE_PI_NOTIFY_WAIT_DELAY_S: "120" }), state(away), OPEN) === OPEN + 120_000);
+	check("no dialog → nothing scheduled", waitingEscalationMs(cfg(), state(), OPEN) === null);
+	check("no remote target → nothing scheduled",
+		waitingEscalationMs(readConfig({} as NodeJS.ProcessEnv), state(away), OPEN) === null);
+	const armedAt = waitingEscalationMs(cfg(), state(justTyped), OPEN)!;
+	check("whatever the scheduler arms, the decision at that instant agrees (no drift between the two)",
+		decideWaiting(cfg(), state(justTyped), armedAt) !== null && decideWaiting(cfg(), state(justTyped), armedAt - 1) === null,
+		`armed +${armedAt - OPEN}ms`);
 
 	// ── remote policy: finished runs ──
 	const longRun = 120_000;
@@ -123,7 +160,7 @@ interface Captured { url?: string; init?: any }
 		decideRunEnd(cfg({ HUMBLE_PI_NOTIFY_IDLE_S: "0" }), state(), longRun, 1_000_001)?.reason === "long_run");
 	check("duration rule can be switched off (LONG_RUN_S=0) without disabling dialog pings",
 		decideRunEnd(cfg({ HUMBLE_PI_NOTIFY_LONG_RUN_S: "0" }), state(), 999_000, 1_999_000) === null
-		&& decideWaiting(cfg({ HUMBLE_PI_NOTIFY_LONG_RUN_S: "0" }), state({ dialogOpen: "x" })) !== null);
+		&& decideWaiting(cfg({ HUMBLE_PI_NOTIFY_LONG_RUN_S: "0" }), state(away), OPEN + 45_000) !== null);
 	check("buzz message carries the run outcome and duration",
 		decideRunEnd(cfg(), state({ outcome: "aborted" }), longRun, 1_090_000)?.message === "pi stopped — 2m",
 		decideRunEnd(cfg(), state({ outcome: "aborted" }), longRun, 1_090_000)?.message);
