@@ -87,12 +87,19 @@ sbxpi
    workspace**, and this repo **read-only**.
 3. Wires your local model: copies **every locally hosted provider** from your
    host's `~/.pi/agent/models.json` into the sandbox (baseUrl host rewritten to
-   `host.docker.internal`, port/path kept — e.g. `http://host.docker.internal:8889/v1`
-   for Strata) and sets a default model — `strata` if defined, else
-   `unsloth-studio` —
-   merged into `settings.json`, so installed packages and preferences survive
-   re-provisioning. Sandboxes deliberately don't import user-level `~/.pi`
-   config, so this step exists.
+   `host.docker.internal`, port/path kept — e.g. `http://host.docker.internal:8890/v1`
+   for the Strata light profile) and sets a default model, merged into
+   `settings.json`, so installed packages and preferences survive
+   re-provisioning. **Per-model `baseUrl` overrides are rewritten too** — one
+   provider spanning two server ports (`SingleGPU` :8890, `DualGPU` :8889) only
+   works in the VM if each model's own URL is rewritten, not just the provider's.
+   The default is chosen by **probing from inside the VM** and taking the first
+   provider that answers (preference: `unsloth-studio`, then any provider named
+   `strata*`, then file order) — a provider that is configured but not running
+   used to become the default, and every message then failed. Sandboxes
+   deliberately don't import user-level `~/.pi` config, so this step exists —
+   and it means the sandbox holds a **snapshot**: edit the host `models.json`,
+   then re-run `sbxpi` (it re-provisions) or the sandbox keeps the old providers.
 4. Installs HumbelPi from the read-only mount — guards, backlog, `/away`, perf stats
    and friends run **inside** the VM, as a second layer on top of the real boundary.
 5. Drops you into pi's TUI, already on your model — and **continues your last

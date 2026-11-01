@@ -66,9 +66,29 @@ Do this once before your first `sbxpi`:
 - **No Anthropic, by design:** `sbxpi` suppresses the pi kit's interactive
   credential prompt and adds per-sandbox **deny** rules for
   `api.anthropic.com` / `platform.claude.com` — we run a local model. (The local
-  model is reached via `host.docker.internal:8889` (Strata; `:8888` for the
-  Unsloth Studio fallback), which resolves to your host
-  from inside the VM; no network-policy rules needed.)
+  model is reached via `host.docker.internal:<port>` — `:8890` for the Strata
+  light profile, `:8889` for the heavy one, `:8888` for the Unsloth Studio
+  fallback — which resolves to your host from inside the VM; no network-policy
+  rules needed.)
+- **"Connection error." inside a sandbox is a URL problem, not a config problem.**
+  `127.0.0.1` and `localhost` inside the microVM are the **VM itself** — the host's
+  servers are not there. Only `host.docker.internal` reaches them, and pi does not
+  rewrite URLs, which is why `sbxpi` writes a rewritten `models.json` every launch.
+  Two traps found the hard way on 2026-11-01:
+  - **Per-model `baseUrl` overrides.** A provider can hold two models on two ports
+    (`SingleGPU` → :8890, `DualGPU` → :8889). Rewriting only the provider-level
+    baseUrl leaves the model pointing at `127.0.0.1`, dead in the VM.
+  - **The config is a snapshot.** The sandbox never reads your host `models.json`.
+    Rename or re-point a provider on the host, and the sandbox keeps the old ids
+    until `sbxpi` re-provisions it.
+  Reaching a host server that listens on `127.0.0.1` only still works: the
+  Docker gateway dials the host loopback **from the host side**, so nothing needs
+  `0.0.0.0`. That is also how to read a probe: **200** means the service answered;
+  **500 with a body like `dial tcp [::1]:8888: connectex: …actively refused`** means
+  the gateway tried and nothing is listening — it is not your model server failing.
+  `sbx-local-model.sh` uses exactly this to pick a default model that is actually
+  running, and prints `[skip] … HTTP 500` plus the gateway's own words when a
+  provider is configured but down.
 - **Yolo by default:** sandboxes created by `sbxpi` carry `HUMBLE_PI_YOLO=1`
   (baked in via `sbx create --env`), and yolo defaults on whenever a sandbox is
   detected (`SANDBOX_NAME` / `/run/sandbox` cover older sandboxes too) — the microVM
