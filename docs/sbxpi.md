@@ -67,8 +67,9 @@ Do this once before your first `sbxpi`:
   credential prompt and adds per-sandbox **deny** rules for
   `api.anthropic.com` / `platform.claude.com` — we run a local model. (The local
   model is reached via `host.docker.internal:<port>` — `:8890` for the Strata
-  light profile, `:8889` for the heavy one, `:8888` for the Unsloth Studio
-  fallback — which resolves to your host from inside the VM; no network-policy
+  light profile *and* the RAM-lean dual profile (they share the port because only
+  one profile can run at a time), `:8889` for the heavy dual one, `:8888` for the
+  Unsloth Studio fallback — which resolves to your host from inside the VM; no network-policy
   rules needed.)
 - **"Connection error." inside a sandbox is a URL problem, not a config problem.**
   `127.0.0.1` and `localhost` inside the microVM are the **VM itself** — the host's
