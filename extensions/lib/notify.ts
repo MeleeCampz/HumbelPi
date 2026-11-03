@@ -67,7 +67,13 @@ export interface NotifyState {
 
 export const DEFAULTS = {
 	longRunS: 90,
-	idleS: 30,
+	// Nothing leaves the terminal until the human has been silent for two full minutes. This is the
+	// presence half of both remote rules, so it also sets the earliest possible push: a dialog opened at
+	// t=0 cannot reach the phone before t=120s no matter how short waitDelayS is. Deliberately generous,
+	// because a push that lands while you are watching the screen is worse than no push at all — asked
+	// for out loud on 2026-11-02 ("dont send a push until at least 2 minutes of inactivity has passed").
+	// Presence is the last keystroke pi actually saw, so 0 means "give up on guessing and push anyway".
+	idleS: 120,
 	// A dialog used to ping the phone immediately. That is what made a 20-second task buzz while the
 	// human sat right in front of the screen — the policy was revised the same day it shipped, see
 	// decideWaiting(). 45s of unanswered dialog is the patience floor.

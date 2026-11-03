@@ -13,7 +13,7 @@
  *   HUMBLE_PI_HA_SERVICE notify.mobile_app_<your_device>  (default: persistent_notification.create,
  *                        which is UI-only — /notify services lists the names that reach a device)
  *   HUMBLE_PI_NOTIFY_LONG_RUN_S  a run must last this long to buzz the phone (default 90)
- *   HUMBLE_PI_NOTIFY_IDLE_S      no typing for this long counts as "not there" (default 30, 0 = off)
+ *   HUMBLE_PI_NOTIFY_IDLE_S      no typing for this long counts as "not there" (default 120, 0 = off)
  *   HUMBLE_PI_NOTIFY_WAIT_DELAY_S how long a dialog must go unanswered before it escalates (default 45)
  *   HUMBLE_PI_NOTIFY_MIN_RUN_S   skip the toast for trivially short runs (default 0 = every run)
  *   HUMBLE_PI_NOTIFY_LOCAL       osc9,bell  (either, or "none"-ish by picking one)
@@ -125,20 +125,28 @@ function remotePing(message: string, title = "pi"): void {
  */
 let waitTimer: NodeJS.Timeout | null = null;
 
-function scheduleWaitPing(): void {
+function scheduleWaitPing(minDelayMs = 0): void {
 	if (waitTimer) {
 		clearTimeout(waitTimer);
 		waitTimer = null;
 	}
 	const at = waitingEscalationMs(config(), STATE);
 	if (at === null) return;
-	const delay = Math.max(0, at - nowMs());
+	const delay = Math.max(minDelayMs, at - nowMs());
 	waitTimer = setTimeout(() => {
 		waitTimer = null;
 		// Re-decided at fire time, not at schedule time: the dialog may have been answered, dismissed,
 		// or you may have come back to the keyboard in the meantime.
 		const d = decideWaiting(config(), STATE, nowMs());
-		if (d) remotePing(d.message, "pi needs you");
+		if (d) {
+			remotePing(d.message, "pi needs you");
+			return;
+		}
+		// Not yet — but that must not mean never. A dialog whose timer fired one step early (a wall-clock
+		// jump over a suspend, a threshold edited underneath it, a timer rounded down) would otherwise
+		// drop the only ping it was ever going to send, silently and with nothing left pending. Re-arm for
+		// what is left, with a 1s floor so a pathological "not yet, and no later than now" cannot spin.
+		if (STATE.dialogOpen !== null) scheduleWaitPing(1000);
 	}, delay).unref();
 }
 
@@ -201,6 +209,12 @@ export default function (pi: ExtensionAPI) {
 		// Answered, dismissed or cancelled is a private event: a push that lands after you already
 		// replied is worse than no push at all.
 		cancelWaitPing();
+		// A dialog only ends because something at this terminal closed it, and pi does not report those
+		// keystrokes through `input` — they go to the selector, not the prompt line. Without this, answering
+		// a question and sitting there for another 90 seconds ends the run as "long run + nobody around" and
+		// phones you while you are looking at the screen. Unattended mode is unaffected: its auto-reject path
+		// never opens a dialog, so no prompt_end fires and absence still counts as absence.
+		STATE.lastActivityMs = nowMs();
 	});
 
 	// Presence proxy: a human-typed message means somebody is at this keyboard. Messages an

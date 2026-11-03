@@ -359,16 +359,23 @@ remote  one POST to Home Assistant's notify service, so the ping reaches your ph
         / TTS / lights when you are not at this machine.
 ```
 
-When the phone is buzzed — the whole point is not to buzz you for work you are watching. A dialog
-(a guards approval, a /plan question, an ask_user) escalates only after it has gone unanswered for
-`HUMBLE_PI_NOTIFY_WAIT_DELAY_S` (45s) **and** nobody has typed for `HUMBLE_PI_NOTIFY_IDLE_S` (30s). A
+When the phone is buzzed — the whole point is not to buzz you for work you are watching. **Nothing
+leaves the terminal until you have been silent for two full minutes.** A dialog (a guards approval, a
+/plan question, an ask_user) escalates only after it has gone unanswered for
+`HUMBLE_PI_NOTIFY_WAIT_DELAY_S` (45s) **and** nobody has typed for `HUMBLE_PI_NOTIFY_IDLE_S` (120s). A
 finished run escalates only when it outlived `HUMBLE_PI_NOTIFY_LONG_RUN_S` (90s) under the same
-no-typing condition. Answer a dialog inside that window and it is a private event: toast, bell, no
-phone call. That is the revision, not the original design — the first version pushed the instant any
-dialog opened, which meant a buzz for every 20-second task while sitting right in front of the screen.
+no-typing condition. Both rules share the presence gate, so the presence gate also sets the earliest
+possible push: a dialog that opens the moment you stop typing cannot reach the phone before +120s, no
+matter how short the patience window is. Answer a dialog inside that window and it is a private event:
+toast, bell, no phone call. That is the revision, not the original design — the first version pushed the
+instant any dialog opened, which meant a buzz for every 20-second task while sitting right in front of
+the screen.
 pi enables terminal focus reporting (?1004h) but never tells extensions whether the window is focused,
-so presence is measured by the last human-typed message. That is a proxy, not a sensor — said out loud
-rather than hidden in a flag.
+so presence is measured by the last human-typed message — plus the last dialog you closed, because a
+selection you made in a dialog never reaches an extension as an `input` event. Absence is also not
+presence: in unattended mode (`/away`) dialogs are auto-rejected without ever opening, so nothing there
+falsely claims you were at the keyboard. Said out loud rather than hidden in a flag: this is a proxy, not
+a sensor.
 
 Config lives in your PowerShell profile (`$PROFILE`), not in this repo:
 
@@ -377,7 +384,7 @@ $env:HUMBLE_PI_HA_URL     = "http://homeassistant.local:8123"
 $env:HUMBLE_PI_HA_TOKEN   = "…"   # HA long-lived token (profile → Security). Never committed.
 $env:HUMBLE_PI_HA_SERVICE = "notify.mobile_app_<your_device>"   # exactly what /notify services prints first
 $env:HUMBLE_PI_NOTIFY_LONG_RUN_S = "90"  # 0 disables the duration rule
-$env:HUMBLE_PI_NOTIFY_IDLE_S     = "30"  # 0 disables the presence heuristic
+$env:HUMBLE_PI_NOTIFY_IDLE_S     = "120" # 0 disables the presence heuristic (pushes immediately)
 $env:HUMBLE_PI_NOTIFY_WAIT_DELAY_S = "45" # how long a dialog must go unanswered before it escalates
 $env:HUMBLE_PI_NOTIFY_MIN_RUN_S  = "0"   # skip the toast for trivially short runs
 $env:HUMBLE_PI_NOTIFY_LOCAL      = "osc9,bell"
@@ -400,8 +407,10 @@ Only `HUMBLE_PI_*` keys are read from it — a config file that could also set `
 bug than the one it fixes. Real environment variables always beat the file, so a one-off
 `HUMBLE_PI_HA_SERVICE=… pi` still wins, and `/notify status` names the file it read and which keys
 came from it. `tools/sbx-pi.sh` writes that file into the sandbox on every launch from whatever the
-host has: it echoes key names only (never the token), and refuses any value containing shell
-metacharacters, because those values are interpolated into a command executed inside the container.
+host has: every `HUMBLE_PI_*` key the extension reads (a test compares the two lists, because a key that is
+read but not synced fails quietly — the sandbox just runs the default and looks configured), it echoes key
+names only (never the token), and it refuses any value containing shell metacharacters, because those
+values are interpolated into a command executed inside the container.
 
 Leave `HUMBLE_PI_HA_SERVICE` unset and the target is `persistent_notification.create`: it exists on
 every install, always accepts `{title, message}`, and never fails — but it lands in HA's own

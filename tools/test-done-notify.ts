@@ -75,7 +75,7 @@ interface Captured { url?: string; init?: any }
 	const d = cfg();
 	check("defaults: both local channels, in order", d.local.join(",") === "osc9,bell", d.local.join(","));
 	check(`defaults: long run ${DEFAULTS.longRunS}s, idle ${DEFAULTS.idleS}s, patience ${DEFAULTS.waitDelayS}s`,
-		d.longRunMs === 90_000 && d.idleMs === 30_000 && d.waitDelayMs === 45_000, `${d.longRunMs}/${d.idleMs}/${d.waitDelayMs}`);
+		d.longRunMs === 90_000 && d.idleMs === 120_000 && d.waitDelayMs === 45_000, `${d.longRunMs}/${d.idleMs}/${d.waitDelayMs}`);
 	check("defaults: trivial runs still notify locally (minRunS 0)", d.minRunMs === 0);
 	check("defaults: remote target is HA's own tray, not the flaky notify.notify shorthand",
 		d.haService === "persistent_notification.create" && haPath(d.haService) === "/api/services/persistent_notification/create", d.haService);
@@ -118,6 +118,21 @@ interface Captured { url?: string; init?: any }
 		decideWaiting(cfg(), state(stillHere), OPEN + 510_000) === null);
 	check("patience alone is not enough: absence is the second half of the rule",
 		decideWaiting(cfg(), state({ ...justTyped, lastActivityMs: OPEN + 440_000 }), OPEN + 450_000) === null);
+	// The rule exactly as asked for ("dont send a push until at least 2 minutes of inactivity has passed"),
+	// pinned at the boundary rather than described. Dialog opened and nobody has typed since.
+	const silent = { dialogOpen: "Approve this plan?", dialogOpenedMs: OPEN, lastActivityMs: OPEN };
+	check("no push before 2 full minutes of silence: 119s is not enough (dialog path)",
+		decideWaiting(cfg(), state(silent), OPEN + 119_000) === null,
+		JSON.stringify(decideWaiting(cfg(), state(silent), OPEN + 119_000)));
+	check("…and 120s is (dialog path)",
+		decideWaiting(cfg(), state(silent), OPEN + 120_000)?.reason === "waiting",
+		JSON.stringify(decideWaiting(cfg(), state(silent), OPEN + 120_000)));
+	// Direction proof: those two checks measure the threshold itself. Same instant, same state, threshold
+	// lowered to the old 30s — the moment pushes. Without this, "119s is silent" could be true for an
+	// unrelated reason and still look like a passing boundary test.
+	check("same instant with IDLE_S=30 does push, so the boundary is the threshold and not a coincidence",
+		decideWaiting(cfg({ HUMBLE_PI_NOTIFY_IDLE_S: "30" }), state(silent), OPEN + 119_000)?.reason === "waiting",
+		JSON.stringify(decideWaiting(cfg({ HUMBLE_PI_NOTIFY_IDLE_S: "30" }), state(silent), OPEN + 119_000)));
 	check("no dialog open → nothing to escalate", decideWaiting(cfg(), state(), OPEN + 90_000) === null);
 	check("waiting escalation respects an unconfigured remote tier",
 		decideWaiting(readConfig({} as NodeJS.ProcessEnv), state(away), OPEN + 90_000) === null);
@@ -130,8 +145,9 @@ interface Captured { url?: string; init?: any }
 	// sleeps instead of polling and the decision is re-made when it fires.
 	check("away already → patience floor decides (+45s)", waitingEscalationMs(cfg(), state(away), OPEN) === OPEN + 45_000,
 		String(waitingEscalationMs(cfg(), state(away), OPEN)));
-	check("typed 30s after it opened → absence pushes the floor out to +60s",
-		waitingEscalationMs(cfg(), state(justTyped), OPEN) === OPEN + 60_000, String(waitingEscalationMs(cfg(), state(justTyped), OPEN)));
+	check("typed 30s after it opened → the presence floor decides, not patience (+150s, not +45s)",
+		waitingEscalationMs(cfg(), state(justTyped), OPEN) === OPEN + 150_000,
+		String(waitingEscalationMs(cfg(), state(justTyped), OPEN)));
 	check("idle rule disabled (0) → patience alone", waitingEscalationMs(cfg({ HUMBLE_PI_NOTIFY_IDLE_S: "0" }), state(justTyped), OPEN) === OPEN + 45_000);
 	check("HUMBLE_PI_NOTIFY_WAIT_DELAY_S moves the patience floor",
 		waitingEscalationMs(cfg({ HUMBLE_PI_NOTIFY_WAIT_DELAY_S: "120" }), state(away), OPEN) === OPEN + 120_000);
@@ -146,24 +162,24 @@ interface Captured { url?: string; init?: any }
 	// ── remote policy: finished runs ──
 	const longRun = 120_000;
 	check("long run + nobody around → buzz",
-		decideRunEnd(cfg(), state({ lastActivityMs: 1_000_000 }), longRun, 1_000_000 + 45_000)?.reason === "long_run");
+		decideRunEnd(cfg(), state({ lastActivityMs: 1_000_000 }), longRun, 1_000_000 + 125_000)?.reason === "long_run");
 	check("long run but somebody typed 5s ago → no buzz (this is the whole point)",
 		decideRunEnd(cfg(), state({ lastActivityMs: 1_000_000 }), longRun, 1_000_000 + 5_000) === null);
 	check("short run + nobody around → no buzz",
 		decideRunEnd(cfg(), state(), 30_000, 1_040_000) === null);
 	check("run exactly at the threshold counts (>=, not >)",
-		decideRunEnd(cfg(), state(), 90_000, 1_000_000 + 30_000)?.reason === "long_run");
-	check("idle window is honoured exactly (30s, not 31s)",
-		decideRunEnd(cfg(), state(), 120_000, 1_000_000 + 29_999) === null
-		&& decideRunEnd(cfg(), state(), 120_000, 1_000_000 + 30_000) !== null);
+		decideRunEnd(cfg(), state(), 90_000, 1_000_000 + 120_000)?.reason === "long_run");
+	check("idle window is honoured exactly (120s, not 121s)",
+		decideRunEnd(cfg(), state(), 120_000, 1_000_000 + 119_999) === null
+		&& decideRunEnd(cfg(), state(), 120_000, 1_000_000 + 120_000) !== null);
 	check("idle heuristic can be switched off (HUMBLE_PI_NOTIFY_IDLE_S=0)",
 		decideRunEnd(cfg({ HUMBLE_PI_NOTIFY_IDLE_S: "0" }), state(), longRun, 1_000_001)?.reason === "long_run");
 	check("duration rule can be switched off (LONG_RUN_S=0) without disabling dialog pings",
 		decideRunEnd(cfg({ HUMBLE_PI_NOTIFY_LONG_RUN_S: "0" }), state(), 999_000, 1_999_000) === null
 		&& decideWaiting(cfg({ HUMBLE_PI_NOTIFY_LONG_RUN_S: "0" }), state(away), OPEN + 45_000) !== null);
 	check("buzz message carries the run outcome and duration",
-		decideRunEnd(cfg(), state({ outcome: "aborted" }), longRun, 1_090_000)?.message === "pi stopped — 2m",
-		decideRunEnd(cfg(), state({ outcome: "aborted" }), longRun, 1_090_000)?.message);
+		decideRunEnd(cfg(), state({ outcome: "aborted" }), longRun, 1_120_000)?.message === "pi stopped — 2m",
+		decideRunEnd(cfg(), state({ outcome: "aborted" }), longRun, 1_120_000)?.message);
 
 	// ── local gating ──
 	check("local tier fires for a 0s run by default", shouldNotifyRunEnd(cfg(), 0) === true);
@@ -381,6 +397,31 @@ interface Captured { url?: string; init?: any }
 	check(from >= 0 && to > from, "the notify-sync block in tools/sbx-pi.sh can be located for testing");
 	const block = launcher.slice(from, to + 3).join("\n");
 
+	// Completeness check, because this exact bug already happened: HUMBLE_PI_NOTIFY_WAIT_DELAY_S was read
+	// by the extension and carried by the launcher for two revisions… except that it was not carried, so a
+	// sandbox silently ran the default while a native session honoured the setting. A key that is read but
+	// not synced fails quietly — which is the worst kind of failure for a config surface.
+	const libSrc = fs.readFileSync(path.join(rootDir, "extensions", "lib", "notify.ts"), "utf8");
+	const readKeys = new Set<string>();
+	for (const m of libSrc.matchAll(/env\.(HUMBLE_PI_[A-Z_]+)/g)) readKeys.add(m[1]);
+	const carried = new Set<string>();
+	for (const line of launcher.slice(from + 1, launcher.findIndex((l, i) => i > from && l.startsWith(")"))))
+		for (const m of line.matchAll(/HUMBLE_PI_[A-Z_]+/g)) carried.add(m[0]);
+	// Exactly one key is deliberately not carried, and it is the one whose value means different things on
+	// the two sides: HUMBLE_PI_HA_ENV_FILE names a file *inside* the container, and the launcher is the
+	// thing that writes it there. Carrying a host path into a sandbox would point at nothing.
+	const DELIBERATE = new Set(["HUMBLE_PI_HA_ENV_FILE"]);
+	const notCarried = [...readKeys].filter((k) => !carried.has(k) && !DELIBERATE.has(k));
+	check(`every key notify.ts reads is carried into a sandbox (${readKeys.size} read, ${carried.size} carried)`,
+		notCarried.length === 0, "not carried: " + notCarried.join(", "));
+	check("the one exception is honest: HUMBLE_PI_HA_ENV_FILE really is read and really is not carried",
+		readKeys.has("HUMBLE_PI_HA_ENV_FILE") && !carried.has("HUMBLE_PI_HA_ENV_FILE"));
+	check("the exception list stays at exactly one entry — growing it is how an omission gets hidden",
+		DELIBERATE.size === 1, [...DELIBERATE].join(", "));
+	check("nothing is carried that the extension does not read (a launcher should not smuggle config)",
+		[...carried].every((k) => readKeys.has(k)),
+		"carried but unread: " + [...carried].filter((k) => !readKeys.has(k)).join(", "));
+
 	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sbxnotify-"));
 	const fakeHome = path.join(tmp, "home");
 	const fakeSbxDir = path.join(tmp, "bin");
@@ -407,6 +448,8 @@ interface Captured { url?: string; init?: any }
 				HUMBLE_PI_HA_SERVICE: "notify.mobile_app_pixel_8a",
 				HUMBLE_PI_HA_EXTRA: '{"data":{"tag":"pi"}}',
 				HUMBLE_PI_NOTIFY_LONG_RUN_S: "90",
+				HUMBLE_PI_NOTIFY_WAIT_DELAY_S: "45",
+				HUMBLE_PI_NOTIFY: "1",
 			},
 		});
 	};
@@ -417,6 +460,9 @@ interface Captured { url?: string; init?: any }
 	check("the launcher writes the config where the extension reads it", written.includes("HUMBLE_PI_HA_URL=http://homeassistant.local:8123"), written);
 	check("the token survives quoting intact", written.includes(`HUMBLE_PI_HA_TOKEN=${goodToken}`), written.split("\n")[1] ?? "");
 	check("HA_EXTRA (JSON, with quotes) is not rejected as unsafe", written.includes('HUMBLE_PI_HA_EXTRA={"data":{"tag":"pi"}}'), written);
+	check("the cadence keys are written too, not merely listed in the array (membership is not delivery)",
+		written.includes("HUMBLE_PI_NOTIFY_WAIT_DELAY_S=45") && written.includes("HUMBLE_PI_NOTIFY=1")
+		&& written.includes("HUMBLE_PI_NOTIFY_LONG_RUN_S=90"), written.trim());
 	check("only key names are echoed — a launcher must not print the token", !out.includes(goodToken) && out.includes("HUMBLE_PI_HA_TOKEN"), out.trim());
 	check("the file is written 600, not world-readable",
 		(fs.statSync(path.join(fakeHome, ".pi", "agent", "notify.env")).mode & 0o777) === 0o600,
