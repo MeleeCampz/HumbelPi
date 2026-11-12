@@ -1,0 +1,11 @@
+# LF everywhere. extensions/guards.ts was the last file that had been committed
+# with CRLF, and editing it rewrote the whole file to LF. Everything else in this
+# repo was already LF, so declare that once instead of letting each platform decide.
+* text=auto eol=lf
+
+# Images must not be touched by the text rules.
+*.png binary
+
+# The 370k-word dictionary is stored with CRLF and spellcheck reads it with
+# split(/\r?\n/); renormalising it would change 370k lines for no benefit.
+extensions/words-en.txt -text

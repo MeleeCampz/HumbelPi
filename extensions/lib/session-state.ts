@@ -34,9 +34,16 @@ export interface SessionState {
 	planMode: boolean;
 	planFile: string | null;
 	unattendedMode: boolean;
+	/**
+	 * #9: planning mode PAUSED — the plan file stays pinned, the write guard is off.
+	 * Stored as `planMode: false, planPaused: true` so every existing `if (ss.planMode)`
+	 * gate in guards.ts/backlog.ts behaves like a normal console without re-auditing.
+	 * The transition table itself is in ./plan-state.ts.
+	 */
+	planPaused?: boolean;
 }
 
-export const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false };
+export const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false, planPaused: false };
 
 /**
  * Yolo default (#14): ON when we detect a sandbox — the container IS the isolation
@@ -84,6 +91,8 @@ export function loadSessionState(sessionId: string): SessionState {
 		const s = JSON.parse(fs.readFileSync(sessionStateFile(sessionId), "utf8"));
 		// #14 one-way migration: strip the legacy per-session yolo key (now global).
 		const { yoloMode: _legacyYolo, ...clean } = s as SessionState & Record<string, unknown>;
+		// #9: state files written before planPaused existed get the default (false) from
+		// freshSessionState() — spread order matters, defaults first.
 		return { ...freshSessionState(), ...clean };
 	} catch {
 		return freshSessionState();

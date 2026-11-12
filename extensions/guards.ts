@@ -43,11 +43,15 @@
  *   /guards revoke-branch <name>   start asking again
  *   /guards reset                  clear all grants, re-enable both guards
  *
- * 3. Planning mode — /plan on [task] | off | approve [file] | implement <file> | reject [reason]
+ * 3. Planning mode — /plan on [task] | pause | resume | off | exit | approve [file] | implement <file> | reject [reason]
  *    Only the pinned plan file may be written (default: <project>/.pi/PLAN.md —
  *    in the project, gitignored, next to the backlog). finish_plan presents the
  *    finished plan for approval; approve or
  *    implement starts implementation with step-by-step progress reporting.
+ *    #9 adds the two ways out that are NOT approval: PAUSE (plan kept, write guard
+ *    suspended so side tasks are possible, marker shows 📋⏸, /plan resume re-arms the
+ *    same plan file) and EXIT (planning over, plan file kept as a document, nothing
+ *    implemented). Both are also rows in the finish_plan dialog. Table in lib/plan-state.ts.
  * 4. Unattended mode — /away [instruction] | /away
  *    The user is away: every confirmation dialog (sandbox, push guard, ask_user,
  *    finish_plan) is auto-rejected instead of hanging, and each user message carries an
@@ -77,6 +81,22 @@ import { askWithOther } from "./lib/ask-flow";
 // #12/#13: the plan-file location is shared with backlog.ts via a dependency-free
 // lib module (keeps the extension import graph light for tests).
 import { defaultPlanFile } from "./lib/plan-file";
+import {
+	applyPlanTransition,
+	finishPlanReminder,
+	planFooterMarker,
+	planFlagOf,
+	planGuardArmed,
+	planPausedFrame,
+	planStatusLine,
+	planTitleMarker,
+	planTransition,
+	planningPausedSteer,
+	planningExitedSteer,
+	planningResumeText,
+	planningRulesText,
+	type PlanFlag,
+} from "./lib/plan-state";
 // #1: all state IO lives in one shared module — fresh reads, atomic writes and
 // read-modify-write (update*) so a stale snapshot can never resurrect/clobber fields.
 import {
@@ -374,11 +394,18 @@ function implementationInstruction(file: string): string {
 /**
  * #1: belt-and-braces after an approval path flips planning mode off — re-read the
  * state file and warn loudly if it still says ON, so this bug class is never silent.
+ * #9: the same check on the other two transitions, because a state write that silently
+ * fails now has three shapes (not off, not paused, wrongly paused) and only the first was
+ * ever caught.
  */
-function verifyPlanModeOff(ctx: ExtensionContext, sid: string): void {
-	if (loadSessionState(sid).planMode) {
-		ctx.ui.notify("⚠️ Planning mode did NOT turn off — the session-state file still says ON. Run /plan off and check for other writers to that file.", "warning");
-	}
+function verifyPlanFlag(ctx: ExtensionContext, sid: string, expected: PlanFlag): void {
+	const got = planFlagOf(loadSessionState(sid));
+	if (got === expected) return;
+	const fix = expected === "paused" ? "/plan pause" : expected === "on" ? "/plan resume" : "/plan off";
+	ctx.ui.notify(
+		`⚠️ Planning mode did NOT become ${expected.toUpperCase()} — the session-state file says ${got.toUpperCase()}. Run ${fix} and check for other writers to that file.`,
+		"warning",
+	);
 }
 
 // ── git push helpers ────────────────────────────────────────────
@@ -430,7 +457,7 @@ function applyTitle(ctx: ExtensionContext): void {
 	// Away/yolo/plan are all per-session (#4).
 	const s = loadSessionState(ctx.sessionManager.getSessionId());
 	const g = loadGuardState(); // #14: yolo is machine-global
-	const marker = [s.unattendedMode ? "🌙 AWAY" : null, g.yoloMode ? "🔥 YOLO" : null, s.planMode ? "📋 PLAN" : null].filter(Boolean).join(" · ");
+	const marker = [s.unattendedMode ? "🌙 AWAY" : null, g.yoloMode ? "🔥 YOLO" : null, planTitleMarker(s)].filter(Boolean).join(" · ");
 	ctx.ui.setTitle(marker ? `${marker} — pi — ${dir}` : `🛡️ pi — ${dir}`);
 }
 
@@ -454,7 +481,7 @@ function createGuardFooter(ctx: any): (tui: any, theme: any, footerData: any) =>
 			const state = loadGuardState();
 			const ss = loadSessionState(ctx.sessionManager.getSessionId());
 			// #14: yolo marker comes from the machine-global guard state, not the session file.
-			const marker = [ss.unattendedMode ? "🌙" : null, state.yoloMode ? "🔥" : null, ss.planMode ? "📋" : null].filter(Boolean).join(" ") || "🛡️";
+			const marker = [ss.unattendedMode ? "🌙" : null, state.yoloMode ? "🔥" : null, planFooterMarker(ss)].filter(Boolean).join(" ") || "🛡️";
 
 			// --- line 1: marker + pwd (+ branch, session name) ---
 			let cwd = ctx.sessionManager.getCwd();
@@ -571,7 +598,9 @@ export default function (pi: ExtensionAPI) {
 		const cwd = ctx.cwd;
 
 		// ── 0. planning mode (per-session, #4): only the pinned plan file may be written ──
-		if (ss.planMode) {
+		// #9: asks planGuardArmed() instead of reading ss.planMode, so "PAUSED behaves like a
+		// normal console" is decided in ONE place (./lib/plan-state) and tested there.
+		if (planGuardArmed(ss)) {
 			const planFile = ss.planFile;
 			if (event.toolName === "write" || event.toolName === "edit") {
 				const p = typeof event.input?.path === "string" ? path.resolve(cwd, event.input.path) : "";
@@ -595,7 +624,9 @@ export default function (pi: ExtensionAPI) {
 			let suspects: string[] = [];
 			let isWrite = false;
 			// The pinned plan file is already vetted by the planning gate — never prompt for it.
-			const planExempt = ss.planMode ? ss.planFile : null;
+			// Only while that gate is actually armed: a PAUSED plan file is just a file again, so an
+			// out-of-project write to it prompts like any other write.
+			const planExempt = planGuardArmed(ss) ? ss.planFile : null;
 			if (event.toolName === "bash") {
 				const command = (event.input.command as string) ?? "";
 				suspects = suspiciousPathsInCommand(command, cwd);
@@ -731,6 +762,12 @@ export default function (pi: ExtensionAPI) {
 		if (ss.planMode) {
 			const file = ss.planFile ?? "(no plan file bound — run /plan on)";
 			frames.push(`[PLAN MODE] Planning mode is on. Refine the plan at ${file} only; do not implement anything else. /plan approve to finish.`);
+		} else if (ss.planPaused) {
+			// #9: injected on EVERY user message, not just the /plan pause notice — the whole point of
+			// pausing is that side work happens in this same console, and a model that still believed it
+			// was planning would refuse writes the guard now (correctly) allows. The frame and the guard
+			// always agree because both read the same flag.
+			frames.push(planPausedFrame(ss));
 		}
 		if (ss.unattendedMode) {
 			frames.push("[UNATTENDED MODE] The user is away and wants you to do as much useful work as possible without waiting for input. Any request for permission, confirmation or a decision will be AUTO-REJECTED — never block on one; pick the safest reasonable option, state your assumption, and collect all such decisions in a \"Decisions made while unattended\" section of your final report. When you run out of safe work, end your turn with a summary instead of waiting.");
@@ -744,7 +781,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── /plan command ──
 	pi.registerCommand("plan", {
-		description: "Planning mode: /plan on [task] | off | approve [file] | implement <file> | reject [reason]",
+		description: "Planning mode: /plan on [task] | pause | resume | off | exit | approve [file] | implement <file> | reject [reason]",
 		handler: async (args, ctx) => {
 			const sid = ctx.sessionManager.getSessionId();
 			const ss = loadSessionState(sid);
@@ -761,9 +798,7 @@ export default function (pi: ExtensionAPI) {
 					try { raw = fs.readFileSync(file, "utf8"); } catch { /* missing */ }
 					ctx.ui.notify(
 						[
-							ss.planMode
-								? `📋 Planning mode ON (this console) — plan file: ${ss.planFile ?? "(unbound)"}. finish_plan or /plan approve to implement, /plan reject [reason] to revise.`
-								: "Planning mode OFF. Start with: /plan on [task]",
+							`Planning mode: ${planStatusLine(ss)}`,
 							`state file: ${file}`,
 							raw,
 						].join("\n"),
@@ -773,43 +808,100 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "on": {
-					if (ss.planMode) {
+					// #9: the transition table decides, this handler only delivers. PAUSED + /plan on
+					// is a RESUME (same pinned file) — a paused console has no reason to start a second
+					// plan behind the one it just suspended.
+					const t = planTransition(ss, "on");
+					if (!t.changed) {
 						if (target) {
 							ctx.ui.notify("Already in planning mode — sending your task.", "info");
 							pi.sendUserMessage(target, { deliverAs: "followUp" });
 						} else {
-							ctx.ui.notify("Already in planning mode.", "info");
+							ctx.ui.notify(t.reason, "info");
 						}
 						break;
 					}
+					const resumed = planFlagOf(ss) === "paused";
 					const savedOn = updateSessionState(sid, s => {
+						applyPlanTransition(s, "on");
 						if (!s.planFile) {
 							s.planFile = defaultPlanFile(ctx.cwd);
 							fs.mkdirSync(path.dirname(s.planFile), { recursive: true });
 						}
-						s.planMode = true;
 					});
 					ss.planFile = savedOn.planFile; // the messages below quote the pinned file
 					applyTitle(ctx);
-					ctx.ui.notify(`📋 Planning mode ON — plan file: ${ss.planFile}. Reads and web search stay free; all other writes are blocked.`, "info");
+					verifyPlanFlag(ctx, sid, "on"); // #1/#9 mirror of the ON side (backlog #11)
+					ctx.ui.notify(resumed
+						? `📋 Planning mode RESUMED — plan file: ${ss.planFile}. Only that file may be written again.`
+						: `📋 Planning mode ON — plan file: ${ss.planFile}. Reads and web search stay free; all other writes are blocked.`, "info");
+					const rules = resumed
+						? planningResumeText(ss.planFile ?? "the plan file")
+						: planningRulesText(ss.planFile ?? "the plan file");
 					pi.sendUserMessage(
 						target
-							? `Planning mode is now ACTIVE. Rules: do not implement anything; the only file you may create or modify is ${ss.planFile} — write the complete plan there, replacing any stale content. Reading, web search and read-only commands are allowed. When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls. Your task: ${target} — draft the plan for it now. When the plan is complete, call the finish_plan tool with a short summary to present it for approval — don't just tell me it's done.`
-							: `Planning mode is now ACTIVE. Rules: do not implement anything; the only file you may create or modify is ${ss.planFile} — write the complete plan there, replacing any stale content. Reading, web search and read-only commands are allowed. When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls. Wait for my task, then draft the plan. When the plan is complete, call the finish_plan tool with a short summary to present it for approval — don't just tell me it's done.`,
+							? `${rules} Your task: ${target} — ${resumed ? "revise the plan for it" : "draft the plan for it"} now. ${finishPlanReminder()}`
+							: `${rules} Wait for my task, then draft the plan. ${finishPlanReminder()}`,
 						{ deliverAs: "followUp" },
 					);
 					break;
 				}
 
-				case "off":
-					updateSessionState(sid, s => { s.planMode = false; });
+				// #9: PAUSE keeps the plan (and its pinned file) and suspends only the plan-file write
+				// guard, so the agent can do side work without the plan being thrown away.
+				case "pause": {
+					const t = planTransition(ss, "pause");
+					if (!t.ok) {
+						ctx.ui.notify(t.reason, "warning");
+						break;
+					}
+					if (!t.changed) { ctx.ui.notify(t.reason, "info"); break; }
+					const pausedFile = ss.planFile ?? "the plan file";
+					updateSessionState(sid, s => { applyPlanTransition(s, "pause"); });
 					applyTitle(ctx);
-					ctx.ui.notify("Planning mode OFF — normal operation (implementation allowed).", "info");
+					verifyPlanFlag(ctx, sid, "paused");
+					ctx.ui.notify(`⏸ Planning mode PAUSED — plan kept at ${pausedFile}, writes allowed again. /plan resume to continue planning, /plan exit to leave.`, "info");
+					// A running turn must hear about it NOW: it would otherwise keep trying to write
+					// the plan file (which is no longer exempted) and get its own writes blocked.
+					if (!ctx.isIdle()) pi.sendUserMessage(planningPausedSteer(pausedFile), { deliverAs: "steer" });
 					break;
+				}
+
+				case "resume": {
+					const t = planTransition(ss, "resume");
+					if (!t.ok) {
+						ctx.ui.notify(t.reason, "warning");
+						break;
+					}
+					if (!t.changed) { ctx.ui.notify(t.reason, "info"); break; }
+					const saved = updateSessionState(sid, s => { applyPlanTransition(s, "resume"); });
+					applyTitle(ctx);
+					verifyPlanFlag(ctx, sid, "on");
+					ctx.ui.notify(`📋 Planning mode resumed — only ${saved.planFile ?? "the plan file"} may be written.`, "info");
+					const streaming = !ctx.isIdle();
+					pi.sendUserMessage(`${planningResumeText(saved.planFile ?? "the plan file")} ${finishPlanReminder()}`, { deliverAs: streaming ? "steer" : "followUp" });
+					break;
+				}
+
+				// #9: /plan off and /plan exit are the same transition — "exit" is the row the approval
+				// dialog shows, "off" is the spelling that has always worked. Neither implements anything.
+				case "off":
+				case "exit": {
+					const t = planTransition(ss, "exit");
+					if (!t.changed) { ctx.ui.notify(t.reason, "info"); break; }
+					const keptFile = ss.planFile ?? "the plan file";
+					const wasPaused = planFlagOf(ss) === "paused";
+					updateSessionState(sid, s => { applyPlanTransition(s, "exit"); });
+					applyTitle(ctx);
+					verifyPlanFlag(ctx, sid, "off");
+					ctx.ui.notify(`🚪 Planning mode OFF${wasPaused ? " (it was paused)" : ""} — plan kept at ${keptFile}, nothing is implemented. /plan on to plan again.`, "info");
+					if (!ctx.isIdle()) pi.sendUserMessage(planningExitedSteer(keptFile), { deliverAs: "steer" });
+					break;
+				}
 
 				case "approve": {
-					if (!ss.planMode) {
-						ctx.ui.notify("Not in planning mode. /plan on first.", "warning");
+					if (planFlagOf(ss) !== "on") {
+						ctx.ui.notify(planFlagOf(ss) === "paused" ? "Planning mode is PAUSED — /plan resume first, then approve." : "Not in planning mode. /plan on first.", "warning");
 						break;
 					}
 					const file = target ? path.resolve(ctx.cwd, target) : ss.planFile ?? path.join(ctx.cwd, "PLAN.md");
@@ -817,8 +909,8 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`Plan file not found: ${file}\nUsage: /plan approve [path/to/plan.md]`, "warning");
 						break;
 					}
-					updateSessionState(sid, s => { s.planMode = false; s.planFile = null; });
-					verifyPlanModeOff(ctx, sid);
+					updateSessionState(sid, s => { applyPlanTransition(s, "approve"); });
+					verifyPlanFlag(ctx, sid, "off");
 					applyTitle(ctx);
 					ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
 					pi.sendUserMessage(implementationInstruction(file), { deliverAs: "followUp" });
@@ -826,13 +918,13 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "reject": {
-					if (!ss.planMode) {
-						ctx.ui.notify("Not in planning mode.", "warning");
+					if (planFlagOf(ss) !== "on") {
+						ctx.ui.notify(planFlagOf(ss) === "paused" ? "Planning mode is PAUSED — reject needs an active plan. /plan resume or /plan exit." : "Not in planning mode.", "warning");
 						break;
 					}
 					const file = ss.planFile ?? "the plan file";
 					const feedback = target.trim();
-					ctx.ui.notify(feedback ? `📋 Plan rejected with feedback — still in planning mode.` : `📋 Plan rejected — still in planning mode. Tell me what should change (or /plan off to exit).`, "info");
+					ctx.ui.notify(feedback ? `📋 Plan rejected with feedback — still in planning mode.` : `📋 Plan rejected — still in planning mode. Tell me what should change (or /plan pause / /plan exit to leave the plan waiting).`, "info");
 					pi.sendUserMessage(
 						`The plan is REJECTED.${feedback ? `\nUser feedback: ${feedback}` : ""} Do NOT implement anything from it. We are still in planning mode — tell me what should change and I’ll revise ${file}.`,
 						{ deliverAs: "followUp" },
@@ -851,8 +943,8 @@ export default function (pi: ExtensionAPI) {
 						break;
 					}
 					if (ss.planMode) {
-						updateSessionState(sid, s => { s.planMode = false; s.planFile = null; });
-						verifyPlanModeOff(ctx, sid);
+						updateSessionState(sid, s => { applyPlanTransition(s, "approve"); });
+						verifyPlanFlag(ctx, sid, "off");
 						applyTitle(ctx);
 					}
 					ctx.ui.notify(`🚀 Implementing ${file} (planning mode off)`, "info");
@@ -861,7 +953,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				default:
-					ctx.ui.notify("Usage: /plan on [task] | off | approve [file] | implement <file> | reject [reason]", "warning");
+					ctx.ui.notify("Usage: /plan on [task] | pause | resume | off | exit | approve [file] | implement <file> | reject [reason]", "warning");
 			}
 		},
 	});
@@ -872,10 +964,11 @@ export default function (pi: ExtensionAPI) {
 		label: "Finish plan",
 		description:
 			"Call when the plan document is complete and you want the user to approve it. " +
-			"Shows an Approve / Keep-planning dialog; approval starts implementation immediately. " +
-			"Do NOT implement anything before approval.",
+			"Shows an Approve / Keep-planning / Pause / Exit dialog; approval starts implementation " +
+			"immediately. Pause keeps the plan and suspends the plan-file guard for side work; Exit ends " +
+			"planning with the plan file kept but NOT implemented. Do NOT implement anything before approval.",
 		promptSnippet:
-			"finish_plan(summary) — present the finished plan for approval (approve → implementation starts; otherwise wait for feedback)",
+			"finish_plan(summary) — present the finished plan for approval (approve → implementation starts; keep planning / pause / exit → no implementation, follow the returned instruction)",
 		parameters: Type.Object({
 			summary: Type.String({ description: "2-4 sentence summary of the plan, shown in the approval dialog" }),
 		}),
@@ -883,7 +976,13 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const sid = ctx.sessionManager.getSessionId();
 			const ss = loadSessionState(sid);
-			if (!ss.planMode) {
+			const flag = planFlagOf(ss);
+			if (flag === "paused") {
+				// #9: the plan is waiting on purpose — a finish_plan call while paused must not sneak
+				// an approval dialog (or an implementation) past the pause the user just asked for.
+				return { content: [{ type: "text", text: `Planning mode is PAUSED in this console (the plan at ${ss.planFile ?? "the plan file"} is kept but suspended). finish_plan is not available while paused. Do NOT implement anything and do NOT call finish_plan again: do the work the user asked for, then tell them to run /plan resume to bring the plan back.` }], details: undefined };
+			}
+			if (flag === "off") {
 				return { content: [{ type: "text", text: "Not in planning mode (this console) — run /plan on first. Do not implement." }], details: undefined };
 			}
 			const file = ss.planFile;
@@ -898,24 +997,48 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: `No interactive UI available. Ask the user to run: /plan approve ${file}` }], details: undefined };
 			}
 			// HumbelPi #3: this whole flow goes through askWithOther, so the feedback box can send
-			// you BACK to Approve / Keep planning (Esc) instead of being a dead end, and Ctrl+C is
-			// the deliberate cancel.
+			// you BACK to the row list (Esc) instead of being a dead end, and Ctrl+C is the deliberate
+			// cancel. #9 adds the two ways out that are NOT approval (rows 3 and 4) — both keep the plan
+			// file on disk; neither implements anything. "Keep planning" stays the 2nd row (it is the
+			// Esc-destination and the reflex answer), so ask-loop keeps a listed otherLabel at its own
+			// position instead of re-appending it at the end.
+			const APPROVE = "✅ Approve & implement";
+			const KEEP = "✏️ Keep planning";
+			const PAUSE = "⏸ Pause planning (side task)";
+			const EXIT = "🚪 Exit planning (keep file)";
 			const outcome = await askWithOther(ctx, {
 				question: `📋 Plan ready — approve?\n\nFile:     ${file}\n\n${params.summary}`,
-				options: ["✅ Approve & implement", "✏️ Keep planning"],
-				otherLabel: "✏️ Keep planning",
+				options: [APPROVE, KEEP, PAUSE, EXIT],
+				otherLabel: KEEP,
 				answerTitle: "✏️ What should change in the plan?",
 				answerPlaceholder: "e.g. use SQLite instead of JSON, drop step 3…",
-				backLabel: "back to Approve / Keep planning",
+				backLabel: "back to Approve / Keep planning / Pause / Exit",
 			});
-			if (outcome.kind === "option" && /approve/i.test(outcome.text)) {
-				updateSessionState(sid, s => { s.planMode = false; s.planFile = null; });
-				verifyPlanModeOff(ctx, sid);
+			// Only the exact Approve row starts implementation — an unknown or partial match must never
+			// turn into code written on a plan the user did not approve (the old /approve/i regex matched
+			// any string containing "approve", including feedback typed at the box).
+			if (outcome.kind === "option" && outcome.text === APPROVE) {
+				updateSessionState(sid, s => { applyPlanTransition(s, "approve"); });
+				verifyPlanFlag(ctx, sid, "off");
 				applyTitle(ctx);
 				ctx.ui.notify(`✅ Plan approved — starting implementation of ${file}`, "info");
 				// #10: no queued follow-up — the instruction goes into the tool result so the model
 				// implements in the SAME turn. A queued message would land later as a stale duplicate.
 				return { content: [{ type: "text", text: implementationInstruction(file) }], details: undefined };
+			}
+			if (outcome.kind === "option" && outcome.text === PAUSE) {
+				updateSessionState(sid, s => { applyPlanTransition(s, "pause"); });
+				verifyPlanFlag(ctx, sid, "paused");
+				applyTitle(ctx);
+				ctx.ui.notify(`⏸ Planning mode PAUSED — plan kept at ${file}, writes allowed again for a side task. /plan resume to continue planning, /plan exit to leave.`, "info");
+				return { content: [{ type: "text", text: `The user PAUSED planning mode: the plan at ${file} is kept but unapproved, and the plan-file guard is off so they can work on something else. Do NOT implement the plan, do NOT rewrite ${file}, and do NOT call finish_plan again. End your turn now and tell the user to run /plan resume when they want the plan back.` }], details: undefined };
+			}
+			if (outcome.kind === "option" && outcome.text === EXIT) {
+				updateSessionState(sid, s => { applyPlanTransition(s, "exit"); });
+				verifyPlanFlag(ctx, sid, "off");
+				applyTitle(ctx);
+				ctx.ui.notify(`🚪 Planning mode EXITED — plan kept at ${file}, nothing implemented. Reads and writes are normal again; /plan on to plan again.`, "info");
+				return { content: [{ type: "text", text: `The user EXITED planning mode: the plan at ${file} stays on disk as a document but it is NOT approved. Do NOT implement it and do NOT call finish_plan again. Summarize the plan briefly, end your turn, and wait for a new instruction.` }], details: undefined };
 			}
 			if (outcome.kind === "custom") {
 				// #13: refusal reason inline — no extra manual turn
@@ -981,7 +1104,7 @@ export default function (pi: ExtensionAPI) {
 					`🛡️ Guards (${GUARD_STATE_FILE})`,
 					`  yolo    : ${state.yoloMode ? "🔥 ON (sandbox silenced)" : "off"} ${yoloIsExplicit() ? "(set)" : `(default: ${yoloDefaultOn() ? "sandbox detected" : "no sandbox"})`}`,
 					`  unattended: ${ss.unattendedMode ? "🌙 ON (this console — dialogs auto-rejected)" : "off"}`,
-					`  plan    : ${ss.planMode ? `📋 ON (this console — ${ss.planFile ?? "no file bound"})` : "off"}`,
+					`  plan    : ${planStatusLine(ss)}`,
 					`  sandbox : ${state.sandboxEnabled ? "ON " : "OFF"}`,
 					`  push    : ${state.pushGuardEnabled ? "ON " : "OFF"}`,
 					`  allowed paths  : ${state.allowedPaths.length ? state.allowedPaths.join(", ") : "(none)"}`,

@@ -26,6 +26,18 @@ import { loadSessionState, updateSessionState } from "./lib/session-state";
 // #13: via the dependency-free lib module — importing ./guards here would drag
 // the whole extension graph (typebox, pi-coding-agent) into test runs.
 import { defaultPlanFile } from "./lib/plan-file";
+// #9: planning mode is a state machine (ON / PAUSED / OFF) owned by guards.ts; the backlog
+// row follows the SAME transition table so the two entry points cannot disagree about what
+// "plan these" means in a paused session. Title/footer markers come from the same helpers.
+import {
+  applyPlanTransition,
+  finishPlanReminder,
+  planFlagOf,
+  planTitleMarker,
+  planTransition,
+  planningResumeText,
+  planningRulesText,
+} from "./lib/plan-state";
 
 type Marker = " " | "~" | "x";
 interface Entry { num: number; marker: Marker; text: string; }
@@ -329,6 +341,32 @@ export default function (pi: ExtensionAPI) {
         const lines = nums.map(entryRefLine);
         const sid = ctx.sessionManager.getSessionId();
         const ss = loadSessionState(sid);
+        const taskList = `Your task: plan these backlog items:\n${lines.join("\n")}\nDraft the plan for them now.`;
+        const titleFor = (state: typeof ss): void => {
+          const marker = planTitleMarker(state) || "📋 PLAN";
+          ctx.ui.setTitle(`${marker} — pi — ${path.basename(ctx.cwd) || "pi"}`);
+        };
+
+        // #9: PAUSED means "the plan is waiting, side work is allowed". Selecting backlog items
+        // for planning is an unambiguous request to bring that plan back — resume the SAME pinned
+        // file, never pin a second one behind the suspended plan (which is what the old
+        // if (!ss.planMode) branch did, because a paused session reads as planMode:false).
+        if (planFlagOf(ss) === "paused") {
+          if (!planTransition(ss, "resume").ok) {
+            ctx.ui.notify("📋 Planning mode is paused but no plan file is bound — run /plan on instead.", "warning");
+            return;
+          }
+          const saved = updateSessionState(sid, s => { applyPlanTransition(s, "resume"); });
+          titleFor(saved);
+          const f = saved.planFile ?? "the plan file";
+          ctx.ui.notify(`📋 Planning mode RESUMED — only ${f} may be written while planning is on.`, "info");
+          pi.sendUserMessage(`${planningResumeText(f)} Your task: plan these backlog items:\n${lines.join("\n")}\nRevise the plan for them now. ${finishPlanReminder()}`, { deliverAs: "followUp" });
+          if (!loadSessionState(sid).planMode) {
+            ctx.ui.notify("⚠️ Planning mode did NOT resume — the session-state file still says OFF. Check ~/.pi/agent/session-state/ for other writers.", "warning");
+          }
+          return;
+        }
+
         let justTurnedOn = false;
         if (!ss.planMode) {
           // #1: fresh read-modify-write — never save a snapshot taken before the check above.
@@ -337,21 +375,22 @@ export default function (pi: ExtensionAPI) {
               s.planFile = defaultPlanFile(ctx.cwd);
               fs.mkdirSync(path.dirname(s.planFile), { recursive: true });
             }
-            s.planMode = true;
+            applyPlanTransition(s, "on");
           });
           ss.planFile = saved.planFile; // the messages below quote the pinned file
-          ctx.ui.setTitle(`📋 PLAN — pi — ${path.basename(ctx.cwd) || "pi"}`);
+          titleFor(saved);
           justTurnedOn = true;
           // #11: belt-and-braces after flipping planning mode ON — re-read and warn
           // loudly if it didn't land (mirror of verifyPlanModeOff in guards.ts).
           if (!loadSessionState(sid).planMode) {
             ctx.ui.notify("⚠️ Planning mode did NOT turn on — the session-state file still says OFF. Check ~/.pi/agent/session-state/ for other writers.", "warning");
           }
+        } else {
+          titleFor(ss); // keep the title in sync with the marker helpers (🌙/🔥 combination)
         }
-        const taskList = `Your task: plan these backlog items:\n${lines.join("\n")}\nDraft the plan for them now.`;
         if (justTurnedOn) {
           pi.sendUserMessage(
-            `Planning mode is now ACTIVE. Rules: do not implement anything; the only file you may create or modify is ${ss.planFile ?? "unbound"} — write the complete plan there, replacing any stale content. Reading, web search and read-only commands are allowed. When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls. ${taskList} When the plan is complete, call the finish_plan tool with a short summary to present it for approval — don't just tell me it's done.`,
+            `${planningRulesText(ss.planFile ?? "unbound")} ${taskList} ${finishPlanReminder()}`,
             { deliverAs: "followUp" },
           );
         } else {
@@ -405,6 +444,9 @@ export default function (pi: ExtensionAPI) {
 
         // options carry emoji prefixes — match on the keyword, not the prefix
         if (action.includes("Plan")) {
+          // #9: in a PAUSED session this row RESUMES the pinned plan (see doPlan). Pausing and
+          // exiting live in /plan and in the finish_plan approval dialog — this row keeps meaning
+          // "start/keep planning", because it is the reflex answer for "these items, please plan".
           const mark = setMarkers(file, selected, "~");
           if (mark.changed > 0) ctx.ui.notify(`🔧 Marked ${mark.changed} item(s) working`, "info");
           await doPlan(selected);

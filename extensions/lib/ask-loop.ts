@@ -74,9 +74,12 @@ export const MAX_BACK_TRIPS = 25;
 export async function runAskLoop(host: AskHost, o: AskOptions): Promise<AskOutcome> {
 	let draft: string | undefined;
 	for (let trip = 0; trip < MAX_BACK_TRIPS; trip++) {
-		// The list is rebuilt identically on every trip (and `otherLabel` never appears twice,
-		// so a caller may list it among `options` for clarity).
-		const list = [...o.options.filter((x) => x !== o.otherLabel), o.otherLabel];
+		// The list is rebuilt identically on every trip. `otherLabel` is appended when the caller
+		// did not list it, and a caller that DOES list it keeps its own row position (#9 needs
+		// "Keep planning" to stay the 2nd row while pause/exit rows come after it) — never shown
+		// twice, whichever way it got there.
+		const list: string[] = [];
+		for (const x of [...o.options, o.otherLabel]) if (!list.includes(x)) list.push(x);
 		const choice = await host.select(o.question, list);
 		if (choice === undefined) return { kind: "dismissed", stage: "options" };
 		if (choice !== o.otherLabel) return { kind: "option", text: choice };
