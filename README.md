@@ -200,6 +200,15 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
 - **Per console**: plan state lives in `~/.pi/agent/session-state/<session>.json`, so
   other pi consoles on the same machine are unaffected; resuming a session keeps its
   plan, new sessions start clean.
+- **Pause and exit** (`/plan pause`, `/plan resume`, `/plan exit` — or the matching rows
+  in the finish_plan dialog): PAUSED keeps the plan file pinned (it is still the file
+  the mode was writing, and `/plan resume` or the backlog's "Plan these" returns to that
+  same plan) but drops the write guard, so you can implement a fix and come back. A paused
+  console behaves like a normal one, marked `[PLAN MODE PAUSED]` in the title, footer and
+  `/guards` status, and every message you send carries a one-line reminder that planning
+  mode is paused rather than gone — so the model cannot quietly forget it exists.
+  `/plan exit` (same as the old `/plan off`) leaves planning mode for good: the pin is
+  released and the guard returns to its normal state.
 - While active, only the plan file is writable: `<project>/.pi/PLAN.md` (in the
   project, gitignored, next to the backlog — easy to access even when pi runs in a
   VM); reads and searches stay free.
@@ -208,6 +217,8 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
   that is fed back to the agent. The reason box is **not** a dead end (#3): `esc` there puts
   you back on Approve / Keep planning with what you typed kept, so you can still approve;
   `ctrl+c` is the deliberate cancel. Same flow as `ask_user` (shared `extensions/lib/ask-loop.ts`).
+  Below those two rows are **⏸️ Pause** and **⏏️ Exit**, so leaving planning mode — temporarily
+  or for good — is answerable at exactly the moment you are deciding about the plan.
 - Planning state also syncs into the window title, so it's visible at a glance.
 
 ## Backlog
@@ -230,6 +241,8 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
 normal text editor for selection: pi's shift+arrow keys are dead by default, this makes
 them select text — and lets you copy it to the system clipboard. It composes with
 spellcheck (it extends the spellchecking editor, so typo highlighting keeps working).
+The same selection also works in the free-text dialogs (`ask_user`'s "Other" box and the
+plan-feedback box), which used pi-tui's stock `Input` — see "In the dialogs" below.
 
 - **Select:** hold `Shift` + `← → ↑ ↓ Home End` to extend the selection from the caret;
   `Ctrl+Shift+←/→` jumps by words. The selected range is drawn with a gray background
@@ -246,6 +259,23 @@ spellcheck (it extends the spellchecking editor, so typo highlighting keeps work
   movement is pi's own engine; the extension only tracks the selection endpoints).
 - Toggle: `/select on | off | status` — **on by default**, persisted in the guard state,
   re-applied automatically on every session start.
+
+**In the dialogs** (`ask_user` "Other", finish_plan "what should change?") the same keys work,
+from the same classification table (`extensions/lib/shift-moves.ts`) — one switch, both hosts,
+so they cannot drift into different key semantics:
+
+- **Why they were dead at all:** pi-tui's `Input` swallows `Shift+←` (`ESC[1;2D` — no binding
+  matches and its control-character guard rejects the sequence), and with the kitty keyboard
+  protocol the same key arrives as `ESC[8592;2u`, which pi-tui decodes as a **printable**
+  character and INSERTS a literal `←` into your answer. `Ctrl+Shift+←` (`ESC[1;6D`) is not
+  bound either — so word selection feeds the engine the ctrl-only form (`ESC[1;5D`, a word
+  jump) and extends the selection itself. All of this is asserted against real pi-tui instances
+  in `tools/test-dialog-select.ts`, section 1, rather than assumed.
+- **Copy:** `Shift+Insert`, `Ctrl+Shift+C`, or `Ctrl+C` while something is selected. In a dialog
+  `Ctrl+C` is also its cancel key, so the order is deliberate: it may only be spent on a copy
+  when there is something to copy — with no selection it still cancels the question.
+- **`⬒ N`** appears on the dialog's bottom border; `esc` still returns your draft, selection
+  included.
 
 ## Spellcheck
 
@@ -312,6 +342,17 @@ extensions/
   ask-user.ts      structured ask_user dialog
   done-notify.ts   finish/waiting notifications: terminal toast + bell, Home Assistant push
                    when pi needs you and you are not at the machine (/notify)
+  lib/             plain helper modules — excluded from extension auto-loading, register
+                   nothing, and importable straight from the tests:
+                   ask-loop.ts (answer/esc-back loop) · ask-flow.ts (ctx.ui wiring) ·
+                   dialog-input.ts (the free-text answer box, with selection — pi-tui-only, so
+                   keystroke tests can drive it; spellcheck.ts hands it the dictionary, the
+                   submit-key label and the clipboard writer)
+                   ansi-style.ts (ANSI-aware column styling + the shared selection color) ·
+                   shift-moves.ts (the key classification both selection hosts share) ·
+                   spell-words.ts (the typo rule) · plan-state.ts (planning-mode state
+                   machine: on/paused/off) · plan-file.ts · session-state.ts (state IO)
+                   notify.ts (done-notify engine)
 .githooks/pre-push   secret scan that runs on every push (this repo is public)
 bin/
   sbxpi, .ps1, .cmd  PATH launcher shims — `sbxpi` in any terminal/OS
@@ -322,7 +363,10 @@ tools/
   sbx-local-model.sh wires a sandbox's pi to the host's local model
   test-*.ts          regression tests — npx tsx tools/test-ask-flow.ts |
                      test-backlog-scroll.ts (needs pi's own node_modules on NODE_PATH) |
-                     test-yolo.ts | test-secret-scan.ts
+                     test-yolo.ts | test-secret-scan.ts | test-plan-state.ts |
+                     test-dialog-select.ts
+  tsconfig.check.json typecheck scaffold — npx tsc -p tools/tsconfig.check.json --noEmit
+                     (Windows: tools/mklink.bat first, to give node_modules the two pi packages)
 ```
 
 ## Development on a machine that uses this repo directly

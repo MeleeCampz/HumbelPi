@@ -1,2 +1,5 @@
 # local working state — never tracked
 .pi/
+
+# dev-only package junctions (tools/mklink.bat) for typecheck/test runs
+node_modules/

@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["../extensions/**/*.ts", "./test-ask-flow.ts", "./test-backlog-scroll.ts", "./test-plan-state.ts", "./test-dialog-select.ts"]
+}

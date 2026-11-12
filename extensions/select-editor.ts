@@ -48,7 +48,15 @@
 
 import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
-import { SpellcheckEditor, styleColumnRange, truncateAnsi } from "./spellcheck";
+import { SpellcheckEditor } from "./spellcheck";
+// The ANSI column arithmetic is shared too (lib/ansi-style.ts): the selection highlight here and
+// the typo underline in the editor/dialog are the same "style columns [a,b) of a rendered line"
+// operation, and a second implementation is how a highlight ends up one character off.
+import { SELECTION_OFF, SELECTION_ON, styleColumnRange, truncateAnsi } from "./lib/ansi-style";
+// #9: the key classification lives in a shared pure module so the main editor and the free-text
+// dialogs (lib/dialog-input.ts SelectingInput) cannot drift into different key semantics — they
+// read the same bytes and must mean the same thing. See lib/shift-moves.ts for what each wire form is.
+import { isCopyKey, isEditingKey, isSelectAllKey, matchShiftMove, plainMoveEdge } from "./lib/shift-moves";
 import { loadGuardState, updateGuardState } from "./lib/session-state";
 
 // ── Shared state (globalThis — jiti double-instance safe) ────────────────
@@ -61,56 +69,6 @@ const SELECT: SelectState = ((globalThis as Record<string, unknown>).__humbel_pi
 /** Latest ctx for notifications — refreshed on session_start (guards.ts #14 pattern). */
 let notifyUi: ((msg: string) => void) | undefined;
 const notify = (msg: string): void => { try { notifyUi?.(msg); } catch { /* stale ctx after reload — ignore */ } };
-
-// ── Key mapping ───────────────────────────────────────────────────────────
-
-/** Shift-movement key → the PLAIN sequence pi's editor already understands. */
-const SHIFT_MOVES: Array<[string, string]> = [
-	["shift+left", "\x1b[D"],
-	["shift+right", "\x1b[C"],
-	["shift+up", "\x1b[A"],
-	["shift+down", "\x1b[B"],
-	["shift+home", "\x1b[H"],
-	["shift+end", "\x1b[F"],
-	["ctrl+shift+left", "\x1b[1;5D"],
-	["ctrl+shift+right", "\x1b[1;5C"],
-];
-
-/**
- * Raw-sequence fallback for Shift+arrows (reference impl found matchesKey
- * unreliable in some environments). Covers the modified-arrow form
- * ESC[1;mX and kitty CSI-u. Wire modifier encoding (per pi's own parser,
- * keys.js parseKittySequence): bitmask = wireValue - 1, with shift = bit 0 —
- * so Shift is present when ((m - 1) & 1) !== 0 (wire 2=shift, 3=alt, 4=shift+alt…).
- */
-const RAW_SHIFT_ARROW = /^\x1b\[(\d+);(\d+)([ABCDHF])$/;
-const RAW_KITTY_SHIFT_MOVE = /^\x1b\[(8592|8593|8594|8595|8963|8964);(\d+)u$/;
-const KITTY_MOVE_SEQ: Record<string, string> = {
-	"8592": "\x1b[D", "8594": "\x1b[C", "8593": "\x1b[A", "8595": "\x1b[B",
-	"8963": "\x1b[H", "8964": "\x1b[F",
-};
-/** Kitty CSI-u for Shift+Insert (U+21E5; 57425 is pi's mapped variant). */
-const RAW_KITTY_SHIFT_INSERT = /^\x1b\[(8677|57425);(\d+)u$/;
-
-const hasShiftWireMod = (wireMod: string): boolean => ((parseInt(wireMod, 10) - 1) & 1) !== 0;
-const hasCtrlWireMod = (wireMod: string): boolean => ((parseInt(wireMod, 10) - 1) & 4) !== 0;
-
-function matchShiftMove(data: string): string | null {
-	for (const [key, seq] of SHIFT_MOVES) if (matchesKey(data, key)) return seq;
-	let m = RAW_SHIFT_ARROW.exec(data);
-	if (m && hasShiftWireMod(m[2])) {
-		// Ctrl bit + left/right → word jump (reference: shift+ctrl+arrow
-		// extends selection by words even when matchesKey is unreliable).
-		if (hasCtrlWireMod(m[2]) && (m[3] === "D" || m[3] === "C")) {
-			return m[3] === "D" ? "\x1b[1;5D" : "\x1b[1;5C";
-		}
-		const plain: Record<string, string> = { D: "\x1b[D", C: "\x1b[C", A: "\x1b[A", B: "\x1b[B", H: "\x1b[H", F: "\x1b[F" };
-		return plain[m[3]] ?? null;
-	}
-	m = RAW_KITTY_SHIFT_MOVE.exec(data);
-	if (m && hasShiftWireMod(m[2])) return KITTY_MOVE_SEQ[m[1]] ?? null;
-	return null;
-}
 
 // ── Editor ────────────────────────────────────────────────────────────────
 
@@ -190,19 +148,6 @@ class SelectingEditor extends SpellcheckEditor {
 		}
 	}
 
-	/** Printable char / Backspace / Delete — the keys that edit text in place. */
-	private isEditingKey(data: string): boolean {
-		if (matchesKey(data, "backspace") || matchesKey(data, "delete")) return true;
-		// Single printable code point (astral-safe: emoji are 2 UTF-16 units).
-		const cps = [...data];
-		return cps.length === 1 && cps[0]!.charCodeAt(0) >= 32;
-	}
-
-	private isRawShiftInsert(data: string): boolean {
-		const m = RAW_KITTY_SHIFT_INSERT.exec(data);
-		return !!m && hasShiftWireMod(m[2]!);
-	}
-
 	/** Delete the active selection in place; caret collapses to its start. */
 	private deleteSelection(): boolean {
 		const rng = this.normRange();
@@ -231,13 +176,13 @@ class SelectingEditor extends SpellcheckEditor {
 		// Copy keys — only with a live selection.
 		if (this.hasSelection()) {
 			const text = this.getSelectedText();
-			if (text !== null && (matchesKey(data, "shift+insert") || matchesKey(data, "ctrl+shift+c") || this.isRawShiftInsert(data))) {
+			if (text !== null && isCopyKey(data)) {
 				void this.copySelected(text);
 				return;
 			}
 			// Ctrl+C with an active selection copies and is consumed; without a
 			// selection it falls through to pi's app.clear (double-Ctrl+C preserved).
-			if (matchesKey(data, "ctrl+c")) {
+			if (text !== null && matchesKey(data, "ctrl+c")) {
 				void this.copySelected(text);
 				return;
 			}
@@ -246,7 +191,7 @@ class SelectingEditor extends SpellcheckEditor {
 		// Ctrl+A — select all. Pi stock binds ctrl+a to line-start; selection
 		// mode repurposes it (reference impl). Raw \x01 covers terminals that
 		// send the plain control byte.
-		if (matchesKey(data, "ctrl+a") || data === "\u0001") {
+		if (isSelectAllKey(data)) {
 			this.selectAll();
 			return;
 		}
@@ -254,7 +199,7 @@ class SelectingEditor extends SpellcheckEditor {
 		// Standard editing semantics with an active selection: typing / Backspace
 		// / Delete replace the selection — delete it in place, then process the
 		// key at the collapsed caret (Backspace/Delete are consumed).
-		if (this.hasSelection() && this.isEditingKey(data)) {
+		if (this.hasSelection() && isEditingKey(data)) {
 			this.deleteSelection();
 			if (matchesKey(data, "backspace") || matchesKey(data, "delete")) return;
 			super.handleInput(data);
@@ -280,11 +225,9 @@ class SelectingEditor extends SpellcheckEditor {
 		// just clears the selection and proceeds normally.
 		if (this.hasSelection()) {
 			const rng = this.normRange()!;
+			const edge = plainMoveEdge(data, { multiline: true });
 			this.clearSelection();
-			const dirLeft = matchesKey(data, "left") || matchesKey(data, "up") || matchesKey(data, "home");
-			const dirRight = matchesKey(data, "right") || matchesKey(data, "down") || matchesKey(data, "end");
-			if (dirLeft) { this.setCaret(rng.s); return; }
-			if (dirRight) { this.setCaret(rng.e); return; }
+			if (edge) { this.setCaret(edge === "start" ? rng.s : rng.e); return; }
 		}
 
 		super.handleInput(data);
@@ -322,13 +265,18 @@ class SelectingEditor extends SpellcheckEditor {
 	 * recovered by walking; any mismatch returns null (skip the paint).
 	 */
 	private buildLayoutEntries(layoutWidth: number): Array<{ lineIdx: number; s: number; e: number; text: string }> | null {
-		const host = this as unknown as { layoutText?: (w: number) => Array<{ text?: string }> };
+		const host = this as unknown as { layoutText?: (w: number) => Array<{ text?: string }>; state?: { lines?: string[] } };
 		const raw = typeof host.layoutText === "function" ? host.layoutText(layoutWidth) : null;
 		if (!Array.isArray(raw)) return null;
+		// `state` is TS-private on Editor (compile-time only). One typed cast, and a graceful bail:
+		// if a future pi-tui makes it truly private, we skip the selection paint rather than paint a
+		// range derived from lines we cannot read.
+		const lines = host.state?.lines;
+		if (!Array.isArray(lines)) return null;
 		const entries: Array<{ lineIdx: number; s: number; e: number; text: string }> = [];
 		let j = 0;
-		for (let i = 0; i < this.state.lines.length; i++) {
-			const line = this.state.lines[i] ?? "";
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i] ?? "";
 			if (visibleWidth(line) <= layoutWidth) {
 				if (j >= raw.length || (raw[j]?.text ?? "") !== line) return null;
 				entries.push({ lineIdx: i, s: 0, e: line.length, text: line });
@@ -400,7 +348,7 @@ class SelectingEditor extends SpellcheckEditor {
 				if (colEnd <= colStart) continue;
 				const renderedIdx = 1 + (r - scrollOffset);
 				if (renderedIdx >= 1 && renderedIdx < lines.length - 1) {
-					lines[renderedIdx] = styleColumnRange(lines[renderedIdx]!, colStart, colEnd, "\x1b[48;5;236m", "\x1b[49m");
+					lines[renderedIdx] = styleColumnRange(lines[renderedIdx]!, colStart, colEnd, SELECTION_ON, SELECTION_OFF);
 				}
 			}
 		} catch { /* layout internals unavailable/changed — skip highlight */ }

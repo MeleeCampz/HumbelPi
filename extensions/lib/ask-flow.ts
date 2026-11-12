@@ -11,7 +11,9 @@
  * (finish_plan approval), which is the point: the same back affordance in both dialogs.
  */
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createSpellcheckInputDialog } from "../spellcheck";
+// The answer box lives in lib/dialog-input.ts (pi-tui-only, so it is testable); spellcheck.ts
+// only supplies it with the dictionary, the key label and the clipboard writer.
+import { createSpellcheckInputDialog } from "./dialog-input";
 import { parseLiteralAnswer, runAskLoop } from "./ask-loop";
 import type { AskHost, AskOptions, AskOutcome, DialogAnswer } from "./ask-loop";
 

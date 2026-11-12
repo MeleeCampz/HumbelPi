@@ -15,21 +15,26 @@
  * - Skipped    : slash command NAMES (the argument text after the first token IS
  *                checked), CamelCase / ALLCAPS tokens, words with digits or symbols,
  *                words ≤ 2 letters.
- * - Everywhere : also highlights free-text dialogs — createSpellcheckInputDialog()
- *                is used by lib/ask-flow.ts (ask_user's "Other" answer and the plan
- *                feedback box) instead of pi's plain ctx.ui.input. Those dialogs use
- *                Enter submit / Esc back to the options / Ctrl+C cancel — see ask-loop.ts.
+ * - Everywhere : also highlights free-text dialogs — the answer box used by ask_user's "Other"
+ *                and the plan feedback box lives in lib/dialog-input.ts (ask-flow.ts builds it),
+ *                and this file hands it its dictionary, pi's submit-key label and the clipboard
+ *                writer through the seams at the bottom of this header. Those dialogs use Enter
+ *                submit / Esc back to the options / Ctrl+C cancel — see ask-loop.ts.
  * - Toggle     : /spellcheck on | off | status
  */
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CustomEditor, keyText, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Container, Input, Spacer, Text, matchesKey, visibleWidth, type Focusable } from "@earendil-works/pi-tui";
-// Type-only import: no runtime edge, so spellcheck.ts stays free of an import cycle
-// (ask-flow.ts imports THIS file for the dialog factory).
-import type { DialogAnswer } from "./lib/ask-loop";
+import { CustomEditor, copyToClipboard, keyText, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { highlightLine } from "./lib/ansi-style";
+import { unknownWords } from "./lib/spell-words";
+// #9: the shared /select switch (owned by select-editor.ts on globalThis) and, through
+// lib/dialog-input.ts, the Shift-selection behavior of the free-text dialogs. The key
+// classification table itself lives in lib/shift-moves.ts, shared with the main editor so the
+// two hosts measure the same bytes and cannot drift into different key semantics.
+import { setClipboardWriter, setDialogNotifier, setDialogSpellPaint, setSubmitKeyLabel } from "./lib/dialog-input";
+import { selectionEnabled } from "./lib/shift-moves";
 
 // The dictionary ships next to this extension file — works both as a loose file in
 // ~/.pi/agent/extensions/ and when loaded from a pi package directory. Fall back to
@@ -62,151 +67,28 @@ function getDict(): Set<string> {
 	return s;
 }
 
-/** Set of words in `text` that are not in the dictionary. */
-export function unknownWords(text: string, dictionary: Set<string>): Set<string> {
-	const out = new Set<string>();
-	const seen = new Set<string>();
-	for (const m of text.matchAll(/[A-Za-z]{3,}/g)) {
-		const tok = m[0];
-		const lower = tok.toLowerCase();
-		if (seen.has(lower)) continue;
-		seen.add(lower);
-		if (/[A-Z]/.test(tok.slice(1))) continue; // CamelCase / ALLCAPS → identifier or acronym
-		if (!dictionary.has(lower)) out.add(lower);
-		if (out.size >= 40) break; // sanity cap per message
-	}
-	return out;
-}
 
-/** Split a rendered line into zero-width sequences and visible chars. */
-interface Item {
-	s: string; // the sequence or single char
-	w: number; // visual width (0 for sequences)
-}
-
-function items(line: string): Item[] {
-	const out: Item[] = [];
-	let i = 0;
-	while (i < line.length) {
-		const ch = line[i];
-		if (ch === "\x1b") {
-			let j = i + 1;
-			if (line[j] === "[") {
-				// CSI: skip "[", consume params/intermediates (0x20-0x3f), then the
-				// final byte (0x40-0x7e). "[" itself is in 0x40-0x7e, so the final-byte
-				// scan must start AFTER it.
-				j++;
-				while (j < line.length && line.charCodeAt(j) >= 0x20 && line.charCodeAt(j) <= 0x3f) j++;
-				if (j < line.length) j++;
-			} else if (line[j] === "]") {
-				// OSC: ends with BEL or ST (ESC \)
-				while (j < line.length && line[j] !== "\x07" && !(line[j] === "\x1b" && line[j + 1] === "\\")) j++;
-				j += line[j] === "\x1b" ? 2 : 1;
-			} else if (line[j] === "_") {
-				// APC (e.g. pi's CURSOR_MARKER "\x1b_pi:c\x07"): ends with BEL or ST.
-				// MUST stay one atomic token — pi strips it by exact indexOf before
-				// writing, so splitting it leaks a raw BEL (terminal bell) and the
-				// embedded "pi:c" text to the screen.
-				while (j < line.length && line[j] !== "\x07" && !(line[j] === "\x1b" && line[j + 1] === "\\")) j++;
-				j += line[j] === "\x1b" ? 2 : 1;
-			} else {
-				j = i + 2; // F1/F2 or bare escape
-			}
-			out.push({ s: line.slice(i, j), w: 0 });
-			i = j;
-		} else {
-			out.push({ s: ch, w: visibleWidth(ch) });
-			i++;
-		}
-	}
-	return out;
-}
-
-/** Plain text (all sequences removed) + visual column of each plain index. */
-function plainAndCols(line: string): { plain: string; cols: number[] } {
-	const its = items(line);
-	let plain = "";
-	const cols: number[] = [];
-	let col = 0;
-	for (const it of its) {
-		if (it.w === 0) continue;
-		cols.push(col);
-		plain += it.s;
-		col += it.w;
-	}
-	return { plain, cols };
-}
-
-/**
- * Wrap visible columns [colStart, colEnd) of a rendered (ANSI) line in an SGR
- * style. ANSI-safe: zero-width sequences inside the range (cursor inversion,
- * hardware-cursor markers, other styling) are preserved, and the style is
- * re-asserted after any of them — so ranges that contain the cursor marker
- * still get fully styled instead of being skipped or half-reset.
- */
-export function styleColumnRange(line: string, colStart: number, colEnd: number, on: string, off: string): string {
-	if (colEnd <= colStart) return line;
-	const toks = items(line);
-	let out = "";
-	let col = 0;
-	let styled = false;
-	for (const t of toks) {
-		if (t.w === 0) {
-			// Close the range BEFORE the sequence: if it sits at the range end,
-			// dropping the closing SGR would leak the style to end-of-line.
-			if (styled) out += off;
-			out += t.s;
-			styled = false; // the sequence may have reset SGR state — re-assert later
-			continue;
-		}
-		const inRange = col >= colStart && col < colEnd;
-		if (inRange && !styled) out += on;
-		if (!inRange && styled) out += off;
-		out += t.s;
-		styled = inRange;
-		col += t.w;
-	}
-	if (styled) out += off;
-	return out;
-}
-
-/**
- * Truncate a rendered (ANSI) line to at most maxCols VISIBLE columns, cutting
- * only on character boundaries — never inside an escape sequence. Escape
- * sequences are dropped (pi's truncateToWidth counts their bytes as visible
- * width and slices by char index, which corrupts styled lines).
- */
-export function truncateAnsi(line: string, maxCols: number): string {
-	if (maxCols <= 0) return "";
-	let out = "";
-	let col = 0;
-	for (const t of items(line)) {
-		if (t.w === 0) continue; // drop sequences — never emit dangling styles
-		if (col + t.w > maxCols) break;
-		out += t.s;
-		col += t.w;
-	}
-	return out;
-}
-
-/** Wrap flagged words in a rendered (ANSI) line with red + underline. */
-export function highlightLine(line: string, bad: Set<string>): string {
-	if (bad.size === 0) return line;
-	const { plain, cols } = plainAndCols(line);
-	let out = line;
-	let lastCol = 0;
-	for (const m of plain.matchAll(/[A-Za-z]{3,}/g)) {
-		if (!bad.has(m[0].toLowerCase())) continue;
-		const start = cols[m.index] ?? 0;
-		if (start < lastCol) continue; // overlaps a previous highlight
-		const end = start + visibleWidth(m[0]);
-		// underline (4) + bright red (91); off = underline-off + default fg so a
-		// cursor [0m reset inside the word doesn't kill the rest of it.
-		out = styleColumnRange(out, start, end, "[4;91m", "[24;39m");
-		lastCol = end;
-	}
-	return out;
-}
+// ── Seams: what this extension hands the pure dialog module ───────────────────
+//
+// lib/dialog-input.ts is pi-tui-only on purpose (so a regression test can drive real keystrokes
+// through the answer box). Everything that needs pi-coding-agent — the dictionary, pi's keybinding
+// label, the clipboard writer — is pushed in here, at module load, which happens before any dialog
+// can open. Order does not matter between the extensions; only that this file is loaded at all, and
+// it is: it is the extension entry listed in package.json.
+setDialogSpellPaint({
+	enabled: () => STATE.enabled,
+	// The typo rule is the SAME one the main editor uses (unknownWords) — the dialog must not get a
+	// looser or stricter dictionary than the editor, or the same word is flagged in one place only.
+	badWords: (text: string) => unknownWords(text, getDict()),
+});
+try {
+	// The hint line names the submit key from pi's own keybinding table, so a user who rebound
+	// submit sees their key. Guarded: a broken keybinding lookup must not take the whole extension down.
+	setSubmitKeyLabel(keyText("tui.select.confirm"));
+} catch { /* keep the module default ("enter") */ }
+// Copy keys route through pi's clipboard path (OSC 52 under an SSH session, native clipboard
+// locally). Tests replace this writer to prove the routing without touching the real clipboard.
+setClipboardWriter(copyToClipboard);
 
 export class SpellcheckEditor extends CustomEditor {
 	private cacheText = "\u0000";
@@ -233,115 +115,15 @@ export class SpellcheckEditor extends CustomEditor {
 	}
 }
 
-// ── Spellchecked single-line input (for dialogs) ─────────────────────────
-
-/** pi-tui Input that highlights unknown words in place while typing. */
-class SpellInput extends Input {
-	private cacheText = "\u0000";
-	private bad: Set<string> = new Set();
-
-	render(width: number): string[] {
-		const lines = super.render(width);
-		if (!STATE.enabled) return lines;
-		const text = this.getValue();
-		if (text !== this.cacheText) {
-			this.cacheText = text;
-			this.bad = unknownWords(text, getDict());
-		}
-		if (this.bad.size === 0) return lines;
-		for (let i = 0; i < lines.length; i++) {
-			lines[i] = highlightLine(lines[i]!, this.bad);
-		}
-		return lines;
-	}
-}
-
-/**
- * Single-line input dialog with live typo highlighting — a lookalike of pi's built-in
- * extension input (what ctx.ui.input shows) for use via ctx.ui.custom.
- *
- * Keys (HumbelPi #3 / the ask_user "Other" door):
- *   Enter   submit what is typed
- *   Esc     go BACK to whatever preceded this dialog (the option list), carrying the text
- *           so the draft is not lost — this is what used to be a one-way cancel
- *   Ctrl+C  cancel the whole question
- *
- * Renders plain when spellcheck is toggled off.
- *
- * Deliberately does NOT use pi's DynamicBorder/keyHint — those read pi's internal theme
- * singleton; everything here is styled with the theme passed in by ctx.ui.custom.
- */
-class SpellcheckInputDialog extends Container implements Focusable {
-	private readonly input: SpellInput;
-	private _focused = false;
-
-	get focused() { return this._focused; }
-	set focused(value: boolean) { this._focused = value; this.input.focused = value; }
-
-	constructor(
-		private readonly theme: { fg(color: string, text: string): string },
-		title: string,
-		placeholder: string,
-		private readonly done: (answer: DialogAnswer) => void,
-		options?: { draft?: string; backLabel?: string },
-	) {
-		super();
-		this.input = new SpellInput({ placeholder });
-		// A trip back to the option list and back here again must not lose what was typed.
-		// pi-tui's Input.setValue() clamps the caret to the START of the value, which would make
-		// the next character land before the restored draft ("SQLite" + typed " for the store"
-		// came back as "for the storeSQLite"). Feeding the draft through the input's own bracketed-
-		// paste path inserts it at the caret and leaves the caret after it, exactly like pasting.
-		if (options?.draft) this.input.handleInput(`\x1b[200~${options.draft}\x1b[201~`);
-		this.addChild(new Spacer(1));
-		this.addChild(new Text(this.theme.fg("accent", title), 1, 0));
-		this.addChild(new Spacer(1));
-		this.addChild(this.input);
-		this.addChild(new Spacer(1));
-		const backLabel = options?.backLabel ?? "back to options";
-		this.addChild(new Text(`${this.theme.fg("dim", keyText("tui.select.confirm"))} ${this.theme.fg("muted", "submit")}  ${this.theme.fg("dim", "esc")} ${this.theme.fg("muted", backLabel)}  ${this.theme.fg("dim", "ctrl+c")} ${this.theme.fg("muted", "cancel")}`, 1, 0));
-		this.addChild(new Spacer(1));
-	}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, "enter") || data === "\n") { this.done({ text: this.input.getValue(), back: false }); return; }
-		// Esc = back to the option list, draft included. Ctrl+C = cancel the whole question.
-		if (matchesKey(data, "escape")) { this.done({ text: this.input.getValue(), back: true }); return; }
-		if (matchesKey(data, "ctrl+c")) { this.done({ back: false }); return; } // discards the draft
-		this.input.handleInput(data);
-	}
-
-	override render(width: number): string[] {
-		const border = this.theme.fg("border", "─".repeat(Math.max(4, width)));
-		return [border, ...super.render(width), border];
-	}
-
-	dispose(): void {}
-}
-
-/** Factory for ctx.ui.custom — see SpellcheckInputDialog. */
-export function createSpellcheckInputDialog(
-	theme: { fg(color: string, text: string): string },
-	title: string,
-	placeholder: string,
-	done: (answer: DialogAnswer) => void,
-	options?: { draft?: string; backLabel?: string },
-): SpellcheckInputDialog {
-	return new SpellcheckInputDialog(theme, title, placeholder, done, options);
-}
-
-// select-editor.ts is the single owner of the custom editor (it composes
-// SpellcheckEditor). Read its flag from globalThis — NOT via an import, which
-// would create a module cycle (select-editor imports this file for the class).
-const selectionEnabled = (): boolean =>
-	((globalThis as Record<string, unknown>).__humbel_pi_select as { enabled?: boolean } | undefined)?.enabled ?? false;
-
 export default function (pi: ExtensionAPI) {
 	const install = (ctx: Parameters<Parameters<ExtensionAPI["on"]>[1]>[1]) => {
 		ctx.ui.setEditorComponent((tui, theme, kb) => new SpellcheckEditor(tui, theme, kb));
 	};
 
 	pi.on("session_start", (_event, ctx) => {
+		// #9: the dialog input reports clipboard results but is a Component, not a command handler —
+		// it has no ctx of its own, so the notify() reaches it through here (select-editor #14 pattern).
+		setDialogNotifier((msg: string) => ctx.ui.notify(msg, "info"));
 		// Only install when selection is OFF — select-editor's session_start
 		// handler (idempotent, runs later in manifest order) re-applies the
 		// combined choice, so both-on converges to SelectingEditor either way.
