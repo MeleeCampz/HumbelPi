@@ -69,6 +69,16 @@ const KITTY_MOVE_SEQ: Record<string, string> = {
  * as a symbol glyph.
  */
 const RAW_KITTY_SHIFT_INSERT = /^\x1b\[(57425);(\d+)u$/;
+/**
+ * The other copy-key spellings, raw. Added after .pi/press scenario q measured the failure mode:
+ * the sequences arrive at handleInput BYTE FOR BYTE (proved by the dialog's key log), the selection
+ * is live, and still nothing copies — because matchesKey answers differently inside a running pi
+ * than it does in a standalone probe. A key-copy feature may not depend on that flip-flop, so every
+ * spelling gets the same raw treatment the arrows already had.
+ */
+const RAW_XTERM_SHIFT_INSERT = /^\x1b\[2;(\d+)~$/; // Insert + wire modifier (Shift+Insert)
+const RAW_KITTY_CTRL_SHIFT_C = /^\x1b\[(99);(\d+)u$/; // 'c' + modifier in kitty CSI-u
+const RAW_MODKEYS_CTRL_SHIFT_C = /^\x1b\[27;(\d+);99~$/; // same key in modifyOtherKeys
 
 const PLAIN_ARROW: Record<string, string> = {
 	D: "\x1b[D", C: "\x1b[C", A: "\x1b[A", B: "\x1b[B", H: "\x1b[H", F: "\x1b[F",
@@ -106,10 +116,18 @@ export function matchShiftMove(data: string): string | null {
 
 /** Copy-while-selected keys that are unambiguous (Ctrl+C is NOT one of these — see below). */
 export function isCopyKey(data: string): boolean {
-	// matchesKey already understands ESC[2;2~ (shift+insert), ESC[57425;2u (kitty Shift+Insert),
-	// ESC[99;6u and CSI 27;6;99~ (ctrl+shift+c in kitty / modifyOtherKeys) — measured, not assumed.
-	// Ctrl+C is NOT a copy key on its own: see isCtrlC and the dialog's copy-else-cancel order.
-	return matchesKey(data, "shift+insert") || matchesKey(data, "ctrl+shift+c") || isRawShiftInsert(data);
+	if (matchesKey(data, "shift+insert") || matchesKey(data, "ctrl+shift+c")) return true;
+	// Raw fallbacks, deliberately the same policy matchShiftMove already uses: matchesKey is known to
+	// be unreliable in some environments (and provably inconsistent between a running pi and a probe).
+	// Which bits the wire modifier carries is arithmetic, not a lookup.
+	let m = isRawShiftInsert(data);
+	if (m) return true;
+	const x = RAW_XTERM_SHIFT_INSERT.exec(data);
+	if (x && hasShiftWireMod(x[1]!)) return true;
+	const k = RAW_KITTY_CTRL_SHIFT_C.exec(data);
+	if (k && hasShiftWireMod(k[2]!) && hasCtrlWireMod(k[2]!)) return true;
+	const o = RAW_MODKEYS_CTRL_SHIFT_C.exec(data);
+	return !!o && hasShiftWireMod(o[1]!) && hasCtrlWireMod(o[1]!);
 }
 
 export function isRawShiftInsert(data: string): boolean {

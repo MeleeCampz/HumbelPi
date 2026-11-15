@@ -55,9 +55,20 @@ const FORBIDDEN_DIRS = new Set(["sessions", "plans"]);
 // Never part of a push even when a repo forgets to ignore them.
 const SKIP_DIRS = new Set([".git", "node_modules"]);
 
+/**
+ * Repo-relative paths are always "/" separated, on every platform.
+ * git prints "/" even on Windows; path.relative() prints "\" there. Skip dirs, forbidden
+ * components and the reported hit paths all compare against one spelling, otherwise the same
+ * repo passes on Linux and leaks (or cries foul) on Windows. File CONTENT patterns keep
+ * matching both separators — this is only about path handling.
+ */
+function toPosixRel(p) {
+	return p.split(path.sep).join("/");
+}
+
 /** Forbidden by NAME (file) or by any path component (directory). */
 function forbiddenReason(rel) {
-	const parts = rel.split(path.sep);
+	const parts = toPosixRel(rel).split("/");
 	const base = parts[parts.length - 1];
 	if (FORBIDDEN_FILES.has(base)) return `forbidden file (${base})`;
 	for (const p of parts.slice(0, -1)) {
@@ -67,7 +78,7 @@ function forbiddenReason(rel) {
 }
 
 function skipped(rel) {
-	return rel.split(path.sep).some((p) => SKIP_DIRS.has(p));
+	return toPosixRel(rel).split("/").some((p) => SKIP_DIRS.has(p));
 }
 
 /** Every leak in one file's text: "<rel>:<line> — <label>: <match>". */
@@ -117,7 +128,7 @@ function walkAll(root, dir = root, out = []) {
 		if (SKIP_DIRS.has(e.name)) continue;
 		const p = path.join(dir, e.name);
 		if (e.isDirectory()) walkAll(root, p, out);
-		else if (e.isFile()) out.push(path.relative(root, p));
+		else if (e.isFile()) out.push(toPosixRel(path.relative(root, p)));
 	}
 	return out;
 }
@@ -130,7 +141,7 @@ function scan(root, mode) {
 	if (mode === "git") {
 		try {
 			const { tracked, fresh } = publishablePaths(root);
-			rel = [...new Set([...tracked, ...fresh])];
+			rel = [...new Set([...tracked, ...fresh].map(toPosixRel))];
 		} catch {
 			console.warn("secret-scan: not a git repository — auditing every file on disk instead");
 			rel = walkAll(root);

@@ -29,9 +29,13 @@ export interface PerfInput {
 export function computeStats({ t0, firstDeltaAt, lastDeltaAt, usage }: PerfInput): { ttftMs: number | null; tps: number | null } {
   const ttftMs = firstDeltaAt != null && firstDeltaAt >= t0 ? firstDeltaAt - t0 : null;
 
+  // Hoisted, not optional-chained twice: TS cannot narrow `usage` from the
+  // `usage?.output > 0` test, and a provider call that ends without usage really
+  // does get here with usage === null / undefined (TS18048/TS18049 at npx tsc).
+  const out = usage?.output ?? 0;
   let tps: number | null = null;
-  if ((usage?.output ?? 0) > 0 && firstDeltaAt != null && lastDeltaAt != null && lastDeltaAt > firstDeltaAt) {
-    tps = usage.output / ((lastDeltaAt - firstDeltaAt) / 1000);
+  if (out > 0 && firstDeltaAt != null && lastDeltaAt != null && lastDeltaAt > firstDeltaAt) {
+    tps = out / ((lastDeltaAt - firstDeltaAt) / 1000);
   }
 
   return { ttftMs, tps };

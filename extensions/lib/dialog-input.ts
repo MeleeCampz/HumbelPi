@@ -29,37 +29,77 @@ export interface SpellPaint {
 	enabled(): boolean;
 	badWords(text: string): Set<string>;
 }
-let paint: SpellPaint | null = null;
-export function setDialogSpellPaint(p: SpellPaint | null): void {
-	paint = p;
+type ClipboardWriter = (text: string) => Promise<void>;
+
+/**
+ * Which copy of this module installed the seams (Math.random per module evaluation). Diagnostics only
+ * — see the seam storage below for why two copies exist.
+ */
+const MODULE_ID = Math.random().toString(36).slice(2, 7);
+
+interface SeamValues {
+	paint: SpellPaint | null;
+	label: string;
+	writer: ClipboardWriter | null;
+	notifier: ((msg: string) => void) | null;
 }
+
+/**
+ * SEAM STORAGE LIVES ON globalThis, NOT IN MODULE-LOCALS — measured, not defensive posturing.
+ * .pi/press scenario q pressed Ctrl+Shift+C in a real pi and the answer box answered "no clipboard
+ * writer": pi loads each extension FILE with its own loader, so a shared lib module exists once PER
+ * EXTENSION that imports it. spellcheck.ts's copy of this file installed the writer; ask-flow.ts's copy
+ * — the one that actually builds the dialog — had none. Module-locals cannot cross that boundary, so
+ * every seam value is stored where both copies see it. __humbel_pi_select and __humbel_pi_spellcheck
+ * are globals for exactly this reason; this is the same rule applied to the seams that were still local.
+ */
+const seamValues = (): SeamValues =>
+	((globalThis as any).__humbel_pi_dialog_seam_values ??= { paint: null, label: "enter", writer: null, notifier: null });
+
+export function setDialogSpellPaint(p: SpellPaint | null): void {
+	seamValues().paint = p;
+	seams().paint = p !== null;
+}
+const paintSeam = (): SpellPaint | null => seamValues().paint;
 
 /** Submit-key label for the hint line, from pi's keybinding table ("enter" if unset). */
-let submitKeyLabel = "enter";
 export function setSubmitKeyLabel(label: string): void {
-	if (label) submitKeyLabel = label;
+	if (label) seamValues().label = label;
+	seams().label = true;
 }
+const submitLabel = (): string => seamValues().label;
 
-/** Clipboard writer. null = the host did not provide one (the copy then reports itself instead of silently failing). */
-let clipboardWriter: ((text: string) => Promise<void>) | null = null;
 /**
  * Clipboard seam. Production writes through the host's writer (spellcheck.ts wires pi's
  * copyToClipboard); it is settable because (a) a regression test must be able to prove the COPY
  * ROUTING (which key copies, that the keystroke is consumed and not inserted as text) without
  * overwriting the developer's real clipboard, and (b) a host could route copies through its own
  * mechanism (OSC 52 over SSH) without this file knowing which one. Only the writer is swappable —
- * the selection semantics are not.
+ * the selection semantics are not. null = the host did not provide one (the copy then reports itself
+ * instead of silently failing).
  */
-export function setClipboardWriter(fn: ((text: string) => Promise<void>) | null): void {
-	clipboardWriter = fn;
+export function setClipboardWriter(fn: ClipboardWriter | null): void {
+	seamValues().writer = fn;
+	seams().writer = fn !== null;
 }
+const clipboardWriter = (): ClipboardWriter | null => seamValues().writer;
 
 /** Host notification surface for copy feedback (guards.ts #14 pattern: re-bound on session_start). */
-let notifyUi: ((msg: string) => void) | undefined;
 export function setDialogNotifier(fn: ((msg: string) => void) | undefined): void {
-	notifyUi = fn;
+	seamValues().notifier = fn ?? null;
+	seams().notifier = fn !== undefined;
 }
-const notify = (msg: string): void => { try { notifyUi?.(msg); } catch { /* stale ctx after a reload — ignore */ } };
+const notify = (msg: string): void => { try { seamValues().notifier?.(msg); } catch { /* stale ctx after a reload — ignore */ } };
+
+/**
+ * Diagnostic canary (same pattern as __humbel_pi_select / __humbel_pi_plan): reports whether the
+ * host actually installed the seams before a dialog opened. The press test reads it through
+ * /probe-state, because "no copy feedback appeared" otherwise cannot tell an uninstalled seam from
+ * a notification the running dialog swallowed.
+ */
+export interface DialogSeams { paint: boolean; label: boolean; writer: boolean; notifier: boolean }
+const seams = (): DialogSeams =>
+	((globalThis as any).__humbel_pi_dialog_seams ??= { paint: false, label: false, writer: false, notifier: false });
 
 // ── Spellchecked single-line input (for dialogs) ─────────────────────────
 
@@ -70,7 +110,7 @@ export class SpellInput extends Input {
 
 	render(width: number): string[] {
 		const lines = super.render(width);
-		const p = paint; // the dictionary belongs to the host (spellcheck.ts), not to this file
+		const p = paintSeam(); // the dictionary belongs to the host (spellcheck.ts), not to this file
 		if (!p || !p.enabled()) return lines;
 		const text = this.getValue();
 		if (text !== this.cacheText) {
@@ -118,12 +158,19 @@ const inputInternals = (input: Input): InputInternals | null => {
 /** Re-exported for hosts/tests: the pair the paint below uses, defined once in ./ansi-style. */
 export { SELECTION_OFF, SELECTION_ON };
 
+/** Instance numbering for the press-test diagnostics (see the key log in SelectingInput.handleInput). */
+let nextInputId = 1;
+
 export class SelectingInput extends SpellInput {
+	/** Instance number: several inputs can be alive, and the key log has to say which one saw the key. */
+	readonly dbgId = nextInputId++;
 	/** Selection endpoints as value-string offsets; null = no selection (reference model). */
 	private selStart: number | null = null;
 	private selEnd: number | null = null;
 	/** Mirror of Input's bracketed-paste state: while pasting, NOTHING is selection logic. */
 	private inPaste = false;
+	/** "copied 7 chars" — set by a copy key, cleared by the NEXT key (see copySelection). */
+	private copyNote: string | null = null;
 
 	/** Same switch as the main editor (/select on|off) — one feature, one flag, both hosts. */
 	private active(): boolean { return selectionEnabled(); }
@@ -176,16 +223,20 @@ export class SelectingInput extends SpellInput {
 	}
 
 	private async copySelected(text: string): Promise<void> {
-		const n = [...text].length;
-		if (!clipboardWriter) {
+		const writer = clipboardWriter();
+		if (!writer) {
 			// No host writer: say so instead of claiming the text is in the clipboard.
+			this.copyNote = "no clipboard writer";
 			notify("Copy unavailable — no clipboard writer installed");
 			return;
 		}
 		try {
-			await clipboardWriter(text);
-			notify(`Copied ${n} char${n === 1 ? "" : "s"} to clipboard`);
+			await writer(text);
 		} catch (err) {
+			// The inline note was written optimistically (see copySelection); a failure replaces it as
+			// soon as the write rejects, and also gets a toast, which is the one channel that CAN ask
+			// for a repaint on its own.
+			this.copyNote = "copy failed";
 			notify(`Copy failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
@@ -194,13 +245,53 @@ export class SelectingInput extends SpellInput {
 	 * Public because the dialog host owns Ctrl+C: here Ctrl+C means "cancel the whole question",
 	 * so the host has to ask whether it is a copy first. Without a selection it stays the cancel key
 	 * (unchanged #3 semantics).
+	 *
+	 * The feedback is written into the component (copyNote -> the dialog's bottom border) rather than
+	 * only through ctx.ui.notify: a component cannot ask pi for a repaint, but the keypress that got
+	 * here already repaints, so the note lands in the same frame — inside the box the user is looking
+	 * at. The toast measured invisible inside the running dialog in .pi/press scenario q. The note is
+	 * written before the clipboard write settles (async writer, no repaint hook); a rejection corrects
+	 * it and says so out loud.
 	 */
 	copySelection(): boolean {
 		const text = this.selectedText();
-		if (text === null) return false;
+		if (text === null) {
+			this.dbgCopy(null, false);
+			return false;
+		}
+		const n = [...text].length;
+		const writer = clipboardWriter();
+		this.copyNote = writer ? `copied ${n} char${n === 1 ? "" : "s"}` : "no clipboard writer";
+		this.dbgCopy(n, !!writer);
 		void this.copySelected(text);
 		return true;
 	}
+
+	/**
+	 * What a copy attempt actually saw (length grabbed, whether a clipboard writer is installed). The press
+	 * test reads it through /probe-state: "the copy key did nothing" has three very different causes — the
+	 * key never arrived, the selection was gone, or the note never got written — and the screen alone
+	 * cannot tell them apart.
+	 */
+	private dbgCopy(chars: number | null, writer: boolean): void {
+		try {
+			const c = ((globalThis as any).__humbel_pi_dialog_copy ??= []) as Record<string, unknown>[];
+			c.push({ id: this.dbgId, mid: MODULE_ID, chars, writer, note: this.copyNote });
+			if (c.length > 12) c.shift();
+		} catch { /* diagnostics never break the copy */ }
+	}
+
+	/** Copy feedback for the dialog to render; null when there is none. */
+	copyStatus(): string | null { return this.copyNote; }
+
+	/**
+	 * The note is cleared by the DIALOG (its single dispatch point), not at the top of handleInput: pi
+	 * delivers a key to the focused child as well as to the container that forwarded it, so an input that
+	 * wipes its own feedback on entry erases the notice the second delivery brings. Measured in .pi/press
+	 * scenario q, where Ctrl+C (consumed by the dialog) reported the copy and Shift+Insert (consumed by
+	 * this input, then re-delivered) reported nothing.
+	 */
+	clearCopyStatus(): void { this.copyNote = null; }
 
 	override setValue(value: string): void {
 		super.setValue(value);
@@ -208,6 +299,26 @@ export class SelectingInput extends SpellInput {
 	}
 
 	override handleInput(data: string): void {
+		// Diagnostic key log (canary pattern, see __humbel_pi_dialog_seams): every claim this module
+		// makes about a wire format is only falsifiable if you can see what the host ACTUALLY delivered
+		// to handleInput, and what the selection endpoints were when it arrived. Bounded (12 entries) and
+		// in memory only — the press test reads it through /probe-state.
+		try {
+			const log = ((globalThis as any).__humbel_pi_dialog_keys ??= []) as Record<string, unknown>[];
+			log.push({
+				id: this.dbgId,
+				k: data.slice(0, 24),
+				s: this.selStart,
+				e: this.selEnd,
+				on: selectionEnabled() ? 1 : 0,
+				// What the classification said IN SITU: matchesKey-based helpers have been measured to
+				// answer differently inside a running pi than in a standalone probe, and "the copy key did
+				// nothing" is otherwise impossible to localize.
+				hs: this.hasSelection() ? 1 : 0,
+				cp: isCopyKey(data) ? 1 : 0,
+			});
+			if (log.length > 12) log.shift();
+		} catch { /* diagnostics never break the input */ }
 		if (data.includes("\x1b[200~")) this.inPaste = true;
 		const pasteStart = data.includes("\x1b[200~");
 		const pasteChunk = this.inPaste;
@@ -378,11 +489,12 @@ class SpellcheckInputDialog extends Container implements Focusable {
 		const selHint = selectionEnabled()
 			? `  ${this.theme.fg("dim", "shift+arrows")} ${this.theme.fg("muted", "select")}  ${this.theme.fg("dim", "ctrl+a")} ${this.theme.fg("muted", "all")}  ${this.theme.fg("dim", "ctrl+c")} ${this.theme.fg("muted", "copy")}`
 			: "";
-		this.addChild(new Text(`${this.theme.fg("dim", submitKeyLabel)} ${this.theme.fg("muted", "submit")}  ${this.theme.fg("dim", "esc")} ${this.theme.fg("muted", backLabel)}  ${this.theme.fg("dim", "ctrl+c")} ${this.theme.fg("muted", "cancel")}${selHint}`, 1, 0));
+		this.addChild(new Text(`${this.theme.fg("dim", submitLabel())} ${this.theme.fg("muted", "submit")}  ${this.theme.fg("dim", "esc")} ${this.theme.fg("muted", backLabel)}  ${this.theme.fg("dim", "ctrl+c")} ${this.theme.fg("muted", "cancel")}${selHint}`, 1, 0));
 		this.addChild(new Spacer(1));
 	}
 
 	handleInput(data: string): void {
+		this.input.clearCopyStatus(); // one clear per key, at the dialog's single dispatch point
 		if (matchesKey(data, "enter") || data === "\n") { this.done({ text: this.input.getValue(), back: false }); return; }
 		// Esc = back to the option list, draft included (a selection goes with the draft: the text
 		// is restored whole, and #3's "never lose what was typed" rule outranks clearing a range).
@@ -406,10 +518,11 @@ class SpellcheckInputDialog extends Container implements Focusable {
 		// is the question the copy then answers. It goes on the border rather than on the last child
 		// because the last child is a Spacer — appending there leaves the label invisible.
 		const n = this.input.selectionSize();
+		const note = this.input.copyStatus();
 		let bottom = border;
-		if (n > 0) {
-			const label = ` \u2B12 ${n} `;
-			bottom = truncateAnsi(border, Math.max(4, width - label.length)) + label;
+		const extras = `${n > 0 ? ` \u2B12 ${n} ` : ""}${note ? ` ${note} ` : ""}`;
+		if (extras) {
+			bottom = truncateAnsi(border, Math.max(4, width - extras.length)) + extras;
 		}
 		return [border, ...lines, bottom];
 	}

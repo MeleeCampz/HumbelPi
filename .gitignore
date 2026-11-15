@@ -3,3 +3,6 @@
 
 # dev-only package junctions (tools/mklink.bat) for typecheck/test runs
 node_modules/
+
+# Vendored copy of the sandbox pi-tui dist, for press-test debugging only (not shipped).
+.pi/press/vendor/

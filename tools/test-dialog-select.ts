@@ -36,10 +36,12 @@ import {
 	SelectingInput,
 	createSpellcheckInputDialog,
 	setClipboardWriter,
+	setDialogNotifier,
 	setDialogSpellPaint,
 	type DialogAnswer,
 } from "../extensions/lib/dialog-input.ts";
 import { unknownWords } from "../extensions/lib/spell-words.ts";
+import { isCopyKey } from "../extensions/lib/shift-moves.ts";
 
 let failures = 0;
 function check(name: string, cond: boolean, detail?: string): void {
@@ -78,6 +80,8 @@ const LEFT = "\x1b[D", RIGHT = "\x1b[C", HOME = "\x1b[H", END = "\x1b[F";
 const BACKSPACE = "\x7f", DELETE = "\x1b[3~", CTRL_W = "\x17", CTRL_C = "\u0003", CTRL_A = "\u0001";
 const K_CTRL_A = "\x1b[97;5u";
 const SHIFT_INSERT = "\x1b[2;2~", K_SHIFT_INSERT = "\x1b[57425;2u", CTRL_SHIFT_C = "\x1b[99;6u";
+const MODKEYS_CTRL_SHIFT_C = "\x1b[27;6;99~"; // the same key in xterm's modifyOtherKeys spelling
+const INSERT_PLAIN = "\x1b[2~", ALT_INSERT = "\x1b[2;3~", CTRL_ALT_C = "\x1b[99;7u";
 
 /**
  * Column/text assertions all measure a RENDERED line, so they need pi-tui-aware stripping — a regex
@@ -283,6 +287,26 @@ async function main(): Promise<void> {
 		check("Ctrl+Shift+C copies", clipboard.join("") === "part", JSON.stringify(clipboard));
 		check("Ctrl+Shift+C does not leak a “c” into the answer", c.getValue() === "copy the good part", JSON.stringify(c.getValue()));
 		clipboard = [];
+		const mo = mk("copy the good part");
+		for (let n = 0; n < 4; n++) mo.handleInput(SLEFT);
+		mo.handleInput(MODKEYS_CTRL_SHIFT_C);
+		await settled();
+		check("modifyOtherKeys Ctrl+Shift+C copies too (the xterm spelling of the same key)",
+			clipboard.join("") === "part" && mo.getValue() === "copy the good part",
+			`${JSON.stringify(clipboard)} ${JSON.stringify(mo.getValue())}`);
+		// Classification boundaries. A copy key that fires on the wrong modifier steals a key the
+		// terminal or pi still needs, so the near-misses are checked as firmly as the hits.
+		check("plain Insert is not a copy key", isCopyKey(INSERT_PLAIN) === false, JSON.stringify(INSERT_PLAIN));
+		check("Alt+Insert is not a copy key", isCopyKey(ALT_INSERT) === false, JSON.stringify(ALT_INSERT));
+		check("Ctrl+Alt+C (no shift) is not a copy key", isCopyKey(CTRL_ALT_C) === false, JSON.stringify(CTRL_ALT_C));
+		check("Ctrl+C on its own is not a copy key (the host decides copy-vs-cancel)", isCopyKey(CTRL_C) === false);
+		check("every Shift+Insert spelling is a copy key",
+			isCopyKey(SHIFT_INSERT) && isCopyKey(K_SHIFT_INSERT) && isCopyKey("\x1b[2;4~"),
+			`${isCopyKey(SHIFT_INSERT)}/${isCopyKey(K_SHIFT_INSERT)}`);
+		check("both Ctrl+Shift+C spellings are copy keys",
+			isCopyKey(CTRL_SHIFT_C) && isCopyKey(MODKEYS_CTRL_SHIFT_C),
+			`${isCopyKey(CTRL_SHIFT_C)}/${isCopyKey(MODKEYS_CTRL_SHIFT_C)}`);
+		clipboard = [];
 		const none = mk("nothing selected here");
 		none.handleInput(SHIFT_INSERT);
 		await settled();
@@ -293,6 +317,55 @@ async function main(): Promise<void> {
 		check("copySelection() reports true with a selection", no.copySelection() === true);
 		await settled();
 		clipboard = [];
+
+		// What the user SEES. Success is reported inside the dialog (copyStatus -> the bottom border),
+		// because a component cannot ask pi for a repaint on its own and the toast measured invisible
+		// while a modal dialog was open (.pi/press scenario q). The host notify is kept for the failure
+		// paths, which are the ones that must be louder than the box.
+		const shown = mk("copy the good part");
+		for (let n = 0; n < 4; n++) shown.handleInput(SLEFT);
+		check("no copy has happened yet, so nothing is claimed", shown.copyStatus() === null, String(shown.copyStatus()));
+		shown.copySelection();
+		check("a copy says so in the box, with the length it grabbed", shown.copyStatus() === "copied 4 chars", String(shown.copyStatus()));
+		// Double delivery: pi hands a key to the focused input AND to the container that forwarded it.
+		// An input that cleared its own copy feedback on entry erased the notice that way — measured in a
+		// real pi (.pi/press scenario q: Ctrl+C reported the copy, Shift+Insert reported nothing). The
+		// one-clear-per-key therefore belongs to the dialog, and re-feeding the same copy key keeps it.
+		shown.handleInput(SHIFT_INSERT);
+		check("a copy key re-delivered does not erase its own feedback",
+			shown.copyStatus() === "copied 4 chars" && clipboard.length === 2,
+			`${JSON.stringify(shown.copyStatus())} copies=${clipboard.length}`);
+		check("a re-delivered copy key is idempotent (the same text twice, not two different texts)",
+			clipboard[0] === "part" && clipboard[1] === "part", JSON.stringify(clipboard));
+		const notes: string[] = [];
+		setDialogNotifier((msg: string) => notes.push(msg));
+		setClipboardWriter(async () => { throw new Error("no clipboard helper on this box"); });
+		check("the seam canary flips when the host installs a writer",
+			(globalThis as any).__humbel_pi_dialog_seams?.writer === true,
+			JSON.stringify((globalThis as any).__humbel_pi_dialog_seams ?? null));
+		const broken = mk("broken clipboard case");
+		broken.handleInput(SLEFT);
+		check("a copy attempt still reports true (the question was not thrown away because of it)",
+			broken.copySelection() === true);
+		await settled();
+		check("a failing writer replaces the claim with the truth in the box",
+			broken.copyStatus() === "copy failed", String(broken.copyStatus()));
+		check("and it reaches the host notify too, since the box cannot repaint itself for that",
+			notes.some((n) => n.includes("Copy failed") && n.includes("no clipboard helper")), JSON.stringify(notes));
+		const unwired = mk("no writer at all");
+		setClipboardWriter(null);
+		unwired.handleInput(SLEFT);
+		unwired.copySelection();
+		await settled();
+		check("with no clipboard writer it admits it instead of claiming a copy",
+			unwired.copyStatus() === "no clipboard writer" && notes.some((n) => n.includes("no clipboard writer")),
+			`${unwired.copyStatus()} ${JSON.stringify(notes)}`);
+		check("the seam canary reports what the host actually installed (the press test reads this through /probe-state)",
+			(globalThis as any).__humbel_pi_dialog_seams?.writer === false &&
+			(globalThis as any).__humbel_pi_dialog_seams?.notifier === true,
+			JSON.stringify((globalThis as any).__humbel_pi_dialog_seams ?? null));
+		setDialogNotifier(undefined);
+		setClipboardWriter(async (text: string) => { clipboard.push(text); }); // restore the recording writer for later sections
 	}
 
 	// ── 8. paste / programmatic replace ──
@@ -406,6 +479,10 @@ async function main(): Promise<void> {
 		check("Ctrl+C WITH a selection does NOT close the dialog", answers.length === 0, JSON.stringify(answers));
 		check("the draft survives the copy", inp.getValue() === "SQLite instead of Postgres", JSON.stringify(inp.getValue()));
 		check("the indicator reports how much was grabbed", d2.render(60).join("\n").includes("⬒ 8"), d2.render(60).join("\n"));
+		check("the copy is reported INSIDE the dialog (a notify toast over a running modal measured invisible)",
+			d2.render(60).join("\n").includes("copied 8 chars"), d2.render(60).join("\n"));
+		d2.handleInput(SRIGHT); // through the dialog, which owns the one-clear-per-key
+		check("and the notice is history once the next key arrives", !d2.render(60).join("\n").includes("copied"), d2.render(60).join("\n"));
 		d2.handleInput("\x1b");
 		check("Esc returns the draft even with a selection active", answers.length === 1 && answers[0]!.back === true && answers[0]!.text === "SQLite instead of Postgres", JSON.stringify(answers));
 
@@ -431,6 +508,22 @@ async function main(): Promise<void> {
 		inp5.handleInput(" for the store");
 		check("a restored draft is not mangled by the selection subclass (caret still lands after it)", inp5.getValue() === "SQLite for the store", JSON.stringify(inp5.getValue()));
 		d5.dispose();
+
+		answers.length = 0; clipboard = [];
+		const d6 = createSpellcheckInputDialog(theme, "Your answer", "type…", (a) => answers.push(a), {});
+		const inp6 = (d6 as unknown as { input: SelectingInput }).input;
+		d6.handleInput(`\x1b[200~shift insert copies\x1b[201~`);
+		for (let n = 0; n < 6; n++) inp6.handleInput(SLEFT); // "copies"
+		d6.handleInput(SHIFT_INSERT); // the exact path the press scenario presses
+		await settled();
+		check("Shift+Insert routed through the dialog copies without touching the question",
+			clipboard.join("") === "copies" && answers.length === 0 && inp6.getValue() === "shift insert copies",
+			`${JSON.stringify(clipboard)} ${JSON.stringify(answers)}`);
+		check("and says so inside the box", d6.render(60).join("\n").includes("copied 6 chars"), d6.render(60).join("\n"));
+		d6.handleInput(SHIFT_INSERT);
+		await settled();
+		check("a double-delivered copy key still shows its notice", d6.render(60).join("\n").includes("copied 6 chars"), d6.render(60).join("\n"));
+		d6.dispose();
 	}
 
 	// ── 13. the typo seam is wired the way spellcheck.ts wires it ──

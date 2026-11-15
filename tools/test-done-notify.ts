@@ -464,9 +464,20 @@ interface Captured { url?: string; init?: any }
 		written.includes("HUMBLE_PI_NOTIFY_WAIT_DELAY_S=45") && written.includes("HUMBLE_PI_NOTIFY=1")
 		&& written.includes("HUMBLE_PI_NOTIFY_LONG_RUN_S=90"), written.trim());
 	check("only key names are echoed — a launcher must not print the token", !out.includes(goodToken) && out.includes("HUMBLE_PI_HA_TOKEN"), out.trim());
-	check("the file is written 600, not world-readable",
-		(fs.statSync(path.join(fakeHome, ".pi", "agent", "notify.env")).mode & 0o777) === 0o600,
-		String((fs.statSync(path.join(fakeHome, ".pi", "agent", "notify.env")).mode & 0o777).toString(8)));
+	// File modes: Windows cannot express them here. Git for Windows mounts NTFS with `noacl`
+	// (measured: a file chmod'd to 600 reports 644 to stat and 666 to node), so a mode
+	// assertion on this machine proves nothing about what the sandbox does — it only reports
+	// the mount's fiction. Where modes are real (the Linux/macOS side, which is where a
+	// sandbox actually runs) the file must be 600; on every platform the launcher must
+	// genuinely ask for it, which is the part Windows can still verify.
+	const asksFor600 = /chmod 600 "\$HOME\/\.pi\/agent\/notify\.env"/.test(launcher);
+	const envMode = (fs.statSync(path.join(fakeHome, ".pi", "agent", "notify.env")).mode & 0o777).toString(8);
+	check("the launcher chmods 600 on the file that will hold the HA token", asksFor600, "no `chmod 600` for notify.env in tools/sbx-pi.sh");
+	if (process.platform === "win32") {
+		console.log(`  SKIP  observed mode on this mount: ${envMode} — NTFS/noacl cannot represent 600, so the stat check is not run here`);
+	} else {
+		check("the file is written 600, not world-readable", envMode === "600", envMode);
+	}
 
 	fs.rmSync(path.join(fakeHome, ".pi", "agent", "notify.env"));
 	const canary = path.join(tmp, "OWNED");
