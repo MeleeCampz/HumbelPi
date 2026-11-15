@@ -20,12 +20,21 @@
 import fs from "node:fs";
 import {
 	applyPlanTransition,
+	consolePlanOf,
+	consolePausedSteer,
+	consoleExitedSteer,
+	consolePlanningRulesText,
 	finishPlanReminder,
+	planExecutingFrame,
+	planExecutingOf,
 	planFlagOf,
 	planFooterMarker,
 	planGuardArmed,
+	planLabel,
 	planPausedFrame,
 	planStatusLine,
+	planStyleForNewPlan,
+	planStyleOf,
 	planTitleMarker,
 	planTransition,
 	planningExitedSteer,
@@ -35,11 +44,14 @@ import {
 	type PlanAction,
 	type PlanView,
 } from "../extensions/lib/plan-state.ts";
+import { applyPlanOp, newPlanDoc } from "../extensions/lib/plan-doc.ts";
 import { runAskLoop, type AskHost, type AskOptions, type DialogAnswer } from "../extensions/lib/ask-loop.ts";
 import { DEFAULT_SESSION_STATE, loadSessionState, sessionStateFile, updateSessionState } from "../extensions/lib/session-state.ts";
 
 let failures = 0;
+let checks = 0;
 function check(name: string, cond: boolean, detail?: string): void {
+	checks++;
 	if (cond) console.log(`  PASS  ${name}`);
 	else { failures++; console.error(`  FAIL  ${name}${detail ? ` — ${detail}` : ""}`); }
 }
@@ -201,12 +213,102 @@ void (() => {
 		check("legacy file gets planPaused:false, not undefined", legacy.planPaused === DEFAULT_SESSION_STATE.planPaused);
 		check("legacy plan file is not lost on upgrade (/plan on re-binds it, exit semantics survive)", (() => { const v = applyState(legacy, "on"); return v.planMode === true && v.planFile === "C:/old/PLAN.md"; })());
 		check("a legacy OFF state still refuses pause (nothing planned)", planFlagOf(applyState(legacy, "pause")) === "off");
+
+		// #16: the console plan is a state object, so it has to survive the same round trip a file does.
+		const cdoc = applyPlanOp(newPlanDoc({ title: "Round trip", task: "t" }), { action: "add", text: "do it" }).doc;
+		updateSessionState(sid, s => {
+			s.planStyle = "tui"; s.planDoc = cdoc; s.planFile = null;
+			applyPlanTransition(s, "on");
+		});
+		const back = loadSessionState(sid);
+		check("console plan survives a reload (style + mode)", planStyleOf(back) === "tui" && planFlagOf(back) === "on", JSON.stringify({ style: back.planStyle, mode: back.planMode }));
+		check("the reloaded plan keeps its steps and their stable ids", consolePlanOf(back)?.steps[0]?.id === cdoc.steps[0]?.id && consolePlanOf(back)?.steps[0]?.text === "do it", JSON.stringify(consolePlanOf(back)?.steps));
+		updateSessionState(sid, s => { applyPlanTransition(s, "approve"); });
+		const approved = loadSessionState(sid);
+		check("approval survives a reload as off + executing + kept plan", planFlagOf(approved) === "off" && planExecutingOf(approved) && consolePlanOf(approved) !== null, JSON.stringify({ mode: approved.planMode, exec: approved.planExecuting }));
+		// A corrupt/hand-edited planDoc must read as NO plan, not as a half-plan.
+		fs.writeFileSync(file, JSON.stringify({ planMode: true, planPaused: false, planFile: null, planStyle: "tui", planDoc: { steps: [{ text: 12345 }] } }));
+		const broken = loadSessionState(sid);
+		check("an unusable planDoc coerces to no plan", consolePlanOf(broken) === null, JSON.stringify(broken.planDoc));
+		check("and planning mode drops instead of running with nothing planned", planFlagOf(broken) === "off", JSON.stringify({ mode: broken.planMode, paused: broken.planPaused }));
+		// A state file written before #16 must read exactly as it did then.
+		fs.writeFileSync(file, JSON.stringify({ planMode: false, planPaused: true, planFile: "C:/old2/PLAN.md" }));
+		const legacy2 = loadSessionState(sid);
+		check("legacy file (no planStyle/planDoc) reads as file mode", planStyleOf(legacy2) === "file" && consolePlanOf(legacy2) === null);
+		check("legacy paused plan still pauses/resumes unchanged", planFlagOf(legacy2) === "paused" && planFlagOf(applyState(legacy2, "resume")) === "on" && applyState(legacy2, "resume").planFile === "C:/old2/PLAN.md");
+		check("legacy state never claims executing", planExecutingOf(legacy2) === false);
+		// #16 coercion: executing is a console-mode fact — file mode cannot carry it.
+		fs.writeFileSync(file, JSON.stringify({ planMode: false, planPaused: false, planFile: "C:/plan/PLAN.md", planStyle: "file", planExecuting: true }));
+		const badExec = loadSessionState(sid);
+		check("executing is coerced off in file mode", planExecutingOf(badExec) === false, JSON.stringify(badExec.planExecuting));
+		fs.writeFileSync(file, JSON.stringify({ planMode: false, planPaused: false, planFile: null, planStyle: "tui", planDoc: null, planExecuting: true }));
+		const execNoDoc = loadSessionState(sid);
+		check("executing with no plan document reads as off", planExecutingOf(execNoDoc) === false, JSON.stringify(execNoDoc.planExecuting));
 	} finally {
 		try { fs.rmSync(file, { force: true }); } catch { /* cleanup best-effort */ }
 	}
 })();
 
-// ── 8. approval dialog rows (finish_plan needs "Keep planning" in row 2) ───
+// ── 8. #16 CONSOLE plan mode: the style flag, the executing flag, the wording ───
+void (() => {
+	console.log("console plan mode (#16)");
+	const doc = applyPlanOp(applyPlanOp(newPlanDoc({ title: "Console plan", task: "do the thing" }), { action: "add", text: "step one" }).doc, { action: "add", text: "step two" }).doc;
+	const tuiOn: PlanView = { planMode: true, planPaused: false, planFile: null, planStyle: "tui", planDoc: doc };
+	const fileOn: PlanView = { planMode: true, planPaused: false, planFile: "C:/plan/PLAN.md" };
+
+	check("a bound planDoc makes the console a CONSOLE-plan console", planStyleOf(tuiOn) === "tui");
+	check("a pinned plan file stays FILE mode (old states unchanged)", planStyleOf(fileOn) === "file");
+	check("consolePlanOf returns the document in console mode", consolePlanOf(tuiOn)?.steps.length === 2);
+	check("consolePlanOf returns null in file mode", consolePlanOf(fileOn) === null);
+
+	// Which style a NEW plan uses — /plan on and the backlog row must agree by construction.
+	check("an existing console plan wins over the machine file default", planStyleForNewPlan(tuiOn, "file") === "tui");
+	check("an existing plan file wins over the machine console default", planStyleForNewPlan(fileOn, "tui") === "file");
+	check("only a console with no plan anywhere consults the machine default", planStyleForNewPlan({ planMode: false, planPaused: false, planFile: null }, "tui") === "tui");
+	check("and defaults to file mode when the machine said nothing", planStyleForNewPlan({ planMode: false, planPaused: false, planFile: null }, undefined) === "file");
+
+	// Approve is the one transition that differs between the styles.
+	const tuiApprove = planTransition(tuiOn, "approve");
+	check("console approve ends planning mode", tuiApprove.ok && tuiApprove.flag === "off");
+	check("console approve sets EXECUTING (the checklist must keep tracking)", tuiApprove.executing === true);
+	const fileApprove = planTransition(fileOn, "approve");
+	check("file approve does NOT set executing (the file mode never had a live checklist)", fileApprove.executing === false);
+	const executed: PlanView = { planMode: false, planPaused: false, planFile: null, planStyle: "tui", planDoc: doc, planExecuting: true };
+	check("planExecutingOf reads the flag", planExecutingOf(executed) === true);
+	check("executing is off before approval", planExecutingOf(tuiOn) === false);
+	check("an executing console is NOT in planning mode (writes are allowed again)", planFlagOf(executed) === "off" && planGuardArmed(executed) === false);
+	check("executing frame names the plan and its progress", (planExecutingFrame(executed) ?? "").includes("PLAN IMPLEMENTING") && (planExecutingFrame(executed) ?? "").includes("0/2"), planExecutingFrame(executed)?.slice(0, 60));
+	check("no executing frame without the flag", planExecutingFrame(tuiOn) === null);
+
+	// Pause/resume are IDENTICAL in both styles — only the wording differs.
+	const tuiPause = planTransition(tuiOn, "pause");
+	check("console pause pauses like everything else", tuiPause.ok && tuiPause.flag === "paused");
+	check("console pause keeps the document bound", tuiPause.file === null && planStyleOf(tuiOn) === "tui");
+	check("paused console frame says PAUSED + kept + writes allowed", planPausedFrame(tuiOn).includes("PAUSED") && planPausedFrame(tuiOn).includes("console plan"), planPausedFrame(tuiOn).slice(0, 80));
+	check("paused FILE frame still names the file", planPausedFrame(fileOn).includes("C:/plan/PLAN.md"));
+	check("console paused steer forbids rebuilding the plan", consolePausedSteer(tuiOn).includes("do NOT call plan_doc") && consolePausedSteer(tuiOn).includes("/plan resume"), consolePausedSteer(tuiOn).slice(0, 60));
+	check("console exited steer keeps the plan but forbids implementing", /is kept/.test(consoleExitedSteer(tuiOn)) && /do NOT implement/i.test(consoleExitedSteer(tuiOn)), consoleExitedSteer(tuiOn).slice(0, 60));
+	check("file exited steer still names the file", planningExitedSteer("C:/plan/PLAN.md").includes("C:/plan/PLAN.md"));
+
+	// Presentation: one source for both styles, different names.
+	check("title marker says CONSOLE PLAN in console mode", (planTitleMarker(tuiOn) ?? "").includes("CONSOLE PLAN"), planTitleMarker(tuiOn) ?? "");
+	check("title marker stays 📋 PLAN in file mode", (planTitleMarker(fileOn) ?? "").includes("PLAN") && !(planTitleMarker(fileOn) ?? "").includes("CONSOLE"), planTitleMarker(fileOn) ?? "");
+	check("footer marker is the same single cell in both styles", planFooterMarker(tuiOn) === "📋" && planFooterMarker(fileOn) === "📋", `${planFooterMarker(tuiOn)} / ${planFooterMarker(fileOn)}`);
+	check("an implementing console shows the ▶ footer cell", planFooterMarker(executed) === "📋▶", planFooterMarker(executed) ?? "");
+	check("status line names the console plan, not a file", planStatusLine(tuiOn).includes("console plan"), planStatusLine(tuiOn));
+	check("planLabel quotes the plan title and its progress", planLabel(tuiOn).includes("Console plan") && planLabel(tuiOn).includes("2 steps"), planLabel(tuiOn));
+
+	// Model-facing rules text: console mode must NOT talk about a file it does not have.
+	const rules = consolePlanningRulesText(doc);
+	check("console rules forbid every write (no exempt file)", rules.includes("do not write ANY file"), rules.slice(0, 80));
+	check("console rules point at plan_doc", rules.includes("plan_doc"));
+	check("console rules still end at finish_plan's reminder", rules.includes("ask_user tool"));
+	check("console rules never mention a plan file path", !/\.md/.test(rules), rules.match(/\.md/)?.[0] ?? "");
+	check("the file-mode rules are unchanged (both modes coexist)", planningRulesText("C:/plan/PLAN.md").includes("C:/plan/PLAN.md") && planningResumeText("f").includes("RESUMED"));
+	check("the finish_plan reminder is shared by both styles", finishPlanReminder().includes("finish_plan"));
+})();
+
+// ── 9. approval dialog rows (finish_plan needs "Keep planning" in row 2) ───
 async function dialogRows(): Promise<void> {
 	console.log("approval dialog rows");
 	const APPROVE = "✅ Approve & implement";
@@ -239,6 +341,6 @@ async function dialogRows(): Promise<void> {
 // The async section must finish before the verdict is printed — otherwise a passing-looking
 // run could exit 0 with the dialog checks never evaluated.
 void dialogRows().then(() => {
-	console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
+	console.log(failures === 0 ? `ALL PASS (${checks} checks)` : `\n${failures} of ${checks} FAILURE(S)`);
 	process.exit(failures === 0 ? 0 : 1);
 });

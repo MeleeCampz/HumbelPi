@@ -1,0 +1,631 @@
+/**
+ * plan-doc — the pure document model behind CONSOLE plan mode (backlog #16).
+ *
+ * Console plan mode is the TUI-native alternative to the file-backed plan mode: the plan is
+ * not a markdown document the user has to open in an editor, it is a small structured object
+ * that the TUI renders live (widget above the editor) and edits in place (the /plan view
+ * overlay). The model reaches it through the `plan_doc` tool instead of through write/edit on
+ * a pinned file.
+ *
+ *   PlanDoc
+ *     title          one-line name of the plan
+ *     task           the request being planned (verbatim-ish, so a resumed plan still says what
+ *                    it was for)
+ *     steps[]        { id, text, status: open | doing | done | dropped }
+ *     decisions[]    choices made while planning (+ why) — the part a .md plan buries in prose
+ *     constraints[]  hard limits the implementation must honor
+ *     openQuestions[] questions the human still has to answer
+ *     revised        mutation counter (widget signature, "revision 4" in the model text)
+ *     nextId         step ids are STABLE and never reused (see below)
+ *
+ * WHY ADDRESS STEPS BY STABLE ID AND NOT BY POSITION: the model, the widget and the overlay
+ * all refer to the same step at the same time, and a user edit (add / delete / reorder) can
+ * change positions in the middle of a turn. `update 4` meaning "the fourth row right now"
+ * would silently hit a different step. ids are printed as `#4` in every rendering, so there is
+ * exactly one number in play and it never moves.
+ *
+ * WHY THIS FILE IS PURE (no pi, no pi-tui, no fs): same rule as plan-state.ts, ask-loop.ts and
+ * plan-file.ts — tools/test-plan-doc.ts exercises every operation and every renderer, including
+ * the terminal height budget, without the extension graph. `theme` enters as a structural
+ * callback, never as an import.
+ *
+ * WHY `dropped` EXISTS AS A STATUS AND NOT AS A DELETE: "step 3 is out, we are not doing that"
+ * is a planning decision worth keeping visible to both sides; hard deletes are a separate op
+ * for when a row was simply wrong.
+ */
+
+export type PlanStepStatus = "open" | "doing" | "done" | "dropped";
+export type PlanNoteKind = "decision" | "constraint" | "open";
+
+/**
+ * The two planning styles a console can be in (session-state, plan-state, guards).
+ *   "file" the original: a pinned markdown document (<cwd>/.pi/PLAN.md)
+ *   "tui"  console plan mode: this document, rendered live and edited in the TUI (#16)
+ * Exported from THIS module (the document model) so every consumer names the same two values.
+ */
+export type PlanStyle = "file" | "tui";
+
+export interface PlanStep {
+	id: number;
+	text: string;
+	status: PlanStepStatus;
+	/** Optional sub-note attached to this step (why it changed, a gotcha, a file to touch). */
+	note?: string;
+}
+
+export interface PlanDoc {
+	/** Discriminator: this document belongs to console plan mode, not to a plan file. */
+	style: "tui";
+	title: string;
+	task: string;
+	steps: PlanStep[];
+	decisions: string[];
+	constraints: string[];
+	openQuestions: string[];
+	revised: number;
+	nextId: number;
+	updatedAt: string;
+}
+
+// ── Status vocabulary (shared by renderer, overlay and tool text) ──────────────
+
+/** Cycle order for the overlay's `x` key and the tool's `cycle` op. */
+export const STATUS_CYCLE: PlanStepStatus[] = ["open", "doing", "done", "dropped"];
+
+export const STATUS_GLYPH: Record<PlanStepStatus, string> = {
+	open: "○",
+	doing: "◐",
+	done: "✓",
+	dropped: "✗",
+};
+
+/** pi theme color per status (same vocabulary as the backlog checklist: ✓ done, ◐ working, ○ open).
+ *  Roles must be pi theme role names — 1.5.2 rejects unknown ones ("default" crashed the live panel; "text" is the body role). */
+export const STATUS_COLOR: Record<PlanStepStatus, string> = {
+	open: "text",
+	doing: "warning",
+	done: "success",
+	dropped: "muted",
+};
+
+/** Structural stand-in for pi's theme so this module stays import-free. */
+export interface PlanTheme {
+	fg(color: string, text: string): string;
+	strikethrough?(text: string): string;
+}
+
+export const PLAIN_THEME: PlanTheme = { fg: (_c, t) => t };
+
+// ── Construction / normalization ──────────────────────────────────────────────
+
+export function newPlanDoc(init: { title?: string; task?: string; steps?: string[] } = {}): PlanDoc {
+	const doc: PlanDoc = {
+		style: "tui",
+		title: (init.title ?? "").trim(),
+		task: (init.task ?? "").trim(),
+		steps: [],
+		decisions: [],
+		constraints: [],
+		openQuestions: [],
+		revised: 0,
+		nextId: 1,
+		updatedAt: new Date().toISOString(),
+	};
+	for (const text of init.steps ?? []) {
+		if (!text.trim()) continue;
+		doc.steps.push({ id: doc.nextId++, text: text.trim(), status: "open" });
+	}
+	return doc;
+}
+
+/**
+ * Defensive read: a PlanDoc comes off disk (session-state JSON) and from older builds, so
+ * every field is defaulted and every step coerced. Anything unusable returns null rather than
+ * a half-valid document — a corrupt plan must read as "no plan", not as an empty plan (those
+ * mean different things to /plan approve and to the write guard).
+ */
+export function normalizePlanDoc(raw: unknown): PlanDoc | null {
+	if (!raw || typeof raw !== "object") return null;
+	const r = raw as Partial<PlanDoc>;
+	if (r.style !== "tui") return null;
+	const steps: PlanStep[] = [];
+	let maxId = 0;
+	for (const s of Array.isArray(r.steps) ? r.steps : []) {
+		if (!s || typeof s !== "object") continue;
+		const st = s as Partial<PlanStep>;
+		const text = typeof st.text === "string" ? st.text.trim() : "";
+		if (!text) continue;
+		const status = STATUS_CYCLE.includes(st.status as PlanStepStatus) ? st.status as PlanStepStatus : "open";
+		const id = typeof st.id === "number" && Number.isInteger(st.id) && st.id > 0 ? st.id : 0; // 0 = assigned below
+		const step: PlanStep = { id, text, status };
+		if (typeof st.note === "string" && st.note.trim()) step.note = st.note.trim();
+		steps.push(step);
+		if (id > maxId) maxId = id;
+	}
+	// Re-key the steps whose id is missing or duplicated, keeping display order.
+	const seen = new Set<number>();
+	for (const step of steps) {
+		if (step.id === 0 || seen.has(step.id)) step.id = maxId + 1;
+		maxId = Math.max(maxId, step.id);
+		seen.add(step.id);
+	}
+	const listsOk = (v: unknown): string[] =>
+		Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x.trim() !== "").map((x) => x.trim()) : [];
+	return {
+		style: "tui",
+		title: typeof r.title === "string" ? r.title.trim() : "",
+		task: typeof r.task === "string" ? r.task.trim() : "",
+		steps,
+		decisions: listsOk(r.decisions),
+		constraints: listsOk(r.constraints),
+		openQuestions: listsOk(r.openQuestions),
+		revised: typeof r.revised === "number" && Number.isFinite(r.revised) ? Math.max(0, Math.floor(r.revised)) : 0,
+		nextId: maxId + 1,
+		updatedAt: typeof r.updatedAt === "string" ? r.updatedAt : new Date().toISOString(),
+	};
+}
+
+// ── Operations ────────────────────────────────────────────────────────────────
+
+export type PlanOp =
+	| { action: "set"; title?: string; task?: string }
+	| { action: "add"; text: string; after?: number }
+	| { action: "update"; id: number; text?: string; note?: string }
+	| { action: "status"; id: number; status: PlanStepStatus }
+	| { action: "cycle"; id: number }
+	| { action: "reorder"; id: number; after?: number | null }
+	| { action: "remove"; id: number }
+	| { action: "note"; kind: PlanNoteKind; text: string }
+	| { action: "unnote"; kind: PlanNoteKind; index: number }
+	| { action: "editNote"; kind: PlanNoteKind; index: number; text: string }
+	| { action: "reset" };
+
+export interface PlanOpResult {
+	ok: boolean;
+	/** The new document (a copy) — the input is never mutated. Equal to `doc` when !ok. */
+	doc: PlanDoc;
+	/** One-line human/model-facing description of what changed ("step #3 → done"). */
+	log: string;
+	/** Present when ok === false: why the op did not apply. */
+	reason?: string;
+}
+
+function copy(doc: PlanDoc): PlanDoc {
+	return {
+		...doc,
+		steps: doc.steps.map((s) => ({ ...s })),
+		decisions: [...doc.decisions],
+		constraints: [...doc.constraints],
+		openQuestions: [...doc.openQuestions],
+	};
+}
+
+function done(doc: PlanDoc, log: string): PlanOpResult {
+	const next = copy(doc);
+	next.revised = doc.revised + 1;
+	next.updatedAt = new Date().toISOString();
+	return { ok: true, doc: next, log };
+}
+
+function fail(doc: PlanDoc, reason: string): PlanOpResult {
+	return { ok: false, doc, log: reason, reason };
+}
+
+function findStep(doc: PlanDoc, id: number): PlanStep | undefined {
+	return doc.steps.find((s) => s.id === id);
+}
+
+function stepLabel(s: PlanStep): string {
+	return `#${s.id} ${s.text}`;
+}
+
+/** Apply one operation. Pure: `doc` is never mutated, `reset` returns a fresh empty document. */
+export function applyPlanOp(doc: PlanDoc, op: PlanOp): PlanOpResult {
+	switch (op.action) {
+		case "set": {
+			const title = op.title !== undefined ? op.title.trim() : doc.title;
+			const task = op.task !== undefined ? op.task.trim() : doc.task;
+			if (title === doc.title && task === doc.task) return fail(doc, "Nothing to set — title and task are already those values.");
+			return done({ ...doc, title, task }, `plan header set: "${title || doc.title || "untitled"}"`);
+		}
+
+		case "add": {
+			const text = op.text.trim();
+			if (!text) return fail(doc, "add needs a non-empty step text.");
+			const next = copy(doc);
+			const step: PlanStep = { id: next.nextId++, text, status: "open" };
+			if (op.after !== undefined) {
+				const at = next.steps.findIndex((s) => s.id === op.after);
+				if (at < 0) return fail(doc, `No step #${op.after} — cannot insert after it.`);
+				next.steps.splice(at + 1, 0, step);
+			} else {
+				next.steps.push(step);
+			}
+			next.revised = doc.revised + 1;
+			next.updatedAt = new Date().toISOString();
+			return { ok: true, doc: next, log: `added step ${stepLabel(step)}` };
+		}
+
+		case "update": {
+			const s = findStep(doc, op.id);
+			if (!s) return fail(doc, `No step #${op.id}.`);
+			const text = op.text?.trim();
+			const note = op.note?.trim();
+			if (!text && !note) return fail(doc, "update needs new text and/or a note.");
+			const next = copy(doc);
+			const target = next.steps.find((x) => x.id === op.id)!;
+			if (text) target.text = text;
+			if (note) target.note = note;
+			next.revised = doc.revised + 1;
+			next.updatedAt = new Date().toISOString();
+			return { ok: true, doc: next, log: `edited step ${stepLabel(target)}` };
+		}
+
+		case "status": {
+			const s = findStep(doc, op.id);
+			if (!s) return fail(doc, `No step #${op.id}.`);
+			if (!STATUS_CYCLE.includes(op.status)) return fail(doc, `Unknown status "${String(op.status)}" (open | doing | done | dropped).`);
+			if (s.status === op.status) return fail(doc, `Step ${stepLabel(s)} is already ${op.status}.`);
+			const next = copy(doc);
+			next.steps.find((x) => x.id === op.id)!.status = op.status;
+			next.revised = doc.revised + 1;
+			next.updatedAt = new Date().toISOString();
+			return { ok: true, doc: next, log: `step ${stepLabel(s)} → ${op.status}` };
+		}
+
+		case "cycle": {
+			const s = findStep(doc, op.id);
+			if (!s) return fail(doc, `No step #${op.id}.`);
+			const nextStatus = STATUS_CYCLE[(STATUS_CYCLE.indexOf(s.status) + 1) % STATUS_CYCLE.length]!;
+			return applyPlanOp(doc, { action: "status", id: op.id, status: nextStatus });
+		}
+
+		case "reorder": {
+			const s = findStep(doc, op.id);
+			if (!s) return fail(doc, `No step #${op.id}.`);
+			const after = op.after === undefined ? null : op.after;
+			if (after !== null) {
+				if (after === op.id) return fail(doc, `Step #${op.id} is already where it is.`);
+				if (!findStep(doc, after)) return fail(doc, `No step #${after} to move #${op.id} after.`);
+			}
+			const next = copy(doc);
+			const from = next.steps.findIndex((x) => x.id === op.id);
+			const [moved] = next.steps.splice(from, 1);
+			if (after === null) next.steps.unshift(moved!);
+			else next.steps.splice(next.steps.findIndex((x) => x.id === after) + 1, 0, moved!);
+			next.revised = doc.revised + 1;
+			next.updatedAt = new Date().toISOString();
+			return { ok: true, doc: next, log: `moved step ${stepLabel(s)} to position ${next.steps.findIndex((x) => x.id === op.id) + 1}/${next.steps.length}` };
+		}
+
+		case "remove": {
+			const s = findStep(doc, op.id);
+			if (!s) return fail(doc, `No step #${op.id}.`);
+			const next = copy(doc);
+			next.steps = next.steps.filter((x) => x.id !== op.id);
+			next.revised = doc.revised + 1;
+			next.updatedAt = new Date().toISOString();
+			return { ok: true, doc: next, log: `removed step ${stepLabel(s)}` };
+		}
+
+		case "note": {
+			const text = op.text.trim();
+			if (!text) return fail(doc, "note needs text.");
+			const next = copy(doc);
+			const list = op.kind === "decision" ? next.decisions : op.kind === "constraint" ? next.constraints : next.openQuestions;
+			if (list.includes(text)) return fail(doc, `That ${op.kind} is already in the plan.`);
+			list.push(text);
+			next.revised = doc.revised + 1;
+			next.updatedAt = new Date().toISOString();
+			return { ok: true, doc: next, log: `added ${op.kind}: ${text}` };
+		}
+
+		case "unnote": {
+			const next = copy(doc);
+			const list = op.kind === "decision" ? next.decisions : op.kind === "constraint" ? next.constraints : next.openQuestions;
+			if (op.index < 0 || op.index >= list.length) return fail(doc, `No ${op.kind} #${op.index + 1} (${list.length} exist).`);
+			const [removed] = list.splice(op.index, 1);
+			next.revised = doc.revised + 1;
+			next.updatedAt = new Date().toISOString();
+			return { ok: true, doc: next, log: `removed ${op.kind}: ${removed}` };
+		}
+
+		case "editNote": {
+			// Replace a note IN PLACE rather than unnote+note: a note has no id, so a delete would
+			// shift every later note while the overlay cursor is still pointing at the old position.
+			const text = op.text.trim();
+			if (!text) return fail(doc, "editNote needs text.");
+			const list = op.kind === "decision" ? doc.decisions : op.kind === "constraint" ? doc.constraints : doc.openQuestions;
+			if (op.index < 0 || op.index >= list.length) return fail(doc, `No ${op.kind} #${op.index + 1} (${list.length} exist).`);
+			if (list[op.index] === text) return fail(doc, `That ${op.kind} is already that text.`);
+			const next = copy(doc);
+			const target = op.kind === "decision" ? next.decisions : op.kind === "constraint" ? next.constraints : next.openQuestions;
+			target[op.index] = text;
+			next.revised = doc.revised + 1;
+			next.updatedAt = new Date().toISOString();
+			return { ok: true, doc: next, log: `${op.kind} #${op.index + 1}: ${list[op.index]} → ${text}` };
+		}
+
+		case "reset": {
+			const fresh = newPlanDoc({ title: doc.title, task: doc.task });
+			fresh.revised = doc.revised + 1;
+			return { ok: true, doc: fresh, log: "plan cleared (title and task kept)" };
+		}
+	}
+}
+
+// ── Progress ──────────────────────────────────────────────────────────────────
+
+export interface PlanProgress {
+	total: number;
+	done: number;
+	open: number;
+	doing: number;
+	dropped: number;
+	/** Steps that still have work (open + doing) — the implementation instruction uses this. */
+	remaining: PlanStep[];
+	allDone: boolean;
+}
+
+export function planProgress(doc: PlanDoc): PlanProgress {
+	const count = (s: PlanStepStatus) => doc.steps.filter((x) => x.status === s).length;
+	const remaining = doc.steps.filter((s) => s.status === "open" || s.status === "doing");
+	return {
+		total: doc.steps.length,
+		done: count("done"),
+		open: count("open"),
+		doing: count("doing"),
+		dropped: count("dropped"),
+		remaining,
+		allDone: doc.steps.length > 0 && remaining.length === 0,
+	};
+}
+
+/**
+ * Cheap identity of a plan's rendered state — the widget refresh loop compares this instead of
+ * re-rendering blindly, so "did anything change" is one string comparison per tick.
+ */
+export function planSignature(doc: PlanDoc | null): string {
+	if (!doc) return "none";
+	return `${doc.title}|${doc.task}|${doc.revised}|${doc.steps.map((s) => `${s.id}:${s.status}`).join(",")}|${doc.steps.length}|${doc.decisions.length}|${doc.constraints.length}|${doc.openQuestions.length}`;
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────────
+
+const NOTES_HEADING: Record<PlanNoteKind, string> = {
+	decision: "Decisions",
+	constraint: "Constraints",
+	open: "Open questions",
+};
+
+const notesOf = (doc: PlanDoc, kind: PlanNoteKind): string[] =>
+	kind === "decision" ? doc.decisions : kind === "constraint" ? doc.constraints : doc.openQuestions;
+
+/**
+ * Model-facing text. Used three ways from one source so they cannot drift: the per-message
+ * [PLAN MODE] frame, every plan_doc tool result, and the approval dialog body.
+ */
+export function renderPlanText(doc: PlanDoc, opts: { heading?: string; compact?: boolean; maxSteps?: number } = {}): string {
+	const p = planProgress(doc);
+	const head = opts.heading ?? "PLAN";
+	const shown = doc.steps.slice(0, opts.maxSteps ?? doc.steps.length);
+	const hidden = doc.steps.length - shown.length;
+	const lines: string[] = [
+		`${head}: ${doc.title || "(untitled plan)"} — console plan, ${p.done}/${p.total} steps done, ${p.doing} in progress, ${p.dropped} dropped (revision ${doc.revised})`,
+	];
+	if (doc.task) lines.push(`Task: ${doc.task}`);
+	lines.push("", "Steps:");
+	if (doc.steps.length === 0) lines.push("  (no steps yet — add them with plan_doc action=add)");
+	for (const s of shown) {
+		lines.push(`  #${s.id} ${STATUS_GLYPH[s.status]} ${s.text}${s.note ? `  ⟵ ${s.note}` : ""}`);
+	}
+	if (hidden > 0) lines.push(`  … ${hidden} more step(s) — plan_doc action=show lists them all`);
+	if (opts.compact) return lines.join("\n"); // per-message frame: steps only, so a long plan is not re-sent whole every message
+	for (const kind of ["decision", "constraint", "open"] as PlanNoteKind[]) {
+		const list = notesOf(doc, kind);
+		if (list.length === 0) continue;
+		lines.push("", `${NOTES_HEADING[kind]}:`);
+		for (const n of list) lines.push(`  - ${n}`);
+	}
+	return lines.join("\n");
+}
+
+export interface PlanLineOptions {
+	width: number;
+	/** Hard cap on rendered rows (the widget/overlay height budget). */
+	maxRows: number;
+	/** Row index (into the step list) hovered by the overlay cursor, if any. */
+	cursor?: number | null;
+	/** Show the decisions/constraints/open-questions blocks. */
+	notes?: boolean;
+	/** Prefix for each step row (the overlay uses "❯ " for the hovered row). */
+	cursorMark?: string;
+	/** Trailing hint line (e.g. "/plan view" in the widget). */
+	hint?: string;
+	theme?: PlanTheme;
+}
+
+export interface PlanLines {
+	lines: string[];
+	hiddenAbove: number;
+	hiddenBelow: number;
+}
+
+/**
+ * Terminal-native rendering: a fixed row budget, a cursor-anchored window over the steps, and
+ * "↑ N more above / ↓ N more below" indicators — the same shape that fixed the backlog checklist
+ * running off-screen (backlog #5). EVERY line is truncated to `width`: pi's renderer throws when
+ * a line is wider than the terminal, so an untruncated title is a crash, not a cosmetic issue.
+ */
+export function planWidgetLines(doc: PlanDoc, o: PlanLineOptions): PlanLines {
+	const theme = o.theme ?? PLAIN_THEME;
+	const width = Math.max(12, o.width);
+	const cursor = o.cursor ?? null;
+	const p = planProgress(doc);
+	const idWidth = Math.max(2, String(doc.steps.reduce((m, s) => Math.max(m, s.id), 0)).length);
+
+	const statusTag = p.doing > 0 ? `${p.done}/${p.total} · ◐ ${p.doing}` : `${p.done}/${p.total}`;
+	const headText = `📋 console plan — ${doc.title || "(untitled)"} · ${statusTag} · rev ${doc.revised}`;
+	const head = [theme.fg("accent", truncate(headText, width))];
+	if (o.hint) head.push(theme.fg("dim", truncate(o.hint, width)));
+
+	// Fixed rows: the header block + one separator + the two "more above/below" indicator slots.
+	const fixed = head.length + 1 + 2;
+	const budget = Math.max(1, o.maxRows - fixed);
+
+	const anchor = cursor === null ? 0 : Math.min(Math.max(0, cursor), Math.max(0, doc.steps.length - 1));
+	let start = anchor;
+	let end = anchor;
+	let used = 0;
+	if (doc.steps.length) {
+		used = Math.min(1, budget);
+		for (let i = anchor - 1; i >= 0 && used + 1 <= budget; i--) { used += 1; start = i; }
+		for (let i = anchor + 1; i < doc.steps.length && used + 1 <= budget; i++) { used += 1; end = i; }
+	}
+
+	const lines: string[] = [...head];
+	for (let i = start; doc.steps.length && i <= end; i++) {
+		const s = doc.steps[i]!;
+		const mark = cursor === i ? (o.cursorMark ?? "❯") : " ";
+		const glyph = theme.fg(STATUS_COLOR[s.status], STATUS_GLYPH[s.status]);
+		const idCell = `#${String(s.id).padEnd(idWidth)}`;
+		// The prefix is measured UNSTYLED and its real length is what the text budget subtracts.
+		// Guessing a column count here is how a step line overflows the terminal by one column.
+		const prefix = `${mark} ${idCell} ${STATUS_GLYPH[s.status]} `;
+		const text = truncate(s.text, Math.max(8, width - prefix.length));
+		const colored = s.status === "done" || s.status === "dropped" ? theme.fg("dim", text) : s.status === "doing" ? theme.fg("warning", text) : text;
+		lines.push(`${mark} ${theme.fg("muted", idCell)} ${glyph} ${colored}`);
+	}
+	const hiddenAbove = start;
+	const hiddenBelow = doc.steps.length ? doc.steps.length - 1 - end : 0;
+	if (hiddenAbove > 0) lines.push(theme.fg("dim", `  ↑ ${hiddenAbove} more above`));
+	if (hiddenBelow > 0) lines.push(theme.fg("dim", `  ↓ ${hiddenBelow} more below`));
+	lines.push(theme.fg("dim", "─".repeat(Math.max(4, Math.min(width, 48)))));
+
+	if (o.notes) {
+		for (const kind of ["decision", "constraint", "open"] as PlanNoteKind[]) {
+			const list = notesOf(doc, kind);
+			if (list.length === 0) continue;
+			lines.push(theme.fg("accent", `${NOTES_HEADING[kind]} (${list.length}):`));
+			for (const n of list) lines.push(theme.fg("muted", `  ${truncate(n, Math.max(8, width - 4))}`));
+		}
+	}
+	return { lines, hiddenAbove, hiddenBelow };
+}
+
+/** Local width-safe truncation (this module must not import pi-tui; see the header). */
+function truncate(text: string, width: number): string {
+	// No ANSI in this module's own strings, so plain slicing is width-correct except for wide
+	// characters, which the host re-measures with truncateToWidth when it paints the final line.
+	const w = Math.max(1, Math.floor(width));
+	if (text.length <= w) return text;
+	return `${text.slice(0, Math.max(1, w - 1))}…`;
+}
+
+// ── Approval / implementation handoff ─────────────────────────────────────────
+
+/**
+ * The instruction handed to the model when a console plan is approved. Same contract as the
+ * file mode's implementationInstruction (steps in order, honor decisions, report per step), but
+ * built from the document — so "approved" and "what the model was told" are the same bytes the
+ * user was looking at in the overlay.
+ */
+export function implementationInstructionFromDoc(doc: PlanDoc): string {
+	const p = planProgress(doc);
+	const steps = doc.steps.map((s) => `  #${s.id} [${s.status}] ${s.text}${s.note ? ` — ${s.note}` : ""}`).join("\n");
+	const notes: string[] = [];
+	for (const kind of ["decision", "constraint", "open"] as PlanNoteKind[]) {
+		const list = notesOf(doc, kind);
+		if (list.length) notes.push(`  ${NOTES_HEADING[kind]}: ${list.join(" · ")}`);
+	}
+	return [
+		`PLAN APPROVED (console plan "${doc.title || "untitled"}", revision ${doc.revised}).`,
+		"",
+		"Steps:",
+		steps || "  (none)",
+		notes.length ? ["", "Honor these:", ...notes].join("\n") : "",
+		"",
+		`Implement it now, in order. ${p.remaining.length} step(s) remain (${p.done} already done, ${p.dropped} deliberately dropped — do not re-open a dropped step unless the user asks). Mark each one as you go with plan_doc action=status id=… status=done, and report progress as you work: one short line per completed step (e.g. "✅ #2 done: …"). Deviate only when something is genuinely impossible, and say why first. Start with the first remaining step.`,
+	].join("\n");
+}
+
+// ── Importing a markdown plan (bridges the two modes) ─────────────────────────
+
+/**
+ * Turn a .md plan into a console plan: numbered steps, `- [ ]` checkboxes and `##`/`###`
+ * headings become steps; lines under a "decision"/"constraint"/"open question" heading become
+ * notes. Deliberately forgiving — this is a convenience path (/plan import), not a parser.
+ *
+ * The metadata lines planDocToMarkdown itself writes (`Task: …`, `# Plan — …`) are skipped, so
+ * export → import does not grow the plan by one step every round trip.
+ */
+export function planDocFromMarkdown(md: string, init: { title?: string; task?: string } = {}): PlanDoc {
+	const doc = newPlanDoc(init);
+	let bucket: PlanNoteKind | null = null;
+	for (const rawLine of md.split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (!line) continue;
+		if (/^[-─—]+$/.test(line)) continue;
+
+		const h = line.match(/^#{1,6}\s+(.*)$/);
+		if (h) {
+			const t = h[1]!.trim().toLowerCase();
+			if (/^(decision|choice|chosen)/.test(t)) bucket = "decision";
+			else if (/^(constraint|risk|assumption|limitation)/.test(t)) bucket = "constraint";
+			else if (/^(open question|question|unknown)/.test(t)) bucket = "open";
+			else if (/^(step|plan|approach|implement)/.test(t)) bucket = null;
+			else if (!doc.title) doc.title = h[1]!.trim();
+			else if (bucket === null) doc.constraints.push(h[1]!.trim()); // a stray heading is a section boundary worth knowing
+			continue;
+		}
+
+		// Metadata the exporter writes; never a step.
+		const meta = line.match(/^(task|steps|plan)\b\s*(\([^)]*\))?\s*:?\s*(.*)$/i);
+		if (meta && /^task$/i.test(meta[1]!) && bucket === null) {
+			if (!doc.task && meta[3]) doc.task = meta[3].trim();
+			continue;
+		}
+		if (meta && bucket === null && /^(steps|plan)$/i.test(meta[1]!)) continue;
+
+		const parsed = parseStepLine(line);
+		if (!parsed) continue;
+		if (bucket) { notesOf(doc, bucket).push(parsed.text); continue; }
+		doc.steps.push({ id: doc.nextId++, text: parsed.text, status: parsed.status });
+	}
+	if (!doc.title && init.title) doc.title = init.title;
+	return doc;
+}
+
+/** `- [x] text`, `1. text`, `* [ ] text`, or a bare line of prose → { text, status }. */
+function parseStepLine(line: string): { text: string; status: PlanStepStatus } | null {
+	const m = line.match(/^(?:(\d+)[.)]|[-*•])\s+(.*)$/) ?? [undefined, undefined, line];
+	let rest = (m[2] ?? "").trim();
+	if (!rest) return null;
+	let status: PlanStepStatus = "open";
+	const box = rest.match(/^\[([ xX~✓✗o○])\]\s*(.*)$/);
+	if (box) {
+		const c = box[1]!;
+		status = c === "x" || c === "X" || c === "✓" ? "done" : c === "~" || c === "✗" ? "dropped" : "open";
+		rest = (box[2] ?? "").trim();
+	}
+	if (!rest || /^[-─—]+$/.test(rest)) return null;
+	return { text: rest, status };
+}
+
+/** Render a console plan back to markdown for /plan export. */
+export function planDocToMarkdown(doc: PlanDoc): string {
+	const p = planProgress(doc);
+	const out: string[] = [`# Plan — ${doc.title || "(untitled)"}`, ""];
+	if (doc.task) out.push(`Task: ${doc.task}`, "");
+	out.push(
+		`## Steps (${p.done}/${p.total} done, revision ${doc.revised})`,
+		"",
+		...doc.steps.map((s, i) => `${i + 1}. ${s.status === "done" ? "[x]" : s.status === "dropped" ? "[~]" : "[ ]"} ${s.text}${s.note ? ` — ${s.note}` : ""}`),
+	);
+	for (const kind of ["decision", "constraint", "open"] as PlanNoteKind[]) {
+		const list = notesOf(doc, kind);
+		if (!list.length) continue;
+		out.push("", `## ${NOTES_HEADING[kind]}`, "", ...list.map((n) => `- ${n}`));
+	}
+	return `${out.join("\n")}\n`;
+}

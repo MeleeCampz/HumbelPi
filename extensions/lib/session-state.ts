@@ -26,9 +26,18 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { normalizePlanDoc, type PlanDoc } from "./plan-doc";
 
 // ── per-session state (plan + unattended + yolo) — #4 ────────────────────
 const SESSION_STATE_DIR = path.join(os.homedir(), ".pi", "agent", "session-state");
+
+/**
+ * #16: which planning mode this console is in.
+ *   "file" — the original: the plan is a pinned markdown file (only that file is writable).
+ *   "tui"  — console plan mode: the plan is the `planDoc` object below, rendered live in the
+ *            TUI and edited through /plan view; NO file is writable while planning is on.
+ */
+export type PlanStyle = "file" | "tui";
 
 export interface SessionState {
 	planMode: boolean;
@@ -41,9 +50,23 @@ export interface SessionState {
 	 * The transition table itself is in ./plan-state.ts.
 	 */
 	planPaused?: boolean;
+	/** #16: which planning mode this session's planning is running in. Absent (old files) = "file". */
+	planStyle?: PlanStyle;
+	/**
+	 * #16: the console plan itself (only meaningful when planStyle === "tui"). Coerced on read
+	 * by normalizePlanDoc, so a hand-edited or older-format state file reads as either a valid
+	 * plan or no plan at all — never as a half-valid one.
+	 */
+	planDoc?: PlanDoc | null;
+	/**
+	 * #16: an APPROVED console plan is being implemented. planMode is false (writes are allowed —
+	 * that is the point) while planDoc stays bound, so the checklist and the progress panel keep
+	 * tracking. Only ever meaningful when planStyle === "tui"; coerced to false otherwise.
+	 */
+	planExecuting?: boolean;
 }
 
-export const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false, planPaused: false };
+export const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false, planPaused: false, planStyle: "file", planDoc: null, planExecuting: false };
 
 /**
  * Yolo default (#14): ON when we detect a sandbox — the container IS the isolation
@@ -93,7 +116,17 @@ export function loadSessionState(sessionId: string): SessionState {
 		const { yoloMode: _legacyYolo, ...clean } = s as SessionState & Record<string, unknown>;
 		// #9: state files written before planPaused existed get the default (false) from
 		// freshSessionState() — spread order matters, defaults first.
-		return { ...freshSessionState(), ...clean };
+		const merged = { ...freshSessionState(), ...clean } as SessionState;
+		// #16: the console plan is coerced, not trusted — an unusable planDoc reads as NO plan.
+		merged.planDoc = merged.planDoc ? normalizePlanDoc(merged.planDoc) : null;
+		if (merged.planStyle !== "tui") merged.planStyle = "file";
+		// Executing is a console-mode fact: file mode never had a live checklist, and an executing
+		// flag with no document is tracking nothing — read it as off rather than as a broken plan.
+		if (merged.planStyle !== "tui" || !merged.planDoc) merged.planExecuting = false;
+		// A tui console claiming planning mode with no document has nothing planned: drop the
+		// mode rather than run planning with no plan to write and no file to pin.
+		if (merged.planStyle === "tui" && !merged.planDoc && merged.planMode) merged.planMode = false;
+		return merged;
 	} catch {
 		return freshSessionState();
 	}
@@ -157,6 +190,12 @@ export interface GuardState {
 	selectionMode?: boolean;
 	/** Yolo mode (#14): machine-global; default is dynamic — see yoloDefaultOn(). */
 	yoloMode: boolean;
+	/**
+	 * #16: which planning mode a bare `/plan on` starts. Machine-global like yolo — set it once
+	 * (`/plan default tui`) and every console from then on plans in the TUI. Defaults to "file",
+	 * so an existing setup changes nothing until it is asked for.
+	 */
+	planStyleDefault?: PlanStyle;
 }
 
 export const DEFAULT_GUARD_STATE: GuardState = {
@@ -167,6 +206,7 @@ export const DEFAULT_GUARD_STATE: GuardState = {
 	allowedBranches: [],
 	selectionMode: true,
 	yoloMode: false,
+	planStyleDefault: "file",
 };
 
 /**
@@ -199,6 +239,7 @@ export function loadGuardState(): GuardState {
 		const raw = JSON.parse(fs.readFileSync(GUARD_STATE_FILE, "utf8")) as Record<string, unknown>;
 		const s = { ...DEFAULT_GUARD_STATE, ...raw } as GuardState;
 		if (!Array.isArray(s.readOnlyPaths)) s.readOnlyPaths = [];
+		if (s.planStyleDefault !== "tui") s.planStyleDefault = "file";
 		s.yoloMode = migrateLegacyYolo(raw);
 		return s;
 	} catch {

@@ -22,17 +22,24 @@ import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@ea
 // #1: session state lives in the shared module (single writer, fresh RMW saves).
 // Importing ./guards only evaluates its top-level constants/functions — the default
 // export factory is NOT invoked, so nothing gets registered twice.
-import { loadSessionState, updateSessionState } from "./lib/session-state";
+import { loadSessionState, loadGuardState, updateSessionState } from "./lib/session-state";
 // #13: via the dependency-free lib module — importing ./guards here would drag
 // the whole extension graph (typebox, pi-coding-agent) into test runs.
 import { defaultPlanFile } from "./lib/plan-file";
+// #16: the console plan document (pure module, same rule as plan-file: no pi, no fs).
+import { newPlanDoc } from "./lib/plan-doc";
 // #9: planning mode is a state machine (ON / PAUSED / OFF) owned by guards.ts; the backlog
 // row follows the SAME transition table so the two entry points cannot disagree about what
 // "plan these" means in a paused session. Title/footer markers come from the same helpers.
 import {
   applyPlanTransition,
+  consolePlanOf,
+  consolePlanningRulesText,
   finishPlanReminder,
   planFlagOf,
+  planLabel,
+  planStyleForNewPlan,
+  planStyleOf,
   planTitleMarker,
   planTransition,
   planningResumeText,
@@ -346,21 +353,30 @@ export default function (pi: ExtensionAPI) {
           const marker = planTitleMarker(state) || "📋 PLAN";
           ctx.ui.setTitle(`${marker} — pi — ${path.basename(ctx.cwd) || "pi"}`);
         };
+        // #16: which STYLE this console plans in — the same helper /plan on uses, so a backlog row can
+        // never decide it differently. An existing plan's style wins; the machine default
+        // (/plan default tui|file) is consulted only when nothing is planned anywhere.
+        const style = planStyleForNewPlan(ss, loadGuardState().planStyleDefault);
 
         // #9: PAUSED means "the plan is waiting, side work is allowed". Selecting backlog items
-        // for planning is an unambiguous request to bring that plan back — resume the SAME pinned
-        // file, never pin a second one behind the suspended plan (which is what the old
-        // if (!ss.planMode) branch did, because a paused session reads as planMode:false).
+        // for planning is an unambiguous request to bring that plan back — resume the SAME plan
+        // (file or console document), never start a second one behind the suspended plan (which is
+        // what the old if (!ss.planMode) branch did, because a paused session reads as planMode:false).
         if (planFlagOf(ss) === "paused") {
           if (!planTransition(ss, "resume").ok) {
-            ctx.ui.notify("📋 Planning mode is paused but no plan file is bound — run /plan on instead.", "warning");
+            ctx.ui.notify("📋 Planning mode is paused but no plan is bound — run /plan on instead.", "warning");
             return;
           }
           const saved = updateSessionState(sid, s => { applyPlanTransition(s, "resume"); });
           titleFor(saved);
-          const f = saved.planFile ?? "the plan file";
-          ctx.ui.notify(`📋 Planning mode RESUMED — only ${f} may be written while planning is on.`, "info");
-          pi.sendUserMessage(`${planningResumeText(f)} Your task: plan these backlog items:\n${lines.join("\n")}\nRevise the plan for them now. ${finishPlanReminder()}`, { deliverAs: "followUp" });
+          if (planStyleOf(saved) === "tui") {
+            ctx.ui.notify(`📋 Console planning RESUMED — ${planLabel(saved)} is back under the write guard. /plan view to edit it.`, "info");
+            pi.sendUserMessage(`${consolePlanningRulesText(consolePlanOf(saved), { resumed: true })} Your task: plan these backlog items:\n${lines.join("\n")}\nRevise the plan for them now. ${finishPlanReminder()}`, { deliverAs: "followUp" });
+          } else {
+            const f = saved.planFile ?? "the plan file";
+            ctx.ui.notify(`📋 Planning mode RESUMED — only ${f} may be written while planning is on.`, "info");
+            pi.sendUserMessage(`${planningResumeText(f)} Your task: plan these backlog items:\n${lines.join("\n")}\nRevise the plan for them now. ${finishPlanReminder()}`, { deliverAs: "followUp" });
+          }
           if (!loadSessionState(sid).planMode) {
             ctx.ui.notify("⚠️ Planning mode did NOT resume — the session-state file still says OFF. Check ~/.pi/agent/session-state/ for other writers.", "warning");
           }
@@ -371,13 +387,26 @@ export default function (pi: ExtensionAPI) {
         if (!ss.planMode) {
           // #1: fresh read-modify-write — never save a snapshot taken before the check above.
           const saved = updateSessionState(sid, s => {
-            if (!s.planFile) {
+            if (style === "tui") {
+              // #16: a console plan is a document, not a file — and it must exist the moment planning
+              // turns on (session-state.ts drops planning mode when a console plan has no document).
+              if (!s.planDoc) {
+                s.planDoc = newPlanDoc({
+                  title: `Backlog: ${lines[0] ?? "items"}`.slice(0, 80),
+                  task: `Plan these backlog items: ${lines.join("; ")}`,
+                });
+                s.planFile = null; // no pin: console mode blocks EVERY write on purpose
+              }
+              s.planStyle = "tui";
+            } else if (!s.planFile) {
               s.planFile = defaultPlanFile(ctx.cwd);
               fs.mkdirSync(path.dirname(s.planFile), { recursive: true });
+              s.planStyle = "file";
             }
             applyPlanTransition(s, "on");
           });
-          ss.planFile = saved.planFile; // the messages below quote the pinned file
+          ss.planFile = saved.planFile; // the messages below quote what is actually bound
+          ss.planDoc = saved.planDoc;
           titleFor(saved);
           justTurnedOn = true;
           // #11: belt-and-braces after flipping planning mode ON — re-read and warn
@@ -388,11 +417,19 @@ export default function (pi: ExtensionAPI) {
         } else {
           titleFor(ss); // keep the title in sync with the marker helpers (🌙/🔥 combination)
         }
-        if (justTurnedOn) {
+        if (justTurnedOn && style === "tui") {
+          ctx.ui.notify(`📋 CONSOLE plan mode ON from the backlog — the plan is a live document in the TUI (panel above the editor), not a file. /plan view edits it; /plan approve implements it.`, "info");
+          pi.sendUserMessage(
+            `${consolePlanningRulesText(consolePlanOf(loadSessionState(sid)))} ${taskList} ${finishPlanReminder()}`,
+            { deliverAs: "followUp" },
+          );
+        } else if (justTurnedOn) {
           pi.sendUserMessage(
             `${planningRulesText(ss.planFile ?? "unbound")} ${taskList} ${finishPlanReminder()}`,
             { deliverAs: "followUp" },
           );
+        } else if (style === "tui") {
+          pi.sendUserMessage(`We are already in console planning mode (${planLabel(ss)} — build on it with plan_doc, don't restart it). ${taskList}`, { deliverAs: "followUp" });
         } else {
           pi.sendUserMessage(`We are already in planning mode (pinned plan: ${ss.planFile ?? "unbound"}). ${taskList}`, { deliverAs: "followUp" });
         }

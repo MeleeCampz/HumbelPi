@@ -9,5 +9,13 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["../extensions/**/*.ts", "./test-ask-flow.ts", "./test-backlog-scroll.ts", "./test-plan-state.ts", "./test-dialog-select.ts"]
+  "include": [
+    "../extensions/**/*.ts",
+    "./test-ask-flow.ts",
+    "./test-backlog-scroll.ts",
+    "./test-plan-state.ts",
+    "./test-dialog-select.ts",
+    "./test-plan-doc.ts",
+    "./test-plan-view.ts"
+  ]
 }

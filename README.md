@@ -13,7 +13,8 @@ What you get:
   until you toggle it, on by default inside sandboxes ([yolo mode](#yolo-mode))
 - 🌙 **Unattended mode** — `/away [instruction]` keeps the agent working while you're
   away, dialogs auto-reject ([unattended mode](#unattended-mode))
-- 📋 **Planning mode** — plan first, approve via dialog, then implement with progress
+- 📋 **Planning mode** — plan first (in a plan file, or live in the TUI as a console plan),
+  approve via dialog, then implement with progress
   reporting ([planning mode](#planning-mode))
 - ✅ **Backlog** — a multi-select task checklist with plan/implement/done actions
   ([backlog](#backlog))
@@ -201,7 +202,8 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
   other pi consoles on the same machine are unaffected; resuming a session keeps its
   plan, new sessions start clean.
 - **Pause and exit** (`/plan pause`, `/plan resume`, `/plan exit` — or the matching rows
-  in the finish_plan dialog): PAUSED keeps the plan file pinned (it is still the file
+  in the finish_plan dialog): PAUSED keeps the plan (the pinned file, or the console plan
+  document — the transition table is the same for both) in play (it is still the plan
   the mode was writing, and `/plan resume` or the backlog's "Plan these" returns to that
   same plan) but drops the write guard, so you can implement a fix and come back. A paused
   console behaves like a normal one, marked `[PLAN MODE PAUSED]` in the title, footer and
@@ -221,6 +223,41 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
   or for good — is answerable at exactly the moment you are deciding about the plan.
 - Planning state also syncs into the window title, so it's visible at a glance.
 
+### Two kinds of plan: a file, or the console itself
+
+The screenshot above is **file mode** — the plan is a markdown document and the guard exists to
+protect it. **Console plan mode** (`/plan tui [task]`) is the same mode with no file at all: the
+plan is a structured document that lives in the session state, is rendered live above the editor,
+and is edited by both sides without leaving the TUI.
+
+- **Enter**: `/plan tui [task]` (or `/plan on` when the machine default is set to console mode).
+  `/plan default tui|file` decides what a bare `/plan on` means; `/plan file [task]` is the file
+  mode spelled out explicitly. Which style a plan uses is decided once per plan, not per command:
+  an existing plan keeps its style, so `/plan resume` on a paused console never resurrects a file.
+- **The plan is a checklist, not prose**: steps (with stable `#ids` that survive adds, removals and
+  reorders), plus decisions, constraints and open questions — because a plan that only says *what*
+  to do loses the two things you actually want to review: *why* it was decided that way and *what
+  is not allowed*. Steps carry a status (open / doing / done / dropped).
+- **The model writes it with the `plan_doc` tool** (add / update / status / note / reorder /
+  remove / show …). Every result returns the current plan, so the model never reasons from a stale
+  copy. In console mode the write guard blocks **every** write and every file-writing command —
+  there is no exempt file, because there is no file to protect.
+- **You edit it with `/plan view`**: an overlay editor over the live plan — ↑↓ move, `Tab` section,
+  `e`/⏎ edit a row, `a` add, `x` cycle status, `[` `]` reorder, `D` drop (and `D` again to remove —
+  one stray keystroke never erases a row), `esc` closes. Every keystroke commits immediately as an
+  operation against the session state, so the agent's `plan_doc` calls and your hand edits cannot
+  overwrite each other; when the overlay closes, the model is told exactly which rows you changed.
+- **A live panel above the editor** shows the plan and its progress while the mode is on, and it
+  re-reads the state on every frame — the panel is a view of the file, never a copy of it.
+- **Approval is the same dialog as file mode** (approve / keep planning / pause / exit), reached via
+  `finish_plan` or `/plan approve`. Approving a console plan ends planning mode but keeps the plan
+  live while it is implemented: the panel stays, each user message carries the remaining steps, and
+  the model marks steps done as it goes — so a long implementation cannot drift off the checklist
+  you approved.
+- `/plan view` also reads a plan from print/rpc mode (as plain text), and `/plan export [file]` /
+  `/plan import [file]` move a console plan to or from markdown, so the two styles are not locked
+  in: a file plan can be drafted as a file and finished as a checklist, or the other way around.
+
 ## Backlog
 
 ![Backlog checklist](imgs/Backlog.png)
@@ -231,7 +268,8 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
   esc cancels. Long items expand inline with `e` or → (word-wrapped full text);
   several can be open at once.
 - After confirming, pick an action for the selected items: **plan** (hands them to
-  planning mode), **implement**, **mark done**, or **delete** — plus bottom rows for
+  planning mode, in whichever style that console plans in — a pinned plan file or a live
+  console plan), **implement**, **mark done**, or **delete** — plus bottom rows for
   clearing completed / all entries.
 - Status markers per item: `[ ]` open, `[~]` in progress, `[x]` done (rendered dimmed).
 
@@ -330,8 +368,9 @@ no post-enter confirmation: the text is sent exactly as typed.
 ```
 extensions/
   guards.ts        sandbox + git-push guard, yolo mode, unattended mode (/away [instruction]),
-                   planning mode (/plan on [task]), per-group permission dialogs,
-                   custom footer (perf stats), title sync
+                   planning mode (/plan on [task] file mode, /plan tui [task] console mode,
+                   plan_doc tool, /plan view overlay editor, live plan panel),
+                   per-group permission dialogs, custom footer (perf stats), title sync
   backlog.ts       /backlog checklist: multi-select + actions (plan/implement/done/delete/clear)
   perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
   working-task.ts  working_task tool — model sets/clears the current task in the working indicator
@@ -351,7 +390,11 @@ extensions/
                    ansi-style.ts (ANSI-aware column styling + the shared selection color) ·
                    shift-moves.ts (the key classification both selection hosts share) ·
                    spell-words.ts (the typo rule) · plan-state.ts (planning-mode state
-                   machine: on/paused/off) · plan-file.ts · session-state.ts (state IO)
+                   machine: on/paused/off, both plan styles) · plan-file.ts ·
+                   plan-doc.ts (the console plan: a pure step/note model — operations, renderers,
+                   markdown import/export; no pi, no fs, so it is testable on its own) ·
+                   plan-view.ts (the /plan overlay editor — pi-tui-only, driven by real keystrokes
+                   in the tests) · session-state.ts (state IO)
                    notify.ts (done-notify engine)
 .githooks/pre-push   secret scan that runs on every push (this repo is public)
 bin/
@@ -364,6 +407,8 @@ tools/
   test-*.ts          regression tests — npx tsx tools/test-ask-flow.ts |
                      test-backlog-scroll.ts (needs pi's own node_modules on NODE_PATH) |
                      test-yolo.ts | test-secret-scan.ts | test-plan-state.ts |
+                     test-plan-doc.ts (the console plan model) |
+                     test-plan-view.ts (the overlay editor, driven by keystrokes) |
                      test-dialog-select.ts
   tsconfig.check.json typecheck scaffold — npx tsc -p tools/tsconfig.check.json --noEmit
                      (Windows: tools/mklink.bat first, to give node_modules the two pi packages)
