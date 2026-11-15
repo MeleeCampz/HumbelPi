@@ -16,8 +16,8 @@ What you get:
 - 📋 **Planning mode** — plan first (in a plan file, or live in the TUI as a console plan),
   approve via dialog, then implement with progress
   reporting ([planning mode](#planning-mode))
-- ✅ **Backlog** — a multi-select task checklist with plan/implement/done actions
-  ([backlog](#backlog))
+- ✅ **Backlog** — a multi-select task checklist with plan-console / plan-file /
+  implement / done actions ([backlog](#backlog))
 - 🖱️ **Shift select** — standard shift+arrow text selection with clipboard copy in the
   input editor, where pi's shift keys are dead by default ([shift select](#shift-select))
 - ✍️ **Spellcheck** — live typo highlighting while you type ([spellcheck](#spellcheck))
@@ -267,10 +267,13 @@ and is edited by both sides without leaving the TUI.
 - Navigate with ↑↓ / `j` `k`, toggle items with `x` or space, ⏎ confirms the selection,
   esc cancels. Long items expand inline with `e` or → (word-wrapped full text);
   several can be open at once.
-- After confirming, pick an action for the selected items: **plan** (hands them to
-  planning mode, in whichever style that console plans in — a pinned plan file or a live
-  console plan), **implement**, **mark done**, or **delete** — plus bottom rows for
-  clearing completed / all entries.
+- After confirming, pick an action for the selected items: **two planning rows** —
+  **📝 Plan these — console plan** (the live checklist in the TUI, edited with
+  `/plan view`) and **📝 Plan these — plan file** (pinned `.pi/PLAN.md`) — then
+  **implement**, **mark done**, or **delete**, plus bottom rows for clearing
+  completed / all entries. The row decides the style only for a plan that does not
+  exist yet: a plan already bound in this console (or paused with one) keeps its
+  style whichever row you press, and the pick just resumes/continues it.
 - Status markers per item: `[ ]` open, `[~]` in progress, `[x]` done (rendered dimmed).
 
 ## Shift select
@@ -371,7 +374,7 @@ extensions/
                    planning mode (/plan on [task] file mode, /plan tui [task] console mode,
                    plan_doc tool, /plan view overlay editor, live plan panel),
                    per-group permission dialogs, custom footer (perf stats), title sync
-  backlog.ts       /backlog checklist: multi-select + actions (plan/implement/done/delete/clear)
+  backlog.ts       /backlog checklist: multi-select + actions (plan-console/plan-file/implement/done/delete/clear)
   perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
   working-task.ts  working_task tool — model sets/clears the current task in the working indicator
                    (pi keeps the text across runs, so it is cleared when a new prompt starts one — #1)

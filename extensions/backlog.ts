@@ -27,7 +27,7 @@ import { loadSessionState, loadGuardState, updateSessionState } from "./lib/sess
 // the whole extension graph (typebox, pi-coding-agent) into test runs.
 import { defaultPlanFile } from "./lib/plan-file";
 // #16: the console plan document (pure module, same rule as plan-file: no pi, no fs).
-import { newPlanDoc } from "./lib/plan-doc";
+import { newPlanDoc, type PlanStyle } from "./lib/plan-doc";
 // #9: planning mode is a state machine (ON / PAUSED / OFF) owned by guards.ts; the backlog
 // row follows the SAME transition table so the two entry points cannot disagree about what
 // "plan these" means in a paused session. Title/footer markers come from the same helpers.
@@ -170,7 +170,7 @@ function markerLabel(m: Marker): string {
 
 const USAGE = `📋 Backlog usage:
   /backlog <idea>      add an item
-  /backlog             checklist → select items (plan / implement / done / delete)
+  /backlog             checklist → select items (plan-console / plan-file / implement / done / delete)
                          ← collapse / → expand item (e toggles) · bottom rows: clear completed · clear all`;
 
 // ── Checklist component (shown via ctx.ui.custom) ───────────────────────
@@ -344,7 +344,7 @@ export default function (pi: ExtensionAPI) {
         );
       };
 
-      const doPlan = async (nums: number[]): Promise<void> => {
+      const doPlan = async (nums: number[], forcedStyle?: PlanStyle): Promise<void> => {
         const lines = nums.map(entryRefLine);
         const sid = ctx.sessionManager.getSessionId();
         const ss = loadSessionState(sid);
@@ -353,10 +353,20 @@ export default function (pi: ExtensionAPI) {
           const marker = planTitleMarker(state) || "📋 PLAN";
           ctx.ui.setTitle(`${marker} — pi — ${path.basename(ctx.cwd) || "pi"}`);
         };
-        // #16: which STYLE this console plans in — the same helper /plan on uses, so a backlog row can
-        // never decide it differently. An existing plan's style wins; the machine default
-        // (/plan default tui|file) is consulted only when nothing is planned anywhere.
-        const style = planStyleForNewPlan(ss, loadGuardState().planStyleDefault);
+        // #16: which STYLE this console plans in. The backlog offers BOTH rows explicitly
+        // (console plan / plan file), so a forced style from the picked row wins over the machine
+        // default (/plan default tui|file). But a plan already BOUND in this console always wins:
+        // a console plan cannot be silently re-pinned to a file, or a pinned file to a console plan
+        // (same rule planStyleForNewPlan states for /plan on).
+        const boundStyle: PlanStyle | undefined =
+          (ss.planDoc ?? null) !== null ? "tui" : ss.planFile ? "file" : undefined;
+        if (forcedStyle && boundStyle && forcedStyle !== boundStyle) {
+          ctx.ui.notify(
+            `📋 This console already has a ${boundStyle === "tui" ? "console plan" : "pinned plan file"} — staying with it. /plan exit leaves it first if you want the ${forcedStyle === "tui" ? "console" : "file"} style instead.`,
+            "warning",
+          );
+        }
+        const style: PlanStyle = boundStyle ?? forcedStyle ?? planStyleForNewPlan(ss, loadGuardState().planStyleDefault);
 
         // #9: PAUSED means "the plan is waiting, side work is allowed". Selecting backlog items
         // for planning is an unambiguous request to bring that plan back — resume the SAME plan
@@ -475,7 +485,7 @@ export default function (pi: ExtensionAPI) {
 
         const action = await ctx.ui.select(
           `📋 Action on ${selected.map((n) => `#${n}`).join(", ")}`,
-          ["📝 Plan these — enters planning mode", "⚡ Implement these now", "✅ Mark done", "🗑️ Delete"],
+          ["📝 Plan these — console plan (live in the TUI)", "📝 Plan these — plan file (.pi/PLAN.md)", "⚡ Implement these now", "✅ Mark done", "🗑️ Delete"],
         );
         if (!action) return;
 
@@ -484,9 +494,12 @@ export default function (pi: ExtensionAPI) {
           // #9: in a PAUSED session this row RESUMES the pinned plan (see doPlan). Pausing and
           // exiting live in /plan and in the finish_plan approval dialog — this row keeps meaning
           // "start/keep planning", because it is the reflex answer for "these items, please plan".
+          // #16: the row picked here also picks the STYLE for a plan that does not exist yet;
+          // a bound plan keeps its style no matter which of the two rows was used.
+          const forced: PlanStyle = action.includes("console") ? "tui" : "file";
           const mark = setMarkers(file, selected, "~");
           if (mark.changed > 0) ctx.ui.notify(`🔧 Marked ${mark.changed} item(s) working`, "info");
-          await doPlan(selected);
+          await doPlan(selected, forced);
         } else if (action.includes("Implement")) {
           const mark = setMarkers(file, selected, "~");
           if (mark.changed > 0) ctx.ui.notify(`🔧 Marked ${mark.changed} item(s) working`, "info");
