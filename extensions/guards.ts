@@ -76,8 +76,8 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
-import { visibleWidth, truncateToWidth } from "@earendil-works/pi-tui";
-import { askWithOther } from "./lib/ask-flow";
+import { visibleWidth, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { askWithOther, type AskOutcome } from "./lib/ask-flow";
 // #12/#13: the plan-file location is shared with backlog.ts via a dependency-free
 // lib module (keeps the extension import graph light for tests).
 import { defaultPlanFile } from "./lib/plan-file";
@@ -88,18 +88,24 @@ import {
 	consolePlanOf,
 	consolePlanningRulesText,
 	finishPlanReminder,
+	bindConsolePlanForStart,
+	planCompletedOf,
 	planExecutingFrame,
 	planExecutingOf,
+	planFinishedOf,
 	planFooterMarker,
 	planFlagOf,
 	planGuardArmed,
 	planLabel,
 	planPausedFrame,
+	planPanelVisibleOf,
+	planRetiredOf,
 	planStatusLine,
 	planStyleForNewPlan,
 	planStyleOf,
 	planTitleMarker,
 	planTransition,
+	retiredPlanOf,
 	planningPausedSteer,
 	planningExitedSteer,
 	planningResumeText,
@@ -428,6 +434,12 @@ const PLAN_APPROVE = "✅ Approve & implement";
 const PLAN_KEEP = "✏️ Keep planning";
 const PLAN_PAUSE = "⏸ Pause planning (side task)";
 const PLAN_EXIT = "🚪 Exit planning (keep plan)";
+// #16: the fifth row of the CONSOLE approval dialog. It is the answer to "the approval popup gives no
+// real chance to review the plan": the preview inside a select list is 14 truncated lines, which is a
+// summary of a checklist, not a review. This row opens the full /plan view overlay (wrapped text,
+// paging, the whole document) and then re-asks — so reviewing never costs you the dialog.
+// It is deliberately NOT one of the four outcome strings: it implements nothing and changes no mode.
+const PLAN_REVIEW = "👀 Review the full plan first";
 
 /**
  * #1: belt-and-braces after an approval path flips planning mode off — re-read the
@@ -457,19 +469,57 @@ function verifyPlanFlag(ctx: ExtensionContext, sid: string, expected: PlanFlag):
 let planPanelSignature: string | null = null;
 
 /**
+ * #18: settle a plan that has finished. One call site does everything: the frame stops, the panel is
+ * removed, the 📋▶ title/footer markers drop, and the user is told once.
+ *
+ * The idempotence mechanism is the flag itself: `planExecuting` is cleared here, so the next call
+ * reads `planExecutingOf() === false` and there is nothing left to announce — no per-frame check,
+ * no timer, no "did I already notify about this" bookkeeping to keep in sync. The DOCUMENT is kept
+ * (the user chose "windows close, document stays"), so /plan view, /plan status and plan_doc
+ * action=show still read a finished plan; only its live surfaces go away.
+ *
+ * Returns true when this call is the one that closed the plan.
+ */
+function settleFinishedPlan(ctx: ExtensionContext): boolean {
+	const sid = ctx.sessionManager.getSessionId();
+	const ss = loadSessionState(sid);
+	if (!planFinishedOf(ss)) return false;
+	const doc = consolePlanOf(ss)!;
+	const p = planProgress(doc);
+	updateSessionState(sid, s => { s.planExecuting = false; });
+	applyTitle(ctx);
+	if (ctx.hasUI) {
+		ctx.ui.notify(
+			`✅ Plan complete — ${p.done}/${p.total} done${p.dropped ? `, ${p.dropped} dropped` : ""}. Its panel, frame and title markers are gone; /plan view still reads the finished plan, /plan tui starts a new one.`,
+			"info",
+		);
+	}
+	return true;
+}
+
+/**
  * Show/hide the console-plan panel. Called on every planning transition this extension performs
  * (and once per session_start); the component itself does the live reading, so a missed call can
  * only delay the panel's appearance, never show a stale plan.
  */
 function refreshPlanPanel(ctx: ExtensionContext): void {
+	// #18: checked here because this runs after every planning transition, every plan_doc call and
+	// every /plan view close — the three ways a plan can reach its last step. BEFORE the hasUI guard:
+	// settling is a state change, and a print/rpc session should not keep saying "implementing" either
+	// (it just cannot show the user the notice).
+	settleFinishedPlan(ctx);
 	if (!ctx.hasUI) return;
 	const sid = ctx.sessionManager.getSessionId();
 	const ss = loadSessionState(sid);
 	const doc = consolePlanOf(ss);
-	const sig = doc ? `${sid}|${planSignature(doc)}|${planFlagOf(ss)}|${planExecutingOf(ss)}` : "none";
+	// #18: visibility is part of the signature, so a plan that FINISHES re-runs this function and the
+	// widget is actually removed — without it the sig change would re-register the same panel and the
+	// window would outlive the plan it belongs to.
+	const visible = planPanelVisibleOf(ss);
+	const sig = doc && visible ? `${sid}|${planSignature(doc)}|${planFlagOf(ss)}|${planExecutingOf(ss)}` : "none";
 	if (sig === planPanelSignature) return;
 	planPanelSignature = sig;
-	if (!doc) {
+	if (!doc || !visible) {
 		ctx.ui.setWidget("plan-panel", undefined);
 		return;
 	}
@@ -495,6 +545,13 @@ function refreshPlanPanel(ctx: ExtensionContext): void {
 				width,
 				maxRows: budget,
 				cursor: null,
+				// #16: the window follows the work. Implementing → the step in progress; drafting → the
+				// newest row, because that is where plan_doc is adding; a kept/exited plan → from the top.
+				anchor: planExecutingOf(cur) ? "active" : cur.planMode || cur.planPaused ? "newest" : "top",
+				// #17: only when the user asked for it (/plan wrap on) — a wrapped row costs several rows of
+				// this panel's small budget, so it is a preference and not the default.
+				wrap: loadGuardState().planWrap === true,
+				wrapText: (t, w) => wrapTextWithAnsi(t, w),
 				hint,
 				theme,
 			}).lines.map((l: string) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
@@ -901,7 +958,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── /plan command ──
 	pi.registerCommand("plan", {
-		description: "Planning mode: /plan on|tui|file [task] | pause | resume | off | exit | approve [file] | implement <file> | reject [reason] | view | import <file> | export [file] | default file|tui",
+		description: "Planning mode: /plan on|tui|file [task] | pause | resume | off | exit | approve [file] | implement <file> | reject [reason] | view | import <file> | export [file] | default file|tui | wrap on|off",
 		handler: async (args, ctx) => {
 			const sid = ctx.sessionManager.getSessionId();
 			const ss = loadSessionState(sid);
@@ -922,14 +979,28 @@ export default function (pi: ExtensionAPI) {
 			 */
 			const startPlanning = (style: PlanStyle, task: string): void => {
 				const resumed = planFlagOf(ss) === "paused";
+				// #22: the finished plan this start archived, if any — reported after the write lands.
+				// A holder object, not a plain let: TypeScript narrows a `let x: T | null = null` that is only
+				// assigned inside a callback back to `null` at the read site.
+				const retired: { doc: PlanDoc | null } = { doc: null };
 				const saved = updateSessionState(sid, s => {
-					applyPlanTransition(s, "on");
 					s.planStyle = style;
+					// #22: bind BEFORE the transition, because the bind rule reads the CURRENT flag: a paused
+					// console keeps the plan it suspended (resume never retires, whatever the step statuses
+					// say), and only a FRESH start may retire the finished checklist it found.
+					const bound = style === "tui"
+						? bindConsolePlanForStart(s, { task, title: task.slice(0, 80) })
+						: null;
+					applyPlanTransition(s, "on");
 					if (style === "tui") {
 						// Console mode binds a document immediately, even with no task: session-state.ts reads
 						// "tui style but no document" as a broken plan and drops planning mode, so an empty
 						// /plan tui must still have something to draft into.
-						if (!s.planDoc) s.planDoc = newPlanDoc({ task, title: task.slice(0, 80) });
+						s.planDoc = bound!.doc;
+						if (bound!.retired) {
+							s.planDocPrevious = bound!.retired;
+							retired.doc = bound!.retired;
+						}
 						s.planFile = null; // no pin: in console mode there is no exempt file, on purpose
 					} else if (!s.planFile) {
 						s.planFile = defaultPlanFile(ctx.cwd);
@@ -942,11 +1013,29 @@ export default function (pi: ExtensionAPI) {
 				verifyPlanFlag(ctx, sid, "on"); // #1/#9 mirror of the ON side (backlog #11)
 				refreshPlanPanel(ctx); // #16: the console-plan panel appears together with the plan
 				if (style === "tui") {
+					// #22: say out loud what happened to the plan that was sitting here when you got back — in the
+					// SAME status line as the mode message. An info notify is ONE status slot: a second one landing
+					// in the same tick gets no frame of its own (the press test watched the mode message appear and
+					// the retirement vanish before the model's turn even started). The retirement is the surprising
+					// half, so it rides along instead of competing for the slot.
+					// #22: say what happened to the plan that was sitting here. It goes in the transcript
+					// message (durable, and it reads the same to the human and to the model) rather than only
+					// in a status line: a status painted just before the console starts its agent turn can be
+					// cleared before it ever gets a frame — press s watched the FIRST start's status paint and
+					// this one vanish. The model also needs the fact: the retired checklist is not this plan.
+					const retiredLine = retired.doc
+						? `🗂 The plan previously planned in this console ("${retired.doc.title || "untitled"}", ${planProgress(retired.doc).done}/${planProgress(retired.doc).total} steps settled) has been RETIRED so this one starts fresh. It is archived, not this plan: you cannot reach it with plan_doc, and I can read it with /plan view last or save it with /plan export last.`
+						: "";
+					// No separate notify for it: measured in press s, a status line raised here never gets a
+					// frame (the console is about to start its turn), so a second message would be dead code
+					// that looks like it works. The fact is in the transcript line below, and /plan status
+					// repeats it.
 					ctx.ui.notify(resumed
 						? `📋 Console planning RESUMED — ${planLabel(saved)}. Writes are blocked again. /plan view to edit the plan by hand.`
 						: `📋 CONSOLE plan mode ON — the plan lives here in the TUI (a live panel above the editor), not in a file. Reads/search stay free, every write is blocked. /plan view edits it; /plan approve implements it.`, "info");
 					pi.sendUserMessage(
-						`${consolePlanningRulesText(saved.planDoc ?? null, { resumed, task: task || undefined })} ${finishPlanReminder()}`,
+						// The retirement sentence leads: it is the surprising part of this start.
+						`${retiredLine}${consolePlanningRulesText(saved.planDoc ?? null, { resumed, task: task || undefined })} ${finishPlanReminder()}`,
 						{ deliverAs: "followUp" },
 					);
 					return;
@@ -976,6 +1065,8 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(
 						[
 							`Planning mode: ${planStatusLine(ss)}`,
+							// #22: the archive is named where you would otherwise wonder about it.
+							...(retiredPlanOf(ss) ? (() => { const r = retiredPlanOf(ss)!; const p = planProgress(r); return [`Archived plan: "${r.title || "untitled"}" (${p.done}/${p.total} settled) — /plan view last reads it, /plan export last [file] saves it.`]; })() : []),
 							`state file: ${file}`,
 							raw,
 						].join("\n"),
@@ -1040,9 +1131,16 @@ export default function (pi: ExtensionAPI) {
 				// point of console plan mode: no external editor, no file, no copy/paste round trip.
 				case "view":
 				case "edit":
-				case "show":
+				case "show": {
+					// #22: `/plan view last` reads the RETIRED plan — the finished checklist that was moved aside
+					// when a new plan started. Read-only, and it steers nothing on close: a viewer changed nothing.
+					if (/^(last|previous|prev|archived)$/i.test(target.trim())) {
+						await openConsolePlanViewer(sid, ctx, ss, { retired: true });
+						break;
+					}
 					await openConsoleEditor(sid, ctx, ss);
 					break;
+				}
 
 				// #16: the bridge between the two styles. An old .md plan becomes an editable console plan;
 				// a console plan can be published as a document when someone wants it in the repo.
@@ -1064,12 +1162,19 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "export": {
-					const doc = consolePlanOf(ss);
+					// #22: `/plan export last [file]` writes the ARCHIVED plan. The keyword is positional, so a file
+					// genuinely named "last" is addressed as ./last.
+					const exportArgs = target.trim().split(/\s+/);
+					const exportLast = /^(last|previous|prev|archived)$/i.test(exportArgs[0] ?? "");
+					const exportFile = (exportLast ? exportArgs.slice(1).join(" ") : target).trim();
+					const doc = exportLast ? retiredPlanOf(ss) : consolePlanOf(ss);
 					if (!doc) {
-						ctx.ui.notify("Nothing to export — no console plan in this console (/plan view shows what is planned).", "warning");
+						ctx.ui.notify(exportLast
+							? "Nothing to export — this console has no archived plan yet. A plan finishes, you start a new one, and the finished checklist moves to /plan view last."
+							: "Nothing to export — no console plan in this console (/plan view shows what is planned).", "warning");
 						break;
 					}
-					const file = target ? path.resolve(ctx.cwd, target) : defaultPlanFile(ctx.cwd);
+					const file = path.resolve(ctx.cwd, exportFile || (exportLast ? ".pi/PLAN-archived.md" : defaultPlanFile(ctx.cwd)));
 					try {
 						fs.mkdirSync(path.dirname(file), { recursive: true });
 						fs.writeFileSync(file, planDocToMarkdown(doc), "utf8");
@@ -1077,7 +1182,36 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`Export failed: ${e instanceof Error ? e.message : String(e)}`, "error");
 						break;
 					}
-					ctx.ui.notify(`📤 Console plan written to ${file} (${doc.steps.length} steps). The plan FILE is not bound — the console plan stays authoritative in this console.`, "info");
+					ctx.ui.notify(exportLast
+						? `📤 Archived plan "${doc.title || "untitled"}" written to ${file} (${doc.steps.length} steps). The archive itself stays read-only here — /plan view last still reads it.`
+						: `📤 Console plan written to ${file} (${doc.steps.length} steps). The plan FILE is not bound — the console plan stays authoritative in this console.`, "info");
+					break;
+				}
+
+				// #17: expanded step texts in the live panel (machine-global, like /plan default).
+				// The panel takes no keystrokes — it is a widget, not a focusable component — so this command
+				// is its only switch. The /plan view overlay has its own `w` key for the same question.
+				case "wrap": {
+					const want = (rest[0] ?? "").toLowerCase();
+					const cur = loadGuardState().planWrap;
+					if (want === "status" || want === "") {
+						ctx.ui.notify(cur === undefined
+							? "📋 /plan wrap is unset: the live panel TRUNCATES long step lines, /plan view WRAPS them. Set it: /plan wrap on|off. Inside /plan view, `w` toggles it for that overlay only."
+							: `📋 /plan wrap is ${cur ? "ON — the panel shows long steps wrapped over several rows" : "OFF — the panel truncates them to one row"}. Inside /plan view, \`w\` toggles it for that overlay only.`, "info");
+						break;
+					}
+					if (want !== "on" && want !== "off") {
+						ctx.ui.notify("Usage: /plan wrap on|off|status", "warning");
+						break;
+					}
+					updateGuardState(s => { s.planWrap = want === "on"; });
+					// The panel re-reads state every frame, but its signature does not include this setting,
+					// so an already-registered panel would keep painting with the old wrap flag.
+					planPanelSignature = null;
+					refreshPlanPanel(ctx);
+					ctx.ui.notify(want === "on"
+						? "📋 Panel lines expanded — long steps wrap over several rows (the panel shows fewer steps at once; the active step stays visible)."
+						: "📋 Panel lines compact — long steps are truncated to one row again. /plan view still wraps them (w flips it there).", "info");
 					break;
 				}
 
@@ -1227,7 +1361,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				default:
-					ctx.ui.notify("Usage: /plan on [task] | tui [task] | file [task] | pause | resume | off | exit | approve [file] | implement <file> | reject [reason] | view | import [file] | export [file] | default file|tui", "warning");
+					ctx.ui.notify("Usage: /plan on [task] | tui [task] | file [task] | pause | resume | off | exit | approve [file] | implement <file> | reject [reason] | view | import [file] | export [file] | default file|tui | wrap on|off", "warning");
 			}
 		},
 	});
@@ -1245,21 +1379,55 @@ export default function (pi: ExtensionAPI) {
 	 * model that keeps reasoning about a step the user just deleted is worse than no editor at all.
 	 */
 	async function openConsoleEditor(sid: string, ctx: ExtensionContext, ss: SessionState): Promise<void> {
-		const doc = consolePlanOf(ss);
+		const closed = await openConsolePlanViewer(sid, ctx, ss);
+		if (!closed) return;
+		// The model is told because a model that keeps reasoning about a step the user just deleted is
+		// worse than no editor at all. #8: the closing rule depends on WHICH mode the console is in —
+		// /plan view also works during implementation, and telling a model mid-implementation that it may
+		// not implement anything would stall the very plan the user is editing.
+		if (closed.edits > 0) {
+			const cur = loadSessionState(sid);
+			const tail = planExecutingOf(cur)
+				? "This plan is APPROVED and being implemented: re-read it with plan_doc action=show and keep going with the rows as they now are (a step the user re-opened is work to do)."
+				: "Planning mode is still ON — do NOT implement anything.";
+			reportPlanEdits(ctx, closed, tail);
+		}
+	}
+
+	/**
+	 * Open the full plan overlay on the live document and return what the user changed.
+	 *
+	 * Split out of /plan view (#8) because the approval dialog needs the same screen for a different
+	 * reason: reviewing a plan before approving it. Only the CALLER decides whether the edits become a
+	 * "you changed the plan, don't implement yet" steer or the instruction the implementation starts
+	 * from, so this function never sends a message of its own.
+	 *
+	 * Returns null when nothing could be opened (no plan bound, or no real TUI — those paths notify).
+	 */
+	async function openConsolePlanViewer(sid: string, ctx: ExtensionContext, ss: SessionState, view: { retired?: boolean } = {}): Promise<PlanEditorClose | null> {
+		// #22: two documents, one viewer. Without `retired` this is the live plan (editable, and its edits
+		// are reported to the model by the caller). With it, it is the ARCHIVED plan: read-only, and the
+		// host's apply refuses instead of writing — a viewer must not be able to touch the checklist of a
+		// plan that already ran, and it must never touch the live plan behind it.
+		const archived = view.retired === true;
+		const doc = archived ? retiredPlanOf(ss) : consolePlanOf(ss);
 		if (!doc) {
-			ctx.ui.notify("No console plan in this console. /plan tui [task] starts one; /plan status shows a pinned plan file.", "warning");
-			return;
+			ctx.ui.notify(archived
+				? "No archived plan in this console yet. A finished plan is archived when you start planning again — /plan status shows what is archived."
+				: "No console plan in this console. /plan tui [task] starts one; /plan status shows a pinned plan file.", "warning");
+			return null;
 		}
 		if (!ctx.hasUI || typeof ctx.ui.custom !== "function") {
 			// print / rpc mode: the same document as plain text rather than a dead key handler.
-			ctx.ui.notify(planPlainLines(doc).join("\n"), "info");
-			return;
+			ctx.ui.notify((archived ? ["🗂 archived plan (read-only — /plan export last [file] saves it as markdown)"] : []).concat(planPlainLines(doc)).join("\n"), "info");
+			return null;
 		}
 		const closed = await ctx.ui.custom<PlanEditorClose>(
 			(_tui, theme, _kb, done) => createPlanEditor(
 				{
-					getDoc: () => consolePlanOf(loadSessionState(sid)),
+					getDoc: () => archived ? retiredPlanOf(loadSessionState(sid)) : consolePlanOf(loadSessionState(sid)),
 					apply: (op) => {
+						if (archived) return { ok: false, doc, log: "an archived plan is read-only", reason: "read-only" };
 						// Read-modify-write against the CURRENT document: the agent can land a plan_doc call
 						// between two keystrokes, and writing a snapshot back would roll that call over — the
 						// same rule every other state write in these extensions follows.
@@ -1275,14 +1443,22 @@ export default function (pi: ExtensionAPI) {
 				},
 				theme as { fg(color: string, text: string): string },
 				done,
+				// #17: the overlay reads the same preference, but the OTHER way round — unset means wrap
+				// here, because opening /plan view is a decision to read the plan properly.
+				{ wrap: loadGuardState().planWrap ?? true, readOnly: archived },
 			),
 		);
 		refreshPlanPanel(ctx);
-		if (!closed || closed.edits === 0) return;
+		return closed ?? null;
+	}
+
+	/** The one place a user's hand-edits are reported to the model. `tail` is the rule that differs
+	 *  per caller: still-planning vs. approved-and-now-implementing. */
+	function reportPlanEdits(ctx: ExtensionContext, closed: PlanEditorClose, tail: string): void {
 		const text = [
-			`PLAN EDITED BY THE USER in /plan view (console plan — these are the rows they changed; the plan on disk is authoritative now):`,
+			`PLAN EDITED BY THE USER in the plan viewer (console plan — these are the rows they changed; the plan on disk is authoritative now):`,
 			...closed.summary.map((l) => `  - ${l}`),
-			`Do not work from the copy you drafted earlier: plan_doc action=show re-reads the current plan. Planning mode is still ON — do NOT implement anything.`,
+			`Do not work from the copy you drafted earlier: plan_doc action=show re-reads the current plan. ${tail}`,
 		].join("\n");
 		pi.sendUserMessage(text, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
 	}
@@ -1302,28 +1478,47 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(planPlainLines(doc).join("\n"), "info");
 			return "No interactive UI available to run the approval dialog. The plan stays UNAPPROVED — do NOT implement. The user can run /plan approve in the TUI.";
 		}
-		const p = planProgress(doc);
-		// Short preview: the approval dialog is a select list, not a document viewer — the full plan is
-		// already on screen in the panel and in /plan view.
-		const preview = renderPlanText(doc, { heading: "PLAN", compact: true, maxSteps: 14 });
-		const outcome = await askWithOther(ctx, {
-			question: `📋 Console plan ready — approve?\n\n${summary}\n\n${preview}\n\n${p.total} step(s) total — /plan view shows every row and lets you edit them before approving.`,
-			options: [PLAN_APPROVE, PLAN_KEEP, PLAN_PAUSE, PLAN_EXIT],
-			otherLabel: PLAN_KEEP,
-			answerTitle: "✏️ What should change in the plan?",
-			answerPlaceholder: "e.g. drop step 3, split step 5, use SQLite instead of JSON…",
-			backLabel: "back to Approve / Keep planning / Pause / Exit",
-		});
+		// #16: the approval popup was the complaint — a 14-line preview inside a select list is a summary,
+		// not a review. 👀 opens the SAME full-screen plan the /plan view command opens (every row, wrapped,
+		// pageable, editable) and then this dialog re-appears over whatever the user changed. The four
+		// outcome strings are untouched, so "only Approve implements" and the press scenarios still hold.
+		let current = doc;
+		const reviewedEdits: string[] = [];
+		let outcome: AskOutcome;
+		for (;;) {
+			const p = planProgress(current);
+			const preview = renderPlanText(current, { heading: "PLAN", compact: true, maxSteps: 14 });
+			outcome = await askWithOther(ctx, {
+				question: `📋 Console plan ready — approve?\n\n${summary}\n\n${preview}\n\n${p.total} step(s) total${reviewedEdits.length ? ` · ${reviewedEdits.length} row(s) you changed while reviewing` : ""} — 👀 opens the whole plan (PgUp/PgDn page it, w wraps long rows, e edits one) and returns here.`,
+				options: [PLAN_APPROVE, PLAN_KEEP, PLAN_PAUSE, PLAN_EXIT, PLAN_REVIEW],
+				otherLabel: PLAN_KEEP,
+				answerTitle: "✏️ What should change in the plan?",
+				answerPlaceholder: "e.g. drop step 3, split step 5, use SQLite instead of JSON…",
+				backLabel: "back to Approve / Keep planning / Pause / Exit",
+			});
+			if (!(outcome.kind === "option" && outcome.text === PLAN_REVIEW)) break;
+			const closed = await openConsolePlanViewer(sid, ctx, loadSessionState(sid));
+			if (closed && closed.edits > 0) reviewedEdits.push(...closed.summary);
+			// The review is the CURRENT document, not the one drafted earlier: a user who drops step 3 here
+			// must not be able to approve a plan that still lists it.
+			current = consolePlanOf(loadSessionState(sid)) ?? current;
+		}
 		if (outcome.kind === "option" && outcome.text === PLAN_APPROVE) {
 			const saved = updateSessionState(sid, s => { applyPlanTransition(s, "approve"); });
 			verifyPlanFlag(ctx, sid, "off");
 			applyTitle(ctx);
 			refreshPlanPanel(ctx);
-			const rem = planProgress(saved.planDoc ?? doc).remaining.length;
+			const approved = saved.planDoc ?? current;
+			const rem = planProgress(approved).remaining.length;
 			ctx.ui.notify(`✅ Console plan approved — implementing ${rem} remaining step(s). Live progress in the panel above the editor.`, "info");
 			// Same as the file mode (#10): the instruction goes into the tool result so the model
 			// implements in the SAME turn instead of getting a stale queued duplicate later.
-			return implementationInstructionFromDoc(saved.planDoc ?? doc);
+			// #8: rows the user hand-edited DURING the review ride along with it — they are already in the
+			// plan above, but naming them is what stops the model treating them as noise to re-litigate.
+			const instruction = implementationInstructionFromDoc(approved);
+			return reviewedEdits.length
+				? `${instruction}\n\nRows the USER changed while reviewing this plan (already reflected above — do not re-argue them):\n${reviewedEdits.map((l) => `  - ${l}`).join("\n")}`
+				: instruction;
 		}
 		if (outcome.kind === "option" && outcome.text === PLAN_PAUSE) {
 			updateSessionState(sid, s => { applyPlanTransition(s, "pause"); });
@@ -1415,23 +1610,38 @@ export default function (pi: ExtensionAPI) {
 			if (planStyleOf(ss) !== "tui") {
 				return { content: [{ type: "text", text: `plan_doc only exists in CONSOLE plan mode. This console plans with a pinned file (${ss.planFile ?? "unbound"}) — write the plan there, or /plan exit and then /plan tui [task].` }], details: undefined };
 			}
-			if (!planGuardArmed(ss) && !planExecutingOf(ss)) {
-				return { content: [{ type: "text", text: `Console planning is not ON in this console — ${planStatusLine(ss)}` }], details: undefined };
-			}
 			const doc = consolePlanOf(ss);
 			if (!doc) return { content: [{ type: "text", text: "No console plan document is bound — run /plan tui [task] to create one." }], details: undefined };
+			// #18: reading a finished plan is always allowed. Once its steps are all settled the console is
+			// not planning and not implementing any more, but "what was the plan" is a fair question — and
+			// the human has the same read in /plan view.
 			if (params.action === "show") return { content: [{ type: "text", text: renderPlanText(doc) }], details: undefined };
+			if (!planGuardArmed(ss) && !planExecutingOf(ss)) {
+				return { content: [{ type: "text", text: `Console planning is not ON in this console — ${planStatusLine(ss)} Only "show" still works on a kept plan. To work on it again: /plan tui [task].` }], details: undefined };
+			}
 			const op = planOpFromParams(params);
 			if (!op) return { content: [{ type: "text", text: `plan_doc action=${params.action} is missing a required field (id for step ops, text for add/note/editNote, kind+index for note ops, title or task for set).\n\n${renderPlanText(doc)}` }], details: undefined };
+			// #22: a reset that would WIPE A FINISHED PLAN archives it instead of dropping it — the human can
+			// still read it with /plan view last. Clearing a half-drafted plan is not archeworthy: that is a
+			// draft the model just decided to throw away, and the archive is for completed work only.
+			const archiveOnReset = op.action === "reset" && planRetiredOf(ss) ? doc : null;
 			let res: PlanOpResult | null = null;
 			updateSessionState(sid, s => {
 				const r = applyPlanOp(s.planDoc ?? doc, op);
 				res = r;
-				if (r.ok) { s.planDoc = r.doc; s.planStyle = "tui"; }
+				if (r.ok) {
+					s.planDoc = r.doc;
+					s.planStyle = "tui";
+					if (archiveOnReset) s.planDocPrevious = archiveOnReset;
+				}
 			});
 			const out = res as PlanOpResult | null;
 			if (!out) return { content: [{ type: "text", text: `plan_doc ${params.action}: the state write failed.\n\n${renderPlanText(doc)}` }], details: undefined };
 			refreshPlanPanel(ctx);
+			if (archiveOnReset && out.ok) {
+				const p = planProgress(archiveOnReset);
+				ctx.ui.notify(`🗂 plan_doc reset archived the finished plan "${archiveOnReset.title || "untitled"}" (${p.done}/${p.total} steps) instead of dropping it — /plan view last reads it, /plan export last [file] saves it.`, "info");
+			}
 			if (!out.ok) return { content: [{ type: "text", text: `plan_doc ${params.action} failed: ${out.reason ?? out.log}\n\n${renderPlanText(out.doc)}` }], details: undefined };
 			return { content: [{ type: "text", text: `${out.log}\n\n${renderPlanText(out.doc)}` }], details: undefined };
 		},

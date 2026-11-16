@@ -430,12 +430,60 @@ export function renderPlanText(doc: PlanDoc, opts: { heading?: string; compact?:
 	return lines.join("\n");
 }
 
+/**
+ * #16: the row a panel should be showing RIGHT NOW.
+ *
+ *   implementing  the step in progress (◐), else the next one to do (○), else the last row
+ *                 (a fully-done plan still has a "here is where you stopped" row)
+ *   planning      the newest step — see planNewestIndex
+ *
+ * WHY THE ACTIVE ROW AND NOT THE TOP OF THE LIST: a 30-step plan in a 12-row panel used to
+ * always render #1..#N, so when the agent was on step #22 the panel showed only finished rows and
+ * the reader had to do the arithmetic. The window follows the work instead (#16).
+ */
+export function planActiveIndex(doc: PlanDoc): number {
+	if (doc.steps.length === 0) return -1;
+	const doing = doc.steps.findIndex((s) => s.status === "doing");
+	if (doing >= 0) return doing;
+	const open = doc.steps.findIndex((s) => s.status === "open");
+	if (open >= 0) return open;
+	return doc.steps.length - 1;
+}
+
+/** #16: the row a DRAFTING panel follows — the last one added, which is where the action is. */
+export function planNewestIndex(doc: PlanDoc): number {
+	return doc.steps.length - 1;
+}
+
+/**
+ * Which row the window is anchored on when there is no overlay cursor to follow.
+ *   "top"    the old behaviour (first row first) — the default, so nothing changes unasked
+ *   "active" planActiveIndex — while a plan is being implemented
+ *   "newest" planNewestIndex — while a plan is being drafted
+ *   number   an explicit row index
+ */
+export type PlanAnchor = "top" | "active" | "newest" | number;
+
 export interface PlanLineOptions {
 	width: number;
 	/** Hard cap on rendered rows (the widget/overlay height budget). */
 	maxRows: number;
 	/** Row index (into the step list) hovered by the overlay cursor, if any. */
 	cursor?: number | null;
+	/** #16: what to anchor the window on when `cursor` is absent (default "top"). */
+	anchor?: PlanAnchor;
+	/**
+	 * #17: show long step texts in FULL by wrapping them over several rows instead of cutting them
+	 * at the terminal width. Wrapped rows are counted against `maxRows` like any other row, so
+	 * wrapping can never make the panel taller than the budget — it trades other steps for text.
+	 */
+	wrap?: boolean;
+	/**
+	 * The wrapping function, supplied by the host. pi-tui's `wrapTextWithAnsi` is what the real
+	 * callers pass; this module must not import it (see the header), so the default here is a plain
+	 * word wrap and the injected version is what decides the real terminal's behaviour.
+	 */
+	wrapText?: (text: string, width: number) => string[];
 	/** Show the decisions/constraints/open-questions blocks. */
 	notes?: boolean;
 	/** Prefix for each step row (the overlay uses "❯ " for the hovered row). */
@@ -449,6 +497,8 @@ export interface PlanLines {
 	lines: string[];
 	hiddenAbove: number;
 	hiddenBelow: number;
+	/** #16: the row the window was anchored on (null when the plan has no steps). */
+	activeIndex: number | null;
 }
 
 /**
@@ -464,8 +514,21 @@ export function planWidgetLines(doc: PlanDoc, o: PlanLineOptions): PlanLines {
 	const p = planProgress(doc);
 	const idWidth = Math.max(2, String(doc.steps.reduce((m, s) => Math.max(m, s.id), 0)).length);
 
+	// ── which row the window follows (cursor wins: a human pointing at a row outranks any rule) ──
+	const anchorWanted = o.anchor ?? "top";
+	const focusRaw = cursor !== null
+		? cursor
+		: anchorWanted === "active" ? planActiveIndex(doc)
+			: anchorWanted === "newest" ? planNewestIndex(doc)
+				: typeof anchorWanted === "number" ? anchorWanted
+					: 0;
+	const focus = doc.steps.length ? Math.min(Math.max(0, focusRaw), doc.steps.length - 1) : -1;
+	const focusStep = focus >= 0 ? doc.steps[focus] : undefined;
+
 	const statusTag = p.doing > 0 ? `${p.done}/${p.total} · ◐ ${p.doing}` : `${p.done}/${p.total}`;
-	const headText = `📋 console plan — ${doc.title || "(untitled)"} · ${statusTag} · rev ${doc.revised}`;
+	// #16: name the row the window is showing, so "↓ 15 more below" is not a mystery.
+	const activeTag = focusStep && anchorWanted !== "top" && cursor === null ? ` · ▶ #${focusStep.id}` : "";
+	const headText = `📋 console plan — ${doc.title || "(untitled)"} · ${statusTag}${activeTag} · rev ${doc.revised}`;
 	const head = [theme.fg("accent", truncate(headText, width))];
 	if (o.hint) head.push(theme.fg("dim", truncate(o.hint, width)));
 
@@ -473,44 +536,115 @@ export function planWidgetLines(doc: PlanDoc, o: PlanLineOptions): PlanLines {
 	const fixed = head.length + 1 + 2;
 	const budget = Math.max(1, o.maxRows - fixed);
 
-	const anchor = cursor === null ? 0 : Math.min(Math.max(0, cursor), Math.max(0, doc.steps.length - 1));
-	let start = anchor;
-	let end = anchor;
-	let used = 0;
-	if (doc.steps.length) {
-		used = Math.min(1, budget);
-		for (let i = anchor - 1; i >= 0 && used + 1 <= budget; i--) { used += 1; start = i; }
-		for (let i = anchor + 1; i < doc.steps.length && used + 1 <= budget; i++) { used += 1; end = i; }
-	}
-
-	const lines: string[] = [...head];
-	for (let i = start; doc.steps.length && i <= end; i++) {
+	// ── row layout, computed once per step and shared by the windowing and the painting ──
+	const layoutOf = (i: number) => {
 		const s = doc.steps[i]!;
 		const mark = cursor === i ? (o.cursorMark ?? "❯") : " ";
-		const glyph = theme.fg(STATUS_COLOR[s.status], STATUS_GLYPH[s.status]);
 		const idCell = `#${String(s.id).padEnd(idWidth)}`;
 		// The prefix is measured UNSTYLED and its real length is what the text budget subtracts.
 		// Guessing a column count here is how a step line overflows the terminal by one column.
 		const prefix = `${mark} ${idCell} ${STATUS_GLYPH[s.status]} `;
-		const text = truncate(s.text, Math.max(8, width - prefix.length));
-		const colored = s.status === "done" || s.status === "dropped" ? theme.fg("dim", text) : s.status === "doing" ? theme.fg("warning", text) : text;
-		lines.push(`${mark} ${theme.fg("muted", idCell)} ${glyph} ${colored}`);
+		const textBudget = Math.max(8, width - prefix.length);
+		const pieces = o.wrap
+			? (o.wrapText ?? defaultWrap)(s.text, textBudget)
+			: [s.text];
+		return { s, mark, idCell, prefix, textBudget, pieces };
+	};
+	/** How many budget rows this step costs — a wrapped step costs what it actually takes (#17). */
+	const costOf = (i: number): number => Math.max(1, layoutOf(i).pieces.length);
+
+	// ── the window: grow out from the focus row while the rows fit the budget ──
+	let start = focus < 0 ? 0 : focus;
+	let end = focus < 0 ? -1 : focus;
+	if (focus >= 0) {
+		let used = Math.min(costOf(focus), budget);
+		for (let i = focus - 1; i >= 0; i--) {
+			const c = costOf(i);
+			if (used + c > budget) break;
+			start = i; used += c;
+		}
+		for (let i = focus + 1; i < doc.steps.length; i++) {
+			const c = costOf(i);
+			if (used + c > budget) break;
+			end = i; used += c;
+		}
 	}
-	const hiddenAbove = start;
-	const hiddenBelow = doc.steps.length ? doc.steps.length - 1 - end : 0;
+
+	const lines: string[] = [...head];
+	let stepRows = 0;
+	for (let i = start; focus >= 0 && i <= end; i++) {
+		const l = layoutOf(i);
+		const room = budget - stepRows;
+		if (room <= 0) break;
+		const take = l.pieces.slice(0, room);
+		// A step that got cut mid-wrap says so — a silently shortened row is how #17 came back.
+		if (take.length < l.pieces.length) take[take.length - 1] = truncate(take[take.length - 1]!, l.textBudget);
+		const glyph = theme.fg(STATUS_COLOR[l.s.status], STATUS_GLYPH[l.s.status]);
+		const idCell = theme.fg("muted", l.idCell);
+		const indent = " ".repeat(l.prefix.length);
+		const colorOf = (t: string): string =>
+			l.s.status === "done" || l.s.status === "dropped" ? theme.fg("dim", t)
+				: l.s.status === "doing" ? theme.fg("warning", t)
+					: theme.fg("text", t);
+		take.forEach((piece, pi) => {
+			const text = colorOf(truncate(piece, l.textBudget));
+			lines.push(pi === 0 ? `${l.mark} ${idCell} ${glyph} ${text}` : `${indent}${text}`);
+			stepRows += 1;
+		});
+	}
+	const hiddenAbove = focus >= 0 ? start : 0;
+	const hiddenBelow = focus >= 0 ? Math.max(0, doc.steps.length - 1 - end) : 0;
 	if (hiddenAbove > 0) lines.push(theme.fg("dim", `  ↑ ${hiddenAbove} more above`));
 	if (hiddenBelow > 0) lines.push(theme.fg("dim", `  ↓ ${hiddenBelow} more below`));
 	lines.push(theme.fg("dim", "─".repeat(Math.max(4, Math.min(width, 48)))));
 
 	if (o.notes) {
-		for (const kind of ["decision", "constraint", "open"] as PlanNoteKind[]) {
+		// Notes share the SAME budget as the steps: an uncapped notes block is how a widget pushes
+		// the editor off the terminal, which is the exact failure #5 was about.
+		const indicatorRows = (hiddenAbove > 0 ? 1 : 0) + (hiddenBelow > 0 ? 1 : 0);
+		let room = Math.max(0, o.maxRows - head.length - stepRows - indicatorRows - 1);
+		let shownNotes = 0;
+		let totalNotes = doc.decisions.length + doc.constraints.length + doc.openQuestions.length;
+		outer: for (const kind of ["decision", "constraint", "open"] as PlanNoteKind[]) {
 			const list = notesOf(doc, kind);
 			if (list.length === 0) continue;
+			if (room < 2) break; // a heading with no entry under it is noise
 			lines.push(theme.fg("accent", `${NOTES_HEADING[kind]} (${list.length}):`));
-			for (const n of list) lines.push(theme.fg("muted", `  ${truncate(n, Math.max(8, width - 4))}`));
+			room -= 1;
+			for (const n of list) {
+				if (room < 1) break outer;
+				lines.push(theme.fg("muted", `  ${truncate(n, Math.max(8, width - 4))}`));
+				room -= 1; shownNotes += 1;
+			}
 		}
+		if (shownNotes < totalNotes) lines.push(theme.fg("dim", `  … ${totalNotes - shownNotes} more note(s)`));
 	}
-	return { lines, hiddenAbove, hiddenBelow };
+	return { lines, hiddenAbove, hiddenBelow, activeIndex: focus >= 0 ? focus : null };
+}
+
+/**
+ * Fallback word wrap for callers that do not inject one (tests, non-TUI prints). It only ever has
+ * to be width-correct for plain strings — the real terminal path injects pi-tui's wrapTextWithAnsi,
+ * which is the one that understands wide characters and colour codes.
+ */
+function defaultWrap(text: string, width: number): string[] {
+	const w = Math.max(4, Math.floor(width));
+	const out: string[] = [];
+	let line = "";
+	for (const word of text.split(/\s+/).filter(Boolean)) {
+		let rest = word;
+		while (rest.length > w) { // one word wider than the column: hard-split it
+			if (line) { out.push(line); line = ""; }
+			out.push(rest.slice(0, w));
+			rest = rest.slice(w);
+		}
+		if (!line) { line = rest; continue; }
+		if (line.length + 1 + rest.length <= w) { line += ` ${rest}`; continue; }
+		out.push(line);
+		line = rest;
+	}
+	if (line) out.push(line);
+	return out.length ? out : [""];
 }
 
 /** Local width-safe truncation (this module must not import pi-tui; see the header). */

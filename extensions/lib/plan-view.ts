@@ -86,9 +86,20 @@ export function createPlanEditor(
 	host: PlanEditorHost,
 	theme: Theme,
 	done: (result: PlanEditorClose) => void,
-	options: { section?: PlanSection } = {},
+	options: { section?: PlanSection; wrap?: boolean; readOnly?: boolean } = {},
 ): PlanEditorComponent {
 	let section: PlanSection = options.section ?? "steps";
+	// #22: a VIEWER, not an editor — used for the retired plan. Every mutation is refused at the one
+	// choke point (apply) AND at the keys, so a viewer cannot half-work: the header and the hint line
+	// say so too, because a read-only editor that looks editable is worse than no editor.
+	const readOnly = options.readOnly === true;
+	const readOnlyKey = (): void => {
+		lastLog = "read-only — this plan is finished and kept for reference. /plan export last [file] saves a copy of it.";
+	};
+	// #17: expanded by DEFAULT here — you opened this overlay to read the plan, and a step truncated
+	// at the terminal width is the complaint. `w` flips it; the live panel keeps the opposite default
+	// (its budget is a third of the terminal) and is set with /plan wrap.
+	let wrapRows = options.wrap ?? true;
 	let stepCursor: number | null = null; // steps: by ID
 	let noteCursor = 0;                   // notes: by position (they have no ids)
 	let editing: Target | null = null;
@@ -137,6 +148,8 @@ export function createPlanEditor(
 	};
 
 	const apply = (op: PlanOp): boolean => {
+		// #22: the single choke point. Nothing in this component writes the plan except through apply().
+		if (readOnly) { readOnlyKey(); return false; }
 		const res = host.apply(op);
 		lastLog = res.ok ? res.log : `✗ ${res.log}`;
 		if (!res.ok) { host.notify?.(`Plan edit refused: ${res.log}`); return false; }
@@ -161,6 +174,7 @@ export function createPlanEditor(
 	};
 
 	const startEdit = (): void => {
+		if (readOnly) { readOnlyKey(); return; }
 		const d = doc();
 		if (!d) return;
 		const t = targetList(d);
@@ -174,6 +188,7 @@ export function createPlanEditor(
 
 	/** a / n: an empty editor for a NEW row (a step after the cursor, or a note in this section). */
 	const startAdd = (): void => {
+		if (readOnly) { readOnlyKey(); return; }
 		editing = section === "steps" ? { kind: "step", id: hoveredStep(doc())?.id ?? -1 } : { kind: "note", index: -1 };
 		openEditor("", section === "steps" ? "new step (⏎ adds it after the cursor)" : `new ${SECTION_LABEL[section].toLowerCase()} (⏎ adds it)`);
 	};
@@ -267,12 +282,23 @@ export function createPlanEditor(
 				if (s) apply({ action: "cycle", id: s.id });
 				return;
 			}
+			if (data === "w") { wrapRows = !wrapRows; lastLog = wrapRows ? "expanded — long steps wrap over several rows" : "compact — long steps are truncated to one row"; return; }
+			// #22: in a viewer the editing keys say why they do nothing instead of pretending to work.
+			if (readOnly && (data === "e" || data === "a" || data === "n" || data === "x" || data === " " || data === "D" || data === "[" || data === "]" || data === "\n")) {
+				readOnlyKey();
+				return;
+			}
+			if (readOnly && matchesKey(data, "enter")) { readOnlyKey(); return; }
 			if (data === "D") { deleteTarget(); return; }
 			if (data === "[") { reorder(-1); return; }
 			if (data === "]") { reorder(1); return; }
 			// A typing mistake must not look like a dead key: every other keypress says what to press
 			// instead, because nothing here is destructive enough to be worth a silent no-op.
-			if (/^[a-zA-Z0-9]$/.test(data)) lastLog = `✗ ${data} does nothing here — ↑↓ move · Tab section · e/⏎ edit · a add · x status · [ ] reorder · D drop/remove · esc close`;
+			if (/^[a-zA-Z0-9]$/.test(data)) {
+				lastLog = readOnly
+					? "read-only — ↑↓ move · Tab section · w wrap/compact · esc close"
+					: `✗ ${data} does nothing here — ↑↓ move · Tab section · e/⏎ edit · a add · x status · [ ] reorder · D drop/remove · w ${wrapRows ? "compact" : "expand"} · esc close`;
+			}
 		},
 
 		render(width: number): string[] {
@@ -282,14 +308,24 @@ export function createPlanEditor(
 			const w = Math.max(12, width);
 			const out: string[] = [];
 
-			const head = `📋 console plan — ${d?.title || "(untitled)"} · ${p.done}/${p.total} done${p.doing ? ` · ◐ ${p.doing} doing` : ""}${p.dropped ? ` · ✗ ${p.dropped} dropped` : ""} · rev ${d?.revised ?? 0}`;
+			const head = readOnly
+				? `🗂 PREVIOUS PLAN (retired) — ${d?.title || "(untitled)"} · ${p.done + p.dropped}/${p.total} settled · rev ${d?.revised ?? 0}`
+				: `📋 console plan — ${d?.title || "(untitled)"} · ${p.done}/${p.total} done${p.doing ? ` · ◐ ${p.doing} doing` : ""}${p.dropped ? ` · ✗ ${p.dropped} dropped` : ""} · rev ${d?.revised ?? 0}`;
 			out.push(theme.fg("accent", head));
 			if (d?.task) out.push(theme.fg("muted", `task: ${d.task}`));
 			out.push(SECTION_ORDER.map((s) => {
 				const n = s === "steps" ? p.total : notesOf(d, s).length;
 				return s === section ? theme.fg("accent", `[${SECTION_LABEL[s]} ${n}]`) : theme.fg("dim", `[${SECTION_LABEL[s]} ${n}]`);
 			}).join("  "));
-			out.push(theme.fg("dim", "↑↓ move · Tab section · e/⏎ edit · a add · x status · [ ] reorder · D drop/remove · esc close"));
+			// Two rows on purpose: one row of key hints is ~100 columns, and the terminal cuts it at 70 —
+			// which is exactly where the `w` wrap state lived. #17's toggle has to be READABLE to exist.
+			if (readOnly) {
+				out.push(theme.fg("dim", "read-only viewer · ↑↓ move · Tab section · w wrap/compact · esc close"));
+				out.push(theme.fg("dim", "/plan export last [file] saves this plan as markdown"));
+			} else {
+				out.push(theme.fg("dim", "↑↓ move · Tab section · e/⏎ edit · a add · x status · D drop/remove"));
+				out.push(theme.fg("dim", `[ ] reorder · w ${wrapRows ? "compact lines" : "expand lines"} · esc close`));
+			}
 
 			// Build the body rows first (each row knows whether the cursor is on it), then fit a
 			// cursor-anchored window into the terminal: the backlog #5 lesson — a long list must not
@@ -312,12 +348,19 @@ export function createPlanEditor(
 					const prefix = `${mark} ${idCell} ${STATUS_GLYPH[s.status]} `;
 					const indent = " ".repeat(visibleWidth(prefix));
 					const glyph = theme.fg(STATUS_COLOR[s.status], STATUS_GLYPH[s.status]);
-					const text = truncateToWidth(s.text, Math.max(8, w - visibleWidth(prefix)));
-					const colored = s.status === "done" || s.status === "dropped"
-						? theme.fg("dim", text)
-						: s.status === "doing" ? theme.fg("warning", text) : text;
+					const textBudget = Math.max(8, w - visibleWidth(prefix));
+					// #17: only the step TEXT wraps, never the prefix — the continuation rows are indented by
+					// exactly the prefix width, so they line up under the text they belong to.
+					const pieces = wrapRows ? wrapTextWithAnsi(s.text, textBudget) : [truncateToWidth(s.text, textBudget)];
+					const colorOf = (t: string): string =>
+						s.status === "done" || s.status === "dropped"
+							? theme.fg("dim", t)
+							: s.status === "doing" ? theme.fg("warning", t) : theme.fg("text", t);
 					if (hovered) hoveredRow = rows.length;
-					rows.push(`${mark} ${theme.fg("muted", idCell)} ${glyph} ${colored}`);
+					pieces.forEach((piece, pi) => {
+						const colored = colorOf(truncateToWidth(piece, textBudget));
+						rows.push(pi === 0 ? `${mark} ${theme.fg("muted", idCell)} ${glyph} ${colored}` : indent + colored);
+					});
 					if (s.note) rows.push(indent + theme.fg("dim", truncateToWidth(s.note, Math.max(8, w - visibleWidth(prefix)))));
 					if (boxLine && draft && editing?.kind === "step" && editing.id === s.id) {
 						rows.push(boxLine);
@@ -355,7 +398,9 @@ export function createPlanEditor(
 				budget = Math.max(1, termRows - fixed - (both ? 2 : 1));
 			}
 			if (rows.length === 0) {
-				out.push(theme.fg("dim", section === "steps" ? "  (no steps yet — press a)" : `  (no ${SECTION_LABEL[section].toLowerCase()} yet — press n)`));
+				out.push(theme.fg("dim", readOnly
+					? "  (nothing in this section)"
+					: section === "steps" ? "  (no steps yet — press a)" : `  (no ${SECTION_LABEL[section].toLowerCase()} yet — press n)`));
 			} else {
 				const anchor = hoveredRow < 0 ? 0 : hoveredRow;
 				let start = anchor;

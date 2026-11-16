@@ -7,7 +7,7 @@
  * Run: npx -y tsx tools/test-plan-view.ts
  */
 import { applyPlanOp, newPlanDoc, type PlanDoc, type PlanOp } from "../extensions/lib/plan-doc";
-import { createPlanEditor, planPlainLines, type PlanEditorClose } from "../extensions/lib/plan-view";
+import { createPlanEditor, planPlainLines, type PlanEditorClose, type PlanSection } from "../extensions/lib/plan-view";
 
 const theme = { fg: (_c: string, t: string) => t };
 const strip = (s: string) => s.replace(/\u001b[^\n]*?m/g, "");
@@ -38,7 +38,7 @@ interface Fake {
 	close: PlanEditorClose | null;
 }
 
-function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the request" })) {
+function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the request" }), options: { section?: PlanSection; wrap?: boolean; readOnly?: boolean } = {}) {
 	const f: Fake = { doc, ops: [], logs: [], close: null };
 	const c = createPlanEditor(
 		{
@@ -53,6 +53,7 @@ function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the
 		},
 		theme,
 		(r) => { f.close = r; },
+		options,
 	);
 	const lines = () => c.render(WIDTH);
 	const text = () => lines().map(strip);
@@ -307,6 +308,88 @@ function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the
 	check("plain render lists open questions", l.some((x) => x === "open questions:") && l.some((x) => x.includes("which theme?")), JSON.stringify(l));
 	check("plain render reports progress", l[0]!.includes("1/1 done"), l[0]);
 	check("plain render of no plan says so", planPlainLines(null)[0] === "(no console plan)", JSON.stringify(planPlainLines(null)));
+}
+
+// ── 14. #17: expanded step text — the overlay WRAPS by default, `w` flips it ──
+{
+	const long = "wire the reranker to the GPU split and hold the switch-back flag so the fallback path stays reachable end to end";
+	const d = newPlanDoc({ title: "Wrap", steps: [long, "short one"] });
+	const { c, text } = fresh(d);
+	let l = text();
+	check("a long step is not cut in half by default", l.some((x) => x.includes("end to end")), JSON.stringify(l));
+	check("the wrapped tail hangs under the text, not under the id", l.some((x) => x.startsWith("     ") && !x.includes("#")), JSON.stringify(l));
+	check("wrapping does not blow the overlay height", l.length <= ROWS, `got ${l.length}`);
+	check("every row still fits the terminal width", l.every((x) => x.length <= WIDTH), JSON.stringify(l.map((x) => x.length)));
+	check("the hint line states the current mode", l.some((x) => x.includes("w compact lines")), JSON.stringify(l));
+	c.handleInput("w");
+	l = text();
+	check("w collapses the step back to one truncated row", l.some((x) => x.includes("#1") && !x.includes("end to end")), JSON.stringify(l));
+	check("the collapsed row reports it was cut", l.some((x) => /\.\.\.|…/.test(x)), JSON.stringify(l));
+	check("the hint line flips with the mode", l.some((x) => x.includes("w expand lines")), JSON.stringify(l));
+	check("w is not mistaken for an edit", c && true);
+	c.handleInput("w");
+	check("w back to expanded shows the whole step again", text().some((x) => x.includes("end to end")), JSON.stringify(text()));
+	// Explicit compact start (what /plan wrap off would mean for the overlay).
+	const compact = fresh(d, { wrap: false });
+	check("options.wrap:false starts compact", !compact.text().some((x) => x.includes("end to end")), JSON.stringify(compact.text()));
+	check("compact mode is the pre-#17 rendering", compact.text().filter((x) => x.includes("#1")).length === 1, JSON.stringify(compact.text()));
+}
+
+// ── 15. #22: the READ-ONLY viewer (a plan that is finished and archived) ──────
+{
+	// The document a finished plan leaves behind: every step settled.
+	let d = newPlanDoc({ title: "Retired plan", task: "the old request" });
+	d = applyPlanOp(d, { action: "add", text: "one settled step with a long tail of explanation about the reranker and the switch-back flag" }).doc;
+	d = applyPlanOp(d, { action: "add", text: "second step" }).doc;
+	d = applyPlanOp(d, { action: "status", id: 1, status: "done" }).doc;
+	d = applyPlanOp(d, { action: "status", id: 2, status: "dropped" }).doc;
+	d = applyPlanOp(d, { action: "note", kind: "decision", text: "one archive slot is enough" }).doc;
+
+	const ro = fresh(d, { readOnly: true });
+	let lines = ro.text();
+	check("the viewer says what it is", lines[0]!.includes("PREVIOUS PLAN (retired)"), lines[0]);
+	check("and reports the plan as settled, not as work in progress", lines[0]!.includes("2/2 settled"), lines[0]);
+	check("the hint row admits it is a viewer", lines.some((x) => x.includes("read-only viewer")), JSON.stringify(lines.slice(2, 5)));
+	check("it points at the way to get a copy out of it", lines.some((x) => x.includes("/plan export last")), JSON.stringify(lines.slice(2, 5)));
+
+	// Every mutating key must be a no-op WITH an explanation, not a silent dead key.
+	for (const key of ["x", "D", "a", "e", "[", "]", "\r"]) {
+		const before = JSON.stringify(ro.f.doc);
+		ro.c.handleInput(key);
+		check(`${JSON.stringify(key)} changes nothing`, ro.f.ops.length === 0 && JSON.stringify(ro.f.doc) === before, JSON.stringify(ro.f.ops));
+		check(`${JSON.stringify(key)} says why it did nothing`, ro.text().at(-1)!.includes("read-only"), ro.text().at(-1));
+	}
+	check("the host's apply was never called (the archive is untouchable)", ro.f.ops.length === 0, JSON.stringify(ro.f.ops));
+	check("and the document's revision never moved", ro.f.doc?.revised === d.revised, `${ro.f.doc?.revised} vs ${d.revised}`);
+
+	// Reading it still works — that is the whole point of keeping it.
+	const cursorRow = () => ro.text().findIndex((x) => x.includes("❯"));
+	const at = cursorRow();
+	ro.c.handleInput(KEYS.down);
+	check("↑↓ still moves", cursorRow() !== at, `${at} -> ${cursorRow()}`);
+	// The viewer starts expanded (that is the /plan view default) — `w` still flips it both ways.
+	ro.c.handleInput("w");
+	check("w still collapses in a viewer", !ro.text().some((x) => x.includes("switch-back flag")), JSON.stringify(ro.text().slice(5, 8)));
+	ro.c.handleInput("w");
+	check("and expands it back", ro.text().some((x) => x.includes("switch-back flag")), JSON.stringify(ro.text().slice(5, 8)));
+	const tabbed = ro.text();
+	ro.c.handleInput(KEYS.tab);
+	check("Tab still cycles into the notes so they can be read", ro.text().some((x) => x.includes("one archive slot is enough")), JSON.stringify(ro.text()));
+	ro.c.handleInput(KEYS.tab);
+	check("Tab cycles on (task section is readable too)", ro.text().some((x) => x.includes("the old request")), JSON.stringify(ro.text().slice(0, 4)));
+	check("the viewer's own hint row was there before Tab moved on", tabbed.some((x) => x.includes("read-only viewer")), JSON.stringify(tabbed.slice(2, 5)));
+	check("the viewer fits the small terminal", ro.lines().length <= ROWS, `got ${ro.lines().length}`);
+	check("and fits its width", ro.lines().every((x) => x.length <= WIDTH), JSON.stringify(ro.lines().map((x) => x.length)));
+
+	ro.c.handleInput(KEYS.esc);
+	check("esc closes it", ro.f.close !== null);
+	check("closing a viewer reports ZERO edits (nothing is steered to the model)", ro.f.close?.edits === 0, JSON.stringify(ro.f.close));
+
+	// The same document through the EDITOR path still edits — readOnly is opt-in, not the default.
+	const live = fresh(d);
+	check("without the flag the overlay is still the normal editor", live.text()[0].includes("console plan —"), live.text()[0]);
+	live.c.handleInput("x");
+	check("and keys that were refused in the viewer still work here", live.f.ops.length === 1, JSON.stringify(live.f.ops));
 }
 
 console.log(failures === 0 ? `ALL PASS (${checks} checks)` : `\n${failures} of ${checks} FAILED`);

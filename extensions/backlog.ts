@@ -27,17 +27,19 @@ import { loadSessionState, loadGuardState, updateSessionState } from "./lib/sess
 // the whole extension graph (typebox, pi-coding-agent) into test runs.
 import { defaultPlanFile } from "./lib/plan-file";
 // #16: the console plan document (pure module, same rule as plan-file: no pi, no fs).
-import { newPlanDoc, type PlanStyle } from "./lib/plan-doc";
+import { type PlanDoc, type PlanStyle } from "./lib/plan-doc";
 // #9: planning mode is a state machine (ON / PAUSED / OFF) owned by guards.ts; the backlog
 // row follows the SAME transition table so the two entry points cannot disagree about what
 // "plan these" means in a paused session. Title/footer markers come from the same helpers.
 import {
   applyPlanTransition,
+  bindConsolePlanForStart,
   consolePlanOf,
   consolePlanningRulesText,
   finishPlanReminder,
   planFlagOf,
   planLabel,
+  planRetiredOf,
   planStyleForNewPlan,
   planStyleOf,
   planTitleMarker,
@@ -394,20 +396,31 @@ export default function (pi: ExtensionAPI) {
         }
 
         let justTurnedOn = false;
+        // #22: the retirement note has to reach the ONE mode message below (an info notify is a single
+        // status slot — a second notify in the same tick is never seen), so it is built where it is known.
+        let retiredBacklogNote = "";
+        // #22: the finished plan this start archived, if any — reported after the write lands.
+        // A holder object: TypeScript narrows a `let x: T | null = null` that is only assigned inside a
+        // callback back to `null` when the callback has run.
+        const retiredBacklog: { doc: PlanDoc | null } = { doc: null };
         if (!ss.planMode) {
           // #1: fresh read-modify-write — never save a snapshot taken before the check above.
           const saved = updateSessionState(sid, s => {
+            // #22: the SAME bind rule /plan on uses (bindConsolePlanForStart) — keep a draft that is
+            // still in progress, retire a FINISHED checklist to planDocPrevious and bind a fresh one to
+            // these items. Bound before the transition, so a paused session keeps what it suspended.
             if (style === "tui") {
-              // #16: a console plan is a document, not a file — and it must exist the moment planning
-              // turns on (session-state.ts drops planning mode when a console plan has no document).
-              if (!s.planDoc) {
-                s.planDoc = newPlanDoc({
-                  title: `Backlog: ${lines[0] ?? "items"}`.slice(0, 80),
-                  task: `Plan these backlog items: ${lines.join("; ")}`,
-                });
-                s.planFile = null; // no pin: console mode blocks EVERY write on purpose
-              }
               s.planStyle = "tui";
+              const bound = bindConsolePlanForStart(s, {
+                title: `Backlog: ${lines[0] ?? "items"}`.slice(0, 80),
+                task: `Plan these backlog items: ${lines.join("; ")}`,
+              });
+              s.planDoc = bound.doc;
+              if (bound.retired) {
+                s.planDocPrevious = bound.retired;
+                retiredBacklog.doc = bound.retired;
+              }
+              s.planFile = null; // no pin: console mode blocks EVERY write on purpose
             } else if (!s.planFile) {
               s.planFile = defaultPlanFile(ctx.cwd);
               fs.mkdirSync(path.dirname(s.planFile), { recursive: true });
@@ -419,6 +432,11 @@ export default function (pi: ExtensionAPI) {
           ss.planDoc = saved.planDoc;
           titleFor(saved);
           justTurnedOn = true;
+          // #22: the retirement fact goes where it cannot be swallowed — the transcript message the model
+          // is about to act on (see the longer note in guards.ts for why a status line is not reliable here).
+          retiredBacklogNote = retiredBacklog.doc
+            ? ` 🗂 The plan previously planned in this console ("${retiredBacklog.doc.title || "untitled"}") has been RETIRED so this one starts fresh — it is archived, not this plan: /plan view last reads it, /plan export last saves it.`
+            : "";
           // #11: belt-and-braces after flipping planning mode ON — re-read and warn
           // loudly if it didn't land (mirror of verifyPlanModeOff in guards.ts).
           if (!loadSessionState(sid).planMode) {
@@ -428,9 +446,9 @@ export default function (pi: ExtensionAPI) {
           titleFor(ss); // keep the title in sync with the marker helpers (🌙/🔥 combination)
         }
         if (justTurnedOn && style === "tui") {
-          ctx.ui.notify(`📋 CONSOLE plan mode ON from the backlog — the plan is a live document in the TUI (panel above the editor), not a file. /plan view edits it; /plan approve implements it.`, "info");
+          ctx.ui.notify(`📋 CONSOLE plan mode ON from the backlog — the plan is a live document in the TUI (panel above the editor), not a file. /plan view edits it; /plan approve implements it.${retiredBacklogNote}`, "info");
           pi.sendUserMessage(
-            `${consolePlanningRulesText(consolePlanOf(loadSessionState(sid)))} ${taskList} ${finishPlanReminder()}`,
+            `${retiredBacklogNote}${consolePlanningRulesText(consolePlanOf(loadSessionState(sid)))} ${taskList} ${finishPlanReminder()}`,
             { deliverAs: "followUp" },
           );
         } else if (justTurnedOn) {

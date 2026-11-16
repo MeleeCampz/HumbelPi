@@ -43,7 +43,7 @@
  * whole table without the extension graph.
  */
 
-import { planProgress, renderPlanText, type PlanDoc, type PlanStyle } from "./plan-doc";
+import { newPlanDoc, planProgress, renderPlanText, type PlanDoc, type PlanStyle } from "./plan-doc";
 
 export type PlanFlag = "on" | "paused" | "off";
 export type PlanAction = "on" | "pause" | "resume" | "approve" | "exit";
@@ -64,6 +64,12 @@ export interface PlanView {
 	 * progress widget keep tracking. Only ever set in console mode.
 	 */
 	planExecuting?: boolean;
+	/**
+	 * #22: the last RETIRED console plan (a checklist that ran to completion and was moved aside when
+	 * a new plan started). Read by /plan view last and /plan export last only — never by the panel,
+	 * the markers, the frames or the model-facing messages.
+	 */
+	planDocPrevious?: PlanDoc | null;
 }
 
 export interface PlanTransition {
@@ -99,6 +105,90 @@ export function consolePlanOf(v: PlanView): PlanDoc | null {
 /** #16: is an approved console plan currently being implemented? */
 export function planExecutingOf(v: PlanView): boolean {
 	return v.planExecuting === true && consolePlanOf(v) !== null;
+}
+
+/**
+ * #18: is the console plan FINISHED — every step done or dropped?
+ *
+ * Derived from the document every time, never stored as its own flag: "finished" is a fact about the
+ * step statuses, and a stored copy goes stale the moment a step is re-opened or a new one is added.
+ * A plan with no steps is NOT finished (an empty checklist is a plan that never started).
+ */
+export function planCompletedOf(v: PlanView): boolean {
+	if (v.planMode || v.planPaused) return false;
+	const d = consolePlanOf(v);
+	return d !== null && d.steps.length > 0 && planProgress(d).allDone;
+}
+
+/** #18: finished AND still flagged as implementing — the one moment a completion may be announced. */
+export function planFinishedOf(v: PlanView): boolean {
+	return planExecutingOf(v) && planCompletedOf(v);
+}
+
+/**
+ * #22: is the bound console plan a FINISHED CHECKLIST THAT NOTHING IS IMPLEMENTING ANY MORE?
+ *
+ * Deliberately NOT planCompletedOf. That one asks "did the run we are tracking end?" and answers false
+ * whenever planning mode is on; this one asks "is what is bound right now the RECORD of a completed plan
+ * rather than a plan somebody is drafting or executing?" — which is the question a start has to answer
+ * before it decides whether to keep the document it found or bind a new one.
+ *
+ * A half-drafted plan is never retired (an open or doing step means work may still be in progress) and
+ * an empty document is never retired (there is nothing to archive).
+ */
+export function planRetiredOf(v: PlanView): boolean {
+	const d = consolePlanOf(v);
+	if (d === null || d.steps.length === 0) return false;
+	if (!planProgress(d).allDone) return false;
+	return !planExecutingOf(v);
+}
+
+/** #22: the retired plan of this console, or null. Console mode only, like consolePlanOf. */
+export function retiredPlanOf(v: PlanView): PlanDoc | null {
+	return planStyleOf(v) === "tui" ? v.planDocPrevious ?? null : null;
+}
+
+/**
+ * #22: THE rule for binding the console plan a start is about to work on — one function so /plan on,
+ * /plan tui, the backlog "Plan these" row and plan_doc reset cannot disagree:
+ *
+ *   nothing bound         → a fresh document
+ *   a draft in progress   → the SAME document (starting never destroys work in progress)
+ *   a finished plan       → a fresh document, and the finished one is RETIRED to planDocPrevious
+ *   resuming a paused plan→ the SAME document whatever its step statuses (resume never retires)
+ *
+ * keepDraft:false (plan_doc reset) always binds a fresh document, but still archives a finished one —
+ * a reset may clear a draft, it must not silently destroy a completed plan.
+ *
+ * Returns the document to bind plus the plan to archive (null when nothing was retired). Callers apply
+ * both inside ONE updateSessionState, so a retire and its rebind are one atomic write.
+ */
+export function bindConsolePlanForStart(
+	v: PlanView,
+	o: { task?: string; title?: string } = {},
+	opts: { keepDraft?: boolean } = {},
+): { doc: PlanDoc; retired: PlanDoc | null } {
+	const cur = consolePlanOf(v);
+	const task = o.task ?? "";
+	const title = o.title ?? (task ? task.slice(0, 80) : "");
+	if (!cur) return { doc: newPlanDoc({ task, title }), retired: null };
+	// A paused plan is kept exactly as it was paused — that is the whole point of pausing.
+	if (planFlagOf(v) === "paused" && opts.keepDraft !== false) return { doc: cur, retired: null };
+	const retired = planRetiredOf(v) ? cur : null;
+	if (opts.keepDraft === false) return { doc: newPlanDoc({ task, title }), retired };
+	// A draft is not a finished plan: keep it, and do not touch the archive.
+	if (!retired) return { doc: cur, retired: null };
+	return { doc: newPlanDoc({ task, title }), retired };
+}
+
+/**
+ * #18: the live plan surfaces (the panel, the [PLAN IMPLEMENTING] frame, the 📋▶ markers) show a
+ * plan that is planned, paused or mid-implementation — never a finished one.
+ */
+export function planPanelVisibleOf(v: PlanView): boolean {
+	if (consolePlanOf(v) === null) return false;
+	if (v.planMode || v.planPaused) return true;
+	return planExecutingOf(v) && !planCompletedOf(v);
 }
 
 /**
@@ -206,15 +296,15 @@ export function planTitleMarker(v: PlanView): string | null {
 	if (v.planMode) return name;
 	if (v.planPaused) return `${name} ⏸`;
 	// #16: an approved console plan being implemented still deserves a marker — the checklist is
-	// live and the user should be able to tell at a glance.
-	return planExecutingOf(v) ? `${name} ▶` : null;
+	// live and the user should be able to tell at a glance. #18: not once it is finished.
+	return planExecutingOf(v) && !planCompletedOf(v) ? `${name} ▶` : null;
 }
 
 /** Footer marker (single cell, same slot as 🛡️/🔥/🌙). */
 export function planFooterMarker(v: PlanView): string | null {
 	if (v.planMode) return "📋";
 	if (v.planPaused) return "📋⏸";
-	return planExecutingOf(v) ? "📋▶" : null;
+	return planExecutingOf(v) && !planCompletedOf(v) ? "📋▶" : null;
 }
 
 /** One-line status, shared by /plan status and /guards status. */
@@ -230,9 +320,16 @@ export function planStatusLine(v: PlanView): string {
 				? `⏸ PAUSED (this console — ${planLabel(v)} is kept, /plan view still opens it). Writes are allowed again; the paused plan itself is not approved. /plan resume to keep planning, /plan exit to leave.`
 				: `⏸ PAUSED (this console — plan kept at ${v.planFile ?? "unbound"}). Writes are allowed again; the paused plan itself is not approved. /plan resume to keep planning, /plan exit to leave.`;
 		case "off":
+			// #18: COMPLETE is checked first on purpose. An approved plan whose every row is settled is not
+			// "implementing" any more, even in the moment before the flag is cleared — and a status line
+			// that says "0 remaining" while claiming to implement is the confusing reading this fixes.
+			if (planCompletedOf(v)) {
+				const p = planProgress(consolePlanOf(v)!);
+				return `✅ COMPLETE (console plan — ${p.done}/${p.total} done${p.dropped ? `, ${p.dropped} dropped` : ""}). Its windows are closed; the document is kept, so /plan view still reads it. /plan tui [task] plans a new one.`;
+			}
 			if (planExecutingOf(v)) {
 				const p = planProgress(consolePlanOf(v)!);
-				return `▶ IMPLEMENTING (approved console plan — ${p.done}/${p.total} steps done, ${p.remaining.length} remaining). plan_doc can still mark steps; /plan tui reopens planning.`;
+				return `▶ IMPLEMENTING (approved console plan — ${p.done}/${p.total} steps done, ${p.remaining.length} remaining). plan_doc can still mark steps; /plan view lets the user edit it; /plan tui reopens planning.`;
 			}
 			return "off. Start with: /plan on [task] (or /plan tui [task] to plan in the TUI)";
 	}
@@ -251,10 +348,14 @@ export function planPausedFrame(v: PlanView): string {
  * #16: the frame for a console plan that was approved and is being implemented. Injected on every
  * user message for the whole implementation, so "which checklist am I working through" cannot
  * drift out of context even after a compaction.
+ *
+ * #18: it goes quiet the moment the plan is finished. The frame is what makes a plan feel like it
+ * is still happening; leaving it on after 12/12 tells the model it is implementing a plan it already
+ * implemented, which is how a finished checklist keeps getting re-announced every message.
  */
 export function planExecutingFrame(v: PlanView): string | null {
 	const d = consolePlanOf(v);
-	if (!planExecutingOf(v) || !d) return null;
+	if (!planExecutingOf(v) || !d || planCompletedOf(v)) return null;
 	const p = planProgress(d);
 	return `[PLAN IMPLEMENTING] The approved console plan "${d.title || "untitled"}" is being implemented: ${p.done}/${p.total} steps done, ${p.remaining.length} remaining. Mark each step as you finish it (plan_doc action=status id=… status=done). Plan text:\n\n${renderPlanText(d, { heading: "PLAN", compact: true, maxSteps: 40 })}`;
 }

@@ -21,6 +21,7 @@ import {
 	implementationInstructionFromDoc,
 	newPlanDoc,
 	normalizePlanDoc,
+	planActiveIndex,
 	planDocFromMarkdown,
 	planDocToMarkdown,
 	planProgress,
@@ -179,6 +180,76 @@ void (() => {
 	const big = applyPlanOp(applyPlanOp(ids, { action: "remove", id: 1 }).doc, { action: "add", text: "new" }).doc;
 	const bigLines = planWidgetLines(big, { width: 60, maxRows: 10 });
 	check("id column width follows the largest id", bigLines.lines.some((l) => l.includes("#2")) && bigLines.lines.some((l) => l.includes("#3")), bigLines.lines.join("\n"));
+})();
+
+// ── 5b. #16: the window follows the WORK, not the top of the list ─────────────
+void (() => {
+	console.log("anchored windows (#16)");
+	let d = newPlanDoc({ title: "rollout", steps: Array.from({ length: 40 }, (_x, i) => `step number ${i + 1} with some more words so it is long enough to truncate`) });
+	for (const id of [1, 2, 3, 4, 5, 6]) d = applyPlanOp(d, { action: "status", id, status: "done" }).doc;
+	d = applyPlanOp(d, { action: "status", id: 7, status: "doing" }).doc;
+
+	check("planActiveIndex names the step in progress", planActiveIndex(d) === 6, String(planActiveIndex(d)));
+	const w = planWidgetLines(d, { width: 60, maxRows: 8, cursor: null, anchor: "active" });
+	check("the active step is on screen", w.lines.some((l) => l.includes("#7")), w.lines.join("\n"));
+	check("the header names the row it chose", w.lines[0]!.includes("▶ #7"), w.lines[0]);
+	check("an active-anchored window still fits the budget", w.lines.length <= 8, `${w.lines.length}`);
+	check("what it hid is reported in both directions", w.hiddenAbove > 0 && w.hiddenBelow > 0, `${w.hiddenAbove}/${w.hiddenBelow}`);
+	check("activeIndex is reported to the caller", w.activeIndex === 6, String(w.activeIndex));
+
+	const n = planWidgetLines(d, { width: 60, maxRows: 8, cursor: null, anchor: "newest" });
+	check("drafting shows the row plan_doc just added", n.lines.some((l) => l.includes("#40")), n.lines.join("\n"));
+	check("the newest anchor hides nothing below", n.hiddenBelow === 0 && n.hiddenAbove > 0, `${n.hiddenAbove}/${n.hiddenBelow}`);
+
+	const c = planWidgetLines(d, { width: 60, maxRows: 8, cursor: 0, anchor: "newest" });
+	check("an explicit cursor outranks the anchor", c.lines.some((l) => l.includes("#1")) && c.hiddenAbove === 0, c.lines.join("\n"));
+
+	const top = planWidgetLines(d, { width: 60, maxRows: 8, cursor: null });
+	check("the old top anchor is still the default", top.lines.some((l) => l.includes("#1 ")) && top.hiddenBelow > 0, top.lines.join("\n"));
+
+	const d2 = applyPlanOp(d, { action: "status", id: 7, status: "done" }).doc;
+	check("with nothing doing it chases the first open step", planActiveIndex(d2) === 7, String(planActiveIndex(d2)));
+	const over = applyPlanOp(applyPlanOp(newPlanDoc({ title: "t", steps: ["a", "b"] }), { action: "status", id: 1, status: "done" }).doc, { action: "status", id: 2, status: "done" }).doc;
+	check("a fully settled plan anchors its last row", planActiveIndex(over) === 1, String(planActiveIndex(over)));
+	check("a plan with no steps has no active row", planActiveIndex(newPlanDoc({ title: "t" })) === -1);
+	check("an out-of-range index is clamped, not crashed", planWidgetLines(d, { width: 60, maxRows: 6, anchor: 999 }).lines.some((l) => l.includes("#40")));
+})();
+
+// ── 5c. #17: expanded step texts — wrapping is a BUDGET decision, not a permission ──
+void (() => {
+	console.log("wrapped rows (#17)");
+	const long = "wire the reranker to the GPU split and hold the switch-back flag so the fallback path stays reachable";
+	const d = newPlanDoc({ title: "W", steps: [long, "second step ".repeat(8), "short step"] });
+
+	const w = planWidgetLines(d, { width: 44, maxRows: 14, wrap: true, cursor: null, anchor: "top" });
+	check("wrapped output never exceeds the width", w.lines.every((l) => l.length <= 44), w.lines.find((l) => l.length > 44));
+	check("a long step is spread over several rows", w.lines.filter((l) => /reranker|switch-back|reachable/.test(l)).length >= 2, w.lines.join("\n"));
+	check("continuation rows hang under the text, not under the id", w.lines.some((l) => l.startsWith("     ") && !l.includes("#")), w.lines.join("\n"));
+
+	const tight = planWidgetLines(d, { width: 30, maxRows: 8, wrap: true, cursor: null, anchor: "top" });
+	check("wrapped rows are counted against the budget", tight.lines.length <= 8, `${tight.lines.length}`);
+	check("a step that cannot fit whole is reported as hidden", tight.hiddenBelow > 0, `${tight.hiddenBelow}`);
+
+	const tiny = planWidgetLines(d, { width: 26, maxRows: 5, wrap: true, cursor: null, anchor: "top" });
+	check("a step cut mid-wrap says so instead of vanishing", tiny.lines.some((l) => l.includes("…")), tiny.lines.join("\n"));
+	check("a cut mid-wrap still fits", tiny.lines.every((l) => l.length <= 26) && tiny.lines.length <= 5, `${tiny.lines.length}`);
+
+	const compact = planWidgetLines(d, { width: 44, maxRows: 6, cursor: null, anchor: "top" });
+	check("without wrap the one-row truncation is unchanged", compact.lines.length <= 6 && compact.lines.every((l) => l.length <= 44), compact.lines.join("\n"));
+
+	let calls = 0;
+	const inj = planWidgetLines(d, {
+		width: 44, maxRows: 14, wrap: true, cursor: null, anchor: "top",
+		wrapText: (t, cw) => { calls++; const out: string[] = []; for (let i = 0; i < t.length; i += cw) out.push(t.slice(i, i + cw)); return out; },
+	});
+	check("the injected wrapText is the one used", calls > 0 && inj.lines.length <= 14, `${calls} calls`);
+	check("an injected wrapper's row count decides the layout", inj.lines.filter((l) => l.startsWith("     ")).length > 0, inj.lines.join("\n"));
+
+	let busy = newPlanDoc({ title: "B", steps: Array.from({ length: 20 }, (_x, i) => (i === 6 ? long : `step ${i + 1}`)) });
+	busy = applyPlanOp(busy, { action: "status", id: 7, status: "doing" }).doc;
+	const act = planWidgetLines(busy, { width: 30, maxRows: 7, wrap: true, cursor: null, anchor: "active" });
+	check("the active step survives a budget too small for its wrap", act.lines.some((l) => l.includes("#7")) && act.lines.length <= 7, act.lines.join("\n"));
+	check("the wrap gives priority to the row that is actually running", act.lines.some((l) => l.includes("reachable") || l.includes("…")), act.lines.join("\n"));
 })();
 
 // ── 6. disk round trip ────────────────────────────────────────────────────────

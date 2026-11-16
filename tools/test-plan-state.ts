@@ -25,12 +25,15 @@ import {
 	consoleExitedSteer,
 	consolePlanningRulesText,
 	finishPlanReminder,
+	planCompletedOf,
 	planExecutingFrame,
 	planExecutingOf,
+	planFinishedOf,
 	planFlagOf,
 	planFooterMarker,
 	planGuardArmed,
 	planLabel,
+	planPanelVisibleOf,
 	planPausedFrame,
 	planStatusLine,
 	planStyleForNewPlan,
@@ -41,6 +44,9 @@ import {
 	planningPausedSteer,
 	planningResumeText,
 	planningRulesText,
+	bindConsolePlanForStart,
+	planRetiredOf,
+	retiredPlanOf,
 	type PlanAction,
 	type PlanView,
 } from "../extensions/lib/plan-state.ts";
@@ -280,6 +286,31 @@ void (() => {
 	check("executing frame names the plan and its progress", (planExecutingFrame(executed) ?? "").includes("PLAN IMPLEMENTING") && (planExecutingFrame(executed) ?? "").includes("0/2"), planExecutingFrame(executed)?.slice(0, 60));
 	check("no executing frame without the flag", planExecutingFrame(tuiOn) === null);
 
+	// ── #18: a FINISHED plan stops claiming to be implementing ────────────────────
+	{
+		let d2 = applyPlanOp(applyPlanOp(newPlanDoc({ title: "Console plan", task: "t" }), { action: "add", text: "step one" }).doc, { action: "add", text: "step two" }).doc;
+		d2 = applyPlanOp(d2, { action: "status", id: 1, status: "done" }).doc;
+		const half: PlanView = { planMode: false, planPaused: false, planFile: null, planStyle: "tui", planDoc: d2, planExecuting: true };
+		check("a half-finished console is still implementing", planCompletedOf(half) === false && planPanelVisibleOf(half) === true, planStatusLine(half));
+		check("and still says so in the frame, the title and the footer", planExecutingFrame(half) !== null && planTitleMarker(half) === "📋 CONSOLE PLAN ▶" && planFooterMarker(half) === "📋▶");
+		d2 = applyPlanOp(d2, { action: "status", id: 2, status: "dropped" }).doc;
+		const fin: PlanView = { ...half, planDoc: d2 };
+		check("done + dropped counts as finished", planCompletedOf(fin) === true, planStatusLine(fin));
+		check("planFinishedOf is the one-shot moment a completion may be announced", planFinishedOf(fin) === true && planFinishedOf(half) === false);
+		check("the [PLAN IMPLEMENTING] frame goes silent", planExecutingFrame(fin) === null, planExecutingFrame(fin) ?? "");
+		check("the 📋▶ title and footer drop", planTitleMarker(fin) === null && planFooterMarker(fin) === null, `${planTitleMarker(fin)} / ${planFooterMarker(fin)}`);
+		check("the panel is no longer visible", planPanelVisibleOf(fin) === false);
+		check("the status line reports a finished plan, not 'off'", planStatusLine(fin).includes("COMPLETE"), planStatusLine(fin));
+		const cleared: PlanView = { ...fin, planExecuting: false };
+		check("a cleared flag still reads as a finished plan", planCompletedOf(cleared) === true && planExecutingOf(cleared) === false);
+		const reopened = applyPlanOp(d2, { action: "status", id: 2, status: "open" }).doc;
+		const back: PlanView = { ...fin, planDoc: reopened };
+		check("re-opening a step un-finishes the plan (and its panel)", planCompletedOf(back) === false && planPanelVisibleOf(back) === true);
+		check("planning and paused plans always keep the panel", planPanelVisibleOf(tuiOn) === true && planPanelVisibleOf({ ...tuiOn, planMode: false, planPaused: true }) === true);
+		check("file mode has no live panel to hide", planPanelVisibleOf(fileOn) === false && planCompletedOf(fileOn) === false);
+		check("an approved plan with no steps is not 'complete'", planCompletedOf({ planMode: false, planPaused: false, planFile: null, planStyle: "tui", planDoc: newPlanDoc({ title: "empty" }), planExecuting: true }) === false);
+	}
+
 	// Pause/resume are IDENTICAL in both styles — only the wording differs.
 	const tuiPause = planTransition(tuiOn, "pause");
 	check("console pause pauses like everything else", tuiPause.ok && tuiPause.flag === "paused");
@@ -306,6 +337,91 @@ void (() => {
 	check("console rules never mention a plan file path", !/\.md/.test(rules), rules.match(/\.md/)?.[0] ?? "");
 	check("the file-mode rules are unchanged (both modes coexist)", planningRulesText("C:/plan/PLAN.md").includes("C:/plan/PLAN.md") && planningResumeText("f").includes("RESUMED"));
 	check("the finish_plan reminder is shared by both styles", finishPlanReminder().includes("finish_plan"));
+})();
+
+// ── 8b. #22: a FINISHED plan is retired when a new plan starts ───────────────
+void (() => {
+	console.log("retiring a finished plan (#22)");
+
+	// A finished checklist that nothing is implementing any more (the state the user walked into).
+	let done = newPlanDoc({ title: "Old plan", task: "the old request" });
+	done = applyPlanOp(done, { action: "add", text: "first" }).doc;
+	done = applyPlanOp(done, { action: "status", id: 1, status: "done" }).doc;
+	const staleOn: PlanView = { planMode: true, planPaused: false, planFile: null, planStyle: "tui", planDoc: done };
+	const staleOff: PlanView = { ...staleOn, planMode: false };
+	const paused: PlanView = { ...staleOn, planMode: false, planPaused: true };
+	const executing: PlanView = { ...staleOff, planDoc: done, planExecuting: true };
+	const half = applyPlanOp(done, { action: "status", id: 1, status: "open" }).doc;
+	const draft: PlanView = { planMode: true, planPaused: false, planFile: null, planStyle: "tui", planDoc: half };
+
+	check("a finished, idle plan reads as RETIRED", planRetiredOf(staleOff) === true);
+	check("and a finished plan still bound to planning mode reads as retired too (the bug you walked into)", planRetiredOf(staleOn) === true);
+	check("a plan mid-implementation is never retired", planRetiredOf(executing) === false);
+	check("a half-drafted plan is never retired", planRetiredOf(draft) === false);
+	check("an empty plan is never retired (nothing to archive)", planRetiredOf({ planMode: false, planPaused: false, planFile: null, planStyle: "tui", planDoc: newPlanDoc({ title: "empty" }) }) === false);
+	check("file mode has no document to retire", planRetiredOf({ planMode: true, planFile: "C:/plan/PLAN.md" }) === false);
+
+	// The bind rule every entry point shares.
+	const freshFromStale = bindConsolePlanForStart(staleOff, { task: "new request", title: "New plan" });
+	check("a fresh start over a finished plan binds an EMPTY document", freshFromStale.doc.steps.length === 0, JSON.stringify(freshFromStale.doc.steps));
+	check("the new document carries THIS task, not the old one", freshFromStale.doc.task === "new request" && freshFromStale.doc.title === "New plan", `${freshFromStale.doc.title} / ${freshFromStale.doc.task}`);
+	check("and the finished plan is handed back to be archived", freshFromStale.retired === done);
+	const freshFromDraft = bindConsolePlanForStart(draft, { task: "another request", title: "Another" });
+	check("a draft is KEPT — starting never destroys work in progress", freshFromDraft.doc === half && freshFromDraft.retired === null);
+	const freshFromPaused = bindConsolePlanForStart(paused, { task: "t", title: "T" });
+	check("a paused plan keeps its document whatever its step statuses", freshFromPaused.doc === done && freshFromPaused.retired === null);
+	const freshFromNothing = bindConsolePlanForStart({ planMode: false, planPaused: false, planFile: null, planStyle: "tui", planDoc: null }, { task: "t", title: "T" });
+	check("nothing bound binds a fresh document, and archives nothing", freshFromNothing.doc.steps.length === 0 && freshFromNothing.retired === null);
+	const resetOnDraft = bindConsolePlanForStart(draft, { task: "t", title: "T" }, { keepDraft: false });
+	check("plan_doc reset clears a live draft (and archives nothing)", resetOnDraft.doc.steps.length === 0 && resetOnDraft.retired === null);
+	const resetOnFinished = bindConsolePlanForStart(staleOff, { task: "t", title: "T" }, { keepDraft: false });
+	check("but a reset ARCHIVES a finished plan instead of dropping it", resetOnFinished.retired === done && resetOnFinished.doc.steps.length === 0);
+	const titleFromTask = bindConsolePlanForStart(staleOff, { task: "a long request that has to become the title" });
+	check("a title falls back to the task text, cut to 80 columns", titleFromTask.doc.title === "a long request that has to become the title", titleFromTask.doc.title);
+
+	// The archive is a separate document, reachable only through its own accessor.
+	check("retiredPlanOf reads the archive, not the live plan", retiredPlanOf({ ...staleOff, planDoc: half, planDocPrevious: done }) === done);
+	check("with no archive it says so", retiredPlanOf(staleOff) === null);
+	check("file mode has no archive", retiredPlanOf({ ...staleOff, planStyle: "file", planDocPrevious: done }) === null);
+	check("the archive never makes a plan visible in the panel", planPanelVisibleOf({ ...staleOff, planDoc: null, planDocPrevious: done }) === false);
+
+	// Disk: the archive survives exactly like the plan does.
+	const sid = `test-plan-retire-${Date.now()}`;
+	const file = sessionStateFile(sid);
+	try {
+		updateSessionState(sid, s => {
+			s.planStyle = "tui"; s.planFile = null;
+			s.planDoc = done;
+			s.planDocPrevious = null;
+			applyPlanTransition(s, "on");
+			const bound = bindConsolePlanForStart(s, { task: "new request", title: "New plan" });
+			s.planDoc = bound.doc;
+			if (bound.retired) s.planDocPrevious = bound.retired;
+		});
+		const back = loadSessionState(sid);
+		check("the retired plan survives a reload in its own field", retiredPlanOf(back)?.steps[0]?.text === "first", JSON.stringify(retiredPlanOf(back)?.steps));
+		check("while the live plan is the fresh one", consolePlanOf(back)?.steps.length === 0 && consolePlanOf(back)?.task === "new request", JSON.stringify(consolePlanOf(back)?.task));
+		check("the archive is not mistaken for the console's plan", planRetiredOf(back) === false, planStatusLine(back));
+		// Exit keeps both: the fresh plan and its archive.
+		updateSessionState(sid, s => { applyPlanTransition(s, "exit"); });
+		const exited = loadSessionState(sid);
+		check("/plan exit keeps the archive too", retiredPlanOf(exited)?.steps[0]?.text === "first" && consolePlanOf(exited)?.steps.length === 0);
+		// A hand-edited / corrupt archive must read as NO archive, never as a half one.
+		fs.writeFileSync(file, JSON.stringify({ planMode: true, planPaused: false, planFile: null, planStyle: "tui", planDoc: half, planDocPrevious: { steps: [{ text: 99999 }] } }));
+		const corrupt = loadSessionState(sid);
+		check("a corrupt archive coerces to no archive", retiredPlanOf(corrupt) === null, JSON.stringify(corrupt.planDocPrevious));
+		check("and it never drops planning mode over a plan that is only missing an archive", planFlagOf(corrupt) === "on" && consolePlanOf(corrupt) !== null, planFlagOf(corrupt));
+		// An archive with NO live plan must not be read as "a plan is bound".
+		fs.writeFileSync(file, JSON.stringify({ planMode: true, planPaused: false, planFile: null, planStyle: "tui", planDoc: null, planDocPrevious: done }));
+		const archiveOnly = loadSessionState(sid);
+		check("archive alone does not count as a bound plan (planning mode drops, as before)", planFlagOf(archiveOnly) === "off" && consolePlanOf(archiveOnly) === null);
+		check("but the archive itself is still readable after that", retiredPlanOf(archiveOnly)?.steps[0]?.text === "first", JSON.stringify(retiredPlanOf(archiveOnly)));
+		// Old state files (no such key) load unchanged.
+		fs.writeFileSync(file, JSON.stringify({ planMode: false, planPaused: false, planFile: "C:/old/PLAN.md" }));
+		check("a legacy state file reads with no archive", retiredPlanOf(loadSessionState(sid)) === null);
+	} finally {
+		try { fs.rmSync(file, { force: true }); } catch { /* cleanup */ }
+	}
 })();
 
 // ── 9. approval dialog rows (finish_plan needs "Keep planning" in row 2) ───

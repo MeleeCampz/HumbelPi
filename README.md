@@ -220,7 +220,9 @@ the [official docs](https://docs.docker.com/ai/sandboxes/).
   you back on Approve / Keep planning with what you typed kept, so you can still approve;
   `ctrl+c` is the deliberate cancel. Same flow as `ask_user` (shared `extensions/lib/ask-loop.ts`).
   Below those two rows are **⏸️ Pause** and **⏏️ Exit**, so leaving planning mode — temporarily
-  or for good — is answerable at exactly the moment you are deciding about the plan.
+  or for good — is answerable at exactly the moment you are deciding about the plan. A console plan
+  adds a fifth row, **👀 Review the full plan first**, which opens the whole plan in the overlay
+  editor before you decide — see "Two kinds of plan" below.
 - Planning state also syncs into the window title, so it's visible at a glance.
 
 ### Two kinds of plan: a file, or the console itself
@@ -232,7 +234,8 @@ and is edited by both sides without leaving the TUI.
 
 - **Enter**: `/plan tui [task]` (or `/plan on` when the machine default is set to console mode).
   `/plan default tui|file` decides what a bare `/plan on` means; `/plan file [task]` is the file
-  mode spelled out explicitly. Which style a plan uses is decided once per plan, not per command:
+  mode spelled out explicitly; `/plan wrap on|off|status` decides whether long rows are expanded.
+  Which style a plan uses is decided once per plan, not per command:
   an existing plan keeps its style, so `/plan resume` on a paused console never resurrects a file.
 - **The plan is a checklist, not prose**: steps (with stable `#ids` that survive adds, removals and
   reorders), plus decisions, constraints and open questions — because a plan that only says *what*
@@ -244,19 +247,56 @@ and is edited by both sides without leaving the TUI.
   there is no exempt file, because there is no file to protect.
 - **You edit it with `/plan view`**: an overlay editor over the live plan — ↑↓ move, `Tab` section,
   `e`/⏎ edit a row, `a` add, `x` cycle status, `[` `]` reorder, `D` drop (and `D` again to remove —
-  one stray keystroke never erases a row), `esc` closes. Every keystroke commits immediately as an
-  operation against the session state, so the agent's `plan_doc` calls and your hand edits cannot
-  overwrite each other; when the overlay closes, the model is told exactly which rows you changed.
+  one stray keystroke never erases a row), `w` wraps or compacts long rows, `esc` closes. Every
+  keystroke commits immediately as an operation against the session state, so the agent's `plan_doc`
+  calls and your hand edits cannot overwrite each other; when the overlay closes, the model is told
+  exactly which rows you changed.
+- **Long steps wrap instead of being cut off** (`w` in the overlay, `/plan wrap on|off|status` for the
+  panel). A step that runs past the terminal width is continued on the next row with a hanging indent,
+  so the whole sentence is readable and its `#id` still lines up with its status marker. Wrapping is
+  on by default in the overlay (you opened it to read) and off in the live panel, whose budget is at
+  most a third of the terminal — `on` makes the panel wrap too, and wrapped rows are counted against
+  the panel budget, so a long plan can never push the editor off screen.
 - **A live panel above the editor** shows the plan and its progress while the mode is on, and it
-  re-reads the state on every frame — the panel is a view of the file, never a copy of it.
+  re-reads the state on every frame — the panel is a view of the plan, never a copy of it. It is
+  **anchored where you are**: while planning it shows the newest steps (a plan the model has just
+  appended to is visible, not buried under "↓ 12 more below"), and while implementing it shows the
+  **active step** — the `◐` one, or the next step to be started, marked `▶ #7` in the header — so the
+  checklist scrolls with the work instead of freezing at step 1. `↑ N more above` / `↓ N more below`
+  say exactly what is off screen.
 - **Approval is the same dialog as file mode** (approve / keep planning / pause / exit), reached via
-  `finish_plan` or `/plan approve`. Approving a console plan ends planning mode but keeps the plan
-  live while it is implemented: the panel stays, each user message carries the remaining steps, and
-  the model marks steps done as it goes — so a long implementation cannot drift off the checklist
-  you approved.
-- `/plan view` also reads a plan from print/rpc mode (as plain text), and `/plan export [file]` /
-  `/plan import [file]` move a console plan to or from markdown, so the two styles are not locked
-  in: a file plan can be drafted as a file and finished as a checklist, or the other way around.
+  `finish_plan` or `/plan approve` — plus a fifth row here: **👀 Review the full plan first**, which
+  opens the whole plan in the `/plan view` overlay (wrapped, pageable, every step and note) and puts
+  you back on the four outcomes when you press `esc`, with the cursor back on Approve. Reviewing is
+  not read-only: if you fix a step while you are there, that edit is committed like any other and is
+  named in the implementation instruction when you then approve. Nothing but the exact Approve row
+  starts implementation.
+- Approving a console plan ends planning mode but keeps the plan **live while it is implemented**: the
+  panel stays, each user message carries the remaining steps, and the model marks steps done as it goes
+  — so a long implementation cannot drift off the checklist you approved. When the last step is
+  settled the plan **dismisses itself**: the panel disappears, the `📋▶` title and footer markers drop,
+  the `[PLAN IMPLEMENTING]` frame stops being sent, one "plan complete" notice is printed, and the
+  console is just a console again. The document itself is not thrown away — `/plan view`,
+  `/plan status` and `/plan export` still read the finished plan, so "what was I supposed to have
+  done" is answerable after the fact.
+- **A finished plan does not shadow the next one.** The moment you start planning again (`/plan tui`,
+  `/plan on`, or the backlog's *Plan these (console plan)*), a checklist whose steps are all settled
+  (`done` **or** `dropped`) and that is no longer being implemented is **retired**: it moves to its own
+  slot in the session state and a FRESH empty document is bound to the new task, so the panel shows
+  only the new plan and the model starts with no stale steps. `/plan view last` opens the retired plan
+  in the same overlay but **read-only** — same scrolling, same `w`, while `e`/`a`/`x`/`D`/`[`/`]`/`⏎`
+  answer "an archived plan is read-only — `/plan export last [file]` saves it as markdown, `/plan view`
+  edits the live one", and closing reports zero edits. `/plan export last [file]` writes it out
+  (default `.pi/PLAN-archived.md`) **without binding anything** — console mode keeps no plan file, on
+  purpose. `/plan status` names the archived plan and how to read it. A half-drafted plan is **never**
+  retired: only a fresh start retires, so `/plan exit` then `/plan resume` gets the same document back
+  whatever its step statuses say — pausing mid-implementation cannot lose work — and `plan_doc` with
+  `action=reset` archives a finished plan rather than silently wiping it. One archive slot, not a
+  history: the next retirement replaces it, so save anything you want to keep.
+- `/plan view` also reads a plan from print/rpc mode (as plain text), `/plan view last` reads the
+  archived plan from either mode, and `/plan export [file]` / `/plan import [file]` move a console plan
+  to or from markdown, so the two styles are not locked in: a file plan can be drafted as a file and
+  finished as a checklist, or the other way around.
 
 ## Backlog
 
@@ -372,7 +412,8 @@ no post-enter confirmation: the text is sent exactly as typed.
 extensions/
   guards.ts        sandbox + git-push guard, yolo mode, unattended mode (/away [instruction]),
                    planning mode (/plan on [task] file mode, /plan tui [task] console mode,
-                   plan_doc tool, /plan view overlay editor, live plan panel),
+                   plan_doc tool, /plan view overlay editor, live plan panel, /plan view last for a
+                   retired plan),
                    per-group permission dialogs, custom footer (perf stats), title sync
   backlog.ts       /backlog checklist: multi-select + actions (plan-console/plan-file/implement/done/delete/clear)
   perf-stats.ts    tok/s + TTFT measured client-side, shown in the footer
@@ -393,8 +434,10 @@ extensions/
                    ansi-style.ts (ANSI-aware column styling + the shared selection color) ·
                    shift-moves.ts (the key classification both selection hosts share) ·
                    spell-words.ts (the typo rule) · plan-state.ts (planning-mode state
-                   machine: on/paused/off, both plan styles) · plan-file.ts ·
+                   machine: on/paused/off, both plan styles, when a settled plan is retired to
+                   planDocPrevious) · plan-file.ts ·
                    plan-doc.ts (the console plan: a pure step/note model — operations, renderers,
+                   the windowed panel view with an active-step anchor and wrapped rows,
                    markdown import/export; no pi, no fs, so it is testable on its own) ·
                    plan-view.ts (the /plan overlay editor — pi-tui-only, driven by real keystrokes
                    in the tests) · session-state.ts (state IO)
@@ -410,9 +453,10 @@ tools/
   test-*.ts          regression tests — npx tsx tools/test-ask-flow.ts |
                      test-backlog-scroll.ts (needs pi's own node_modules on NODE_PATH) |
                      test-yolo.ts | test-secret-scan.ts | test-plan-state.ts |
-                     test-plan-doc.ts (the console plan model) |
-                     test-plan-view.ts (the overlay editor, driven by keystrokes) |
-                     test-dialog-select.ts
+                     test-plan-doc.ts (the console plan model, incl. the anchored window and wrapped
+                     rows counted against the panel budget) |
+                     test-plan-view.ts (the overlay editor, driven by keystrokes, incl. the `w`
+                     wrap/compact toggle) | test-dialog-select.ts
   tsconfig.check.json typecheck scaffold — npx tsc -p tools/tsconfig.check.json --noEmit
                      (Windows: tools/mklink.bat first, to give node_modules the two pi packages)
 ```

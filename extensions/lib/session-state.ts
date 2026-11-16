@@ -64,9 +64,17 @@ export interface SessionState {
 	 * tracking. Only ever meaningful when planStyle === "tui"; coerced to false otherwise.
 	 */
 	planExecuting?: boolean;
+	/**
+	 * #22: the last RETIRED console plan — a checklist whose every step was settled, moved aside when a
+	 * NEW plan started so a finished plan can never shadow the one being drafted. Human-facing only:
+	 * plan_doc, the implementation instruction, the live panel, the title/footer markers and every frame
+	 * read planDoc and never this. Kept while planning mode is OFF and across /plan exit and reload —
+	 * that is exactly when you want to read it. One slot, not a history: /plan view last, /plan export last.
+	 */
+	planDocPrevious?: PlanDoc | null;
 }
 
-export const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false, planPaused: false, planStyle: "file", planDoc: null, planExecuting: false };
+export const DEFAULT_SESSION_STATE: SessionState = { planMode: false, planFile: null, unattendedMode: false, planPaused: false, planStyle: "file", planDoc: null, planExecuting: false, planDocPrevious: null };
 
 /**
  * Yolo default (#14): ON when we detect a sandbox — the container IS the isolation
@@ -119,6 +127,9 @@ export function loadSessionState(sessionId: string): SessionState {
 		const merged = { ...freshSessionState(), ...clean } as SessionState;
 		// #16: the console plan is coerced, not trusted — an unusable planDoc reads as NO plan.
 		merged.planDoc = merged.planDoc ? normalizePlanDoc(merged.planDoc) : null;
+		// #22: same rule for the retired plan. It is allowed to exist while planMode is OFF (that is the
+		// point — you read it after the fact), and it never counts as "a plan is bound" for the rules below.
+		merged.planDocPrevious = merged.planDocPrevious ? normalizePlanDoc(merged.planDocPrevious) : null;
 		if (merged.planStyle !== "tui") merged.planStyle = "file";
 		// Executing is a console-mode fact: file mode never had a live checklist, and an executing
 		// flag with no document is tracking nothing — read it as off rather than as a broken plan.
@@ -196,6 +207,14 @@ export interface GuardState {
 	 * so an existing setup changes nothing until it is asked for.
 	 */
 	planStyleDefault?: PlanStyle;
+	/**
+	 * #17: does the live console-plan panel show long step texts in FULL (wrapped over several rows)
+	 * or cut at the terminal width? Deliberately OPTIONAL, and deliberately not in DEFAULT_GUARD_STATE:
+	 * "unset" and "off" must stay different answers, because the two surfaces want different
+	 * defaults from the same key — the panel wraps only when asked (its budget is a third of the
+	 * terminal), the /plan view overlay wraps unless told otherwise (you opened it to read).
+	 */
+	planWrap?: boolean;
 }
 
 export const DEFAULT_GUARD_STATE: GuardState = {
@@ -240,6 +259,9 @@ export function loadGuardState(): GuardState {
 		const s = { ...DEFAULT_GUARD_STATE, ...raw } as GuardState;
 		if (!Array.isArray(s.readOnlyPaths)) s.readOnlyPaths = [];
 		if (s.planStyleDefault !== "tui") s.planStyleDefault = "file";
+		// #17: three-state on purpose — only a real boolean counts as an explicit choice, so an old
+		// guard-state file keeps "no preference yet" instead of silently becoming "off".
+		if (s.planWrap !== true && s.planWrap !== false) s.planWrap = undefined;
 		s.yoloMode = migrateLegacyYolo(raw);
 		return s;
 	} catch {
