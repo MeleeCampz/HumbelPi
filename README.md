@@ -241,13 +241,29 @@ and is edited by both sides without leaving the TUI.
   reorders), plus decisions, constraints and open questions — because a plan that only says *what*
   to do loses the two things you actually want to review: *why* it was decided that way and *what
   is not allowed*. Steps carry a status (open / doing / done / dropped).
-- **The model writes it with the `plan_doc` tool** (add / update / status / note / reorder /
+- **…and it can carry the document behind the checklist.** `plan_doc action=brief` writes a markdown
+  **Brief**: the background, the approach, a comparison table, the API shape in a fenced block — the
+  material that is too big for a one-line step and would otherwise be lost in chat scrollback. It is
+  stored in the session state like the rest of the plan (capped at 20 000 characters), it travels with
+  the approval (the implementation instruction quotes it, because it is the reasoning the steps rest
+  on), and the model is told it exists on every planning message without the whole body being re-sent
+  each time. **`/plan view` → `Tab` to Brief renders it with pi's own markdown renderer** — the same
+  one that draws the assistant's messages, so a table gets real box-drawing borders, headings are
+  headings, quotes and rules render, and a long paragraph wraps instead of running off the panel. There
+  the cursor names a **line of the source** (`❯ line 4/13 · ⏎ edits: …`) because the rendered body is
+  wrapped and rows are not lines: `↑↓` move by line, `e`/`⏎` rewrites that line, `a` adds one, `D`
+  deletes one, and a checklist key like `x` or `[` answers "does not apply to the brief" instead of
+  going dead. From your side: **`/plan brief <file>`** loads a markdown file you wrote yourself as the
+  body, **`/plan brief`** opens the overlay directly on that section, **`/plan brief clear`** removes
+  it, and `/plan status` reports what is in it. A plan without a brief looks exactly as it did before.
+- **The model writes it with the `plan_doc` tool** (add / update / status / note / brief / reorder /
   remove / show …). Every result returns the current plan, so the model never reasons from a stale
   copy. In console mode the write guard blocks **every** write and every file-writing command —
   there is no exempt file, because there is no file to protect.
-- **You edit it with `/plan view`**: an overlay editor over the live plan — ↑↓ move, `Tab` section,
-  `e`/⏎ edit a row, `a` add, `x` cycle status, `[` `]` reorder, `D` drop (and `D` again to remove —
-  one stray keystroke never erases a row), `w` wraps or compacts long rows, `esc` closes. Every
+- **You edit it with `/plan view`**: an overlay editor over the live plan — ↑↓ move, `Tab` section
+  (Steps → Brief → Decisions → Constraints → Open questions), `e`/⏎ edit a row, `a` add, `x` cycle
+  status, `[` `]` reorder, `D` drop (and `D` again to remove — one stray keystroke never erases a row),
+  `w` wraps or compacts long rows, `esc` closes. Every
   keystroke commits immediately as an operation against the session state, so the agent's `plan_doc`
   calls and your hand edits cannot overwrite each other; when the overlay closes, the model is told
   exactly which rows you changed.
@@ -295,7 +311,8 @@ and is edited by both sides without leaving the TUI.
   history: the next retirement replaces it, so save anything you want to keep.
 - `/plan view` also reads a plan from print/rpc mode (as plain text), `/plan view last` reads the
   archived plan from either mode, and `/plan export [file]` / `/plan import [file]` move a console plan
-  to or from markdown, so the two styles are not locked in: a file plan can be drafted as a file and
+  to or from markdown — the Brief included (`## Brief`, which the importer reads back as the body rather
+  than as a pile of steps) — so the two styles are not locked in: a file plan can be drafted as a file and
   finished as a checklist, or the other way around.
 
 ## Backlog
@@ -437,10 +454,12 @@ extensions/
                    machine: on/paused/off, both plan styles, when a settled plan is retired to
                    planDocPrevious) · plan-file.ts ·
                    plan-doc.ts (the console plan: a pure step/note model — operations, renderers,
-                   the windowed panel view with an active-step anchor and wrapped rows,
-                   markdown import/export; no pi, no fs, so it is testable on its own) ·
+                   the windowed panel view with an active-step anchor and wrapped rows, the optional
+                   markdown Brief, markdown import/export; no pi, no fs, no pi-tui, so it is testable
+                   on its own) ·
                    plan-view.ts (the /plan overlay editor — pi-tui-only, driven by real keystrokes
-                   in the tests) · session-state.ts (state IO)
+                   in the tests; the brief section renders through pi-tui's own Markdown component)
+                   · session-state.ts (state IO)
                    notify.ts (done-notify engine)
 .githooks/pre-push   secret scan that runs on every push (this repo is public)
 bin/
@@ -454,9 +473,11 @@ tools/
                      test-backlog-scroll.ts (needs pi's own node_modules on NODE_PATH) |
                      test-yolo.ts | test-secret-scan.ts | test-plan-state.ts |
                      test-plan-doc.ts (the console plan model, incl. the anchored window and wrapped
-                     rows counted against the panel budget) |
+                     rows counted against the panel budget, and the brief: cap, render, export/import
+                     round trip, which headings become the document and which stay the checklist) |
                      test-plan-view.ts (the overlay editor, driven by keystrokes, incl. the `w`
-                     wrap/compact toggle) | test-dialog-select.ts
+                     wrap/compact toggle, the Brief section's rendered markdown and its line editor) |
+                     test-dialog-select.ts
   tsconfig.check.json typecheck scaffold — npx tsc -p tools/tsconfig.check.json --noEmit
                      (Windows: tools/mklink.bat first, to give node_modules the two pi packages)
 ```

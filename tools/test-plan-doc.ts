@@ -322,6 +322,86 @@ void (() => {
 	check("export carries the notes", back.includes("## Decisions") && back.includes("keep file mode intact"));
 })();
 
+// ── 8b. #23: the brief — the markdown document a console plan can carry ─────────
+void (() => {
+	console.log("the brief");
+	const MD = [
+		"## Why the split",
+		"",
+		"The embedder stays on CPU; the reranker moves to GPU:0.",
+		"",
+		"| part | where | why |",
+		"| --- | --- | --- |",
+		"| embedder | CPU | fp32 is enough |",
+		"| reranker | GPU:0 | 8x faster there |",
+		"",
+		"```ts",
+		'const split = { embed: "cpu", rank: "cuda:0" };',
+		"```",
+	].join("\n");
+
+	let d = newPlanDoc({ title: "GPU split", task: "split the model across devices" });
+	d = applyPlanOp(d, { action: "add", text: "wire the reranker" }).doc;
+	const before = d;
+	let r = applyPlanOp(d, { action: "brief", text: MD });
+	check("brief writes a body without touching the steps", r.ok && r.doc.brief === MD && r.doc.steps.length === 1, r.log);
+	check("a body that starts with a heading is NAMED in the log (a tool result stays readable)", r.ok && /^brief (written|replaced): Why the split$/.test(r.log), r.log);
+	const plain = applyPlanOp(d, { action: "brief", text: "Just prose, no heading at all." });
+	check("a body with no heading falls back to counting characters", /characters of markdown/.test(plain.log), plain.log);
+	check("applyPlanOp did not mutate the document it was given", before.brief === undefined && d.revised === before.revised, JSON.stringify([before.brief, d.revised, before.revised]));
+	d = r.doc;
+
+	r = applyPlanOp(d, { action: "brief", text: MD });
+	check("writing the identical body is refused (a no-op is not a revision)", !r.ok && /already that text/.test(r.log), r.log);
+	r = applyPlanOp(d, { action: "brief", text: "## Shorter\n\nOne paragraph." });
+	check("a second brief REPLACES it", r.ok && r.doc.brief === "## Shorter\n\nOne paragraph." && r.doc.brief !== MD, r.log);
+	r = applyPlanOp(r.doc, { action: "brief", text: "   \n\n  " });
+	check("whitespace-only clears the brief", r.ok && r.doc.brief === undefined && r.log.includes("cleared"), r.log);
+	r = applyPlanOp(r.doc, { action: "brief", text: "" });
+	check("clearing a brief that is not there says so", !r.ok && /no brief to clear/.test(r.log), r.log);
+
+	r = applyPlanOp(d, { action: "brief", text: "x".repeat(30_000) });
+	check("an oversized body is refused with a reason, not silently cut", !r.ok && /capped at/.test(r.log), r.log.slice(0, 90));
+
+	const kept = normalizePlanDoc(JSON.parse(JSON.stringify(d)));
+	check("the brief survives the session-state round trip", kept?.brief === MD, String(kept?.brief).slice(0, 40));
+	const corrupt = normalizePlanDoc({ ...JSON.parse(JSON.stringify(d)), brief: { not: "a string" } });
+	check("a brief that is not a string is dropped, not trusted", corrupt?.brief === undefined && corrupt?.steps.length === 1, JSON.stringify([corrupt?.brief, corrupt?.steps?.length]));
+	const truncated = normalizePlanDoc({ ...JSON.parse(JSON.stringify(d)), brief: "y".repeat(40_000) });
+	check("a brief already too long on disk is clamped, not rejected outright", (truncated?.brief ?? "").length <= 20_000 && (truncated?.brief ?? "").length > 0, String((truncated?.brief ?? "").length));
+	check("newPlanDoc can seed a brief (and trims its tail)", newPlanDoc({ brief: "## hi\n\n" }).brief === "## hi", JSON.stringify(newPlanDoc({ brief: "## hi\n\n" }).brief));
+
+	// The model-facing text: the brief travels with every plan_doc result and with the approval.
+	const txt = renderPlanText(d);
+	check("renderPlanText carries the brief", txt.includes("Brief (") && txt.includes("| embedder | CPU | fp32 is enough |"), txt.slice(-120));
+	check("and prints it VERBATIM, not indented (indent would make a table into code)", txt.split("\n").some((l) => l.startsWith("| part |")), JSON.stringify(txt.split("\n").filter((l) => l.startsWith("| part")).at(0)));
+	const capped = renderPlanText(d, { maxBrief: 60 });
+	check("a capped render admits how much it hid", capped.includes("more characters") && !capped.includes("8x faster there"), capped.slice(-90));
+	const frame = renderPlanText(d, { compact: true, heading: "[PLAN MODE]" });
+	check("the per-message frame NAMES the body without resending it (a model must know a brief exists)",
+		frame.includes("lines of markdown sit behind these steps") && !frame.includes("| embedder | CPU | fp32 is enough |"), frame.slice(-160));
+	check("and a compact frame of a plan with NO brief says nothing about one",
+		!renderPlanText(before, { compact: true, heading: "[PLAN MODE]" }).includes("Brief"), renderPlanText(before, { compact: true }).slice(-120));
+
+	const ins = implementationInstructionFromDoc(d);
+	check("the approval instruction carries the brief (it is the reasoning the steps rest on)", ins.includes("brief") && ins.includes("reranker moves to GPU:0"), ins.slice(0, 160));
+
+	// The markdown bridge, both directions.
+	const md = planDocToMarkdown(d);
+	check("export writes the brief under a heading the importer recognises", md.includes("## Brief") && md.includes("const split = { embed"), md.slice(0, 140));
+	const re = planDocFromMarkdown(md);
+	check("import reads the body back as ONE brief", (re.brief ?? "").includes("| embedder | CPU | fp32 is enough |") && (re.brief ?? "").includes("const split = { embed"), String(re.brief).slice(0, 90));
+	check("a table inside the brief did NOT become steps", re.steps.length === 1, re.steps.map((s) => s.text).join(" / "));
+	check("nor did the fenced code", !re.steps.some((s) => s.text.includes("const split")), re.steps.map((s) => s.text).join(" / "));
+
+	// The decision that pins the importer's precedence (see the comment in planDocFromMarkdown).
+	const approach = planDocFromMarkdown(["# T", "", "## Approach", "1. first", "- [ ] second"].join("\n"));
+	check("## Approach still means the checklist, not a document block", approach.steps.length === 2 && approach.brief === undefined, JSON.stringify([approach.steps.map((s) => s.text), approach.brief]));
+	const bg = planDocFromMarkdown(["# T", "", "## Background", "A paragraph about the host.", "", "## Steps", "1. first"].join("\n"));
+	check("## Background opens a document block and ## Steps reopens the checklist", (bg.brief ?? "").includes("A paragraph about the host.") && bg.steps.length === 1, JSON.stringify([bg.brief, bg.steps.map((s) => s.text)]));
+	check("a plan with no brief renders exactly as it did before #23", !renderPlanText(newPlanDoc({ title: "plain" })).includes("Brief ("), renderPlanText(newPlanDoc({ title: "plain" })));
+})();
+
 console.log("");
 if (failures > 0) { console.error(`${failures} of ${checks} CHECK(S) FAILED`); process.exit(1); }
 console.log(`ALL PASS (${checks} checks)`);

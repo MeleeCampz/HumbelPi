@@ -144,7 +144,7 @@ import {
 	type PlanOpResult,
 	type PlanStyle,
 } from "./lib/plan-doc";
-import { createPlanEditor, planPlainLines, type PlanEditorClose } from "./lib/plan-view";
+import { createPlanEditor, planPlainLines, type PlanEditorClose, type PlanEditorTheme, type PlanSection } from "./lib/plan-view";
 
 const PROTECTED_BRANCHES = new Set(["main", "master"]);
 
@@ -541,6 +541,11 @@ function refreshPlanPanel(ctx: ExtensionContext): void {
 				: planExecutingOf(cur)
 					? "▶ implementing — plan_doc marks steps · /plan view to edit"
 					: "/plan view to read it · /plan tui to plan again";
+			// #23: the panel stays a CHECKLIST — but a plan that has a written-up body should say so, or the
+			// human never learns the reasoning is there to read. FIRST in the hint, not last: the hint row is
+			// long and the terminal cuts it, so a marker bolted on the end is a marker nobody sees.
+			const briefTag = d.brief ? `📝 Brief (${d.brief.split("\n").filter((l: string) => l.trim()).length} lines) · ` : "";
+			const hintWithBrief = `${briefTag}${hint}`;
 			return planWidgetLines(d, {
 				width,
 				maxRows: budget,
@@ -552,7 +557,7 @@ function refreshPlanPanel(ctx: ExtensionContext): void {
 				// this panel's small budget, so it is a preference and not the default.
 				wrap: loadGuardState().planWrap === true,
 				wrapText: (t, w) => wrapTextWithAnsi(t, w),
-				hint,
+				hint: hintWithBrief,
 				theme,
 			}).lines.map((l: string) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
 		},
@@ -1067,6 +1072,9 @@ export default function (pi: ExtensionAPI) {
 							`Planning mode: ${planStatusLine(ss)}`,
 							// #22: the archive is named where you would otherwise wonder about it.
 							...(retiredPlanOf(ss) ? (() => { const r = retiredPlanOf(ss)!; const p = planProgress(r); return [`Archived plan: "${r.title || "untitled"}" (${p.done}/${p.total} settled) — /plan view last reads it, /plan export last [file] saves it.`]; })() : []),
+							// #23: same for the document half of the live plan — /plan status is where you look when
+							// you can see a plan exists but not what is in it.
+							...(ss.planDoc?.brief ? [(() => { const l = ss.planDoc!.brief!.split("\n").filter((x) => x.trim()).length; return `Brief: ${l} lines of markdown (${ss.planDoc!.brief!.length} characters) — /plan view → Brief renders it; /plan brief <file> replaces it, "/plan brief clear" removes it.`; })()] : []),
 							`state file: ${file}`,
 							raw,
 						].join("\n"),
@@ -1139,6 +1147,51 @@ export default function (pi: ExtensionAPI) {
 						break;
 					}
 					await openConsoleEditor(sid, ctx, ss);
+					break;
+				}
+
+				// #23: the human's side of the brief. With a file, that markdown becomes the plan's document;
+				// with no argument, the overlay opens directly on the Brief section (no Tab hunting, and a line
+				// of it can be fixed there the way a step is fixed).
+				case "brief": {
+					if (planStyleOf(ss) !== "tui") {
+						ctx.ui.notify(`The brief is part of a CONSOLE plan. This console plans with a file (${ss.planFile ?? "unbound"}) — a markdown plan file already is the document. /plan tui [task] starts a console plan if you want the live checklist with it.`, "info");
+						break;
+					}
+					const arg = target.trim();
+					if (!arg) {
+						const closed = await openConsolePlanViewer(sid, ctx, ss, { section: "brief" });
+						if (closed && closed.edits > 0) {
+							const cur = loadSessionState(sid);
+							reportPlanEdits(ctx, closed, planExecutingOf(cur)
+								? "This plan is APPROVED and being implemented: re-read it with plan_doc action=show and keep going."
+								: "Planning mode is still ON — do NOT implement anything.");
+						}
+						break;
+					}
+					const doc0 = consolePlanOf(ss);
+					if (!doc0) { ctx.ui.notify("No console plan document is bound — /plan tui [task] creates one.", "warning"); break; }
+					const clear = /^(clear|none|remove|drop)$/i.test(arg);
+					let text = "";
+					if (!clear) {
+						const file = path.resolve(ctx.cwd, arg);
+						if (!fs.existsSync(file)) { ctx.ui.notify(`No such file: ${file}\nUsage: /plan brief <path/to/markdown.md>  (or: /plan brief clear)`, "warning"); break; }
+						text = fs.readFileSync(file, "utf8");
+					}
+					let res: PlanOpResult | null = null;
+					updateSessionState(sid, s => {
+						const r = applyPlanOp(s.planDoc ?? doc0, { action: "brief", text });
+						res = r;
+						if (r.ok) { s.planDoc = r.doc; s.planStyle = "tui"; }
+					});
+					const out = res as PlanOpResult | null;
+					if (!out) { ctx.ui.notify("plan brief: the state write failed.", "error"); break; }
+					if (!out.ok) { ctx.ui.notify(`✗ ${out.log}`, "warning"); break; }
+					const lines = (loadSessionState(sid).planDoc?.brief ?? "").split("\n").filter((l) => l.trim()).length;
+					ctx.ui.notify(clear
+						? "🗒 Brief cleared — the plan is steps and notes again."
+						: `📝 Brief set from ${arg} (${lines} lines) — /plan view, section Brief reads it rendered with tables, headings and code blocks.`, "info");
+					refreshPlanPanel(ctx);
 					break;
 				}
 
@@ -1404,7 +1457,7 @@ export default function (pi: ExtensionAPI) {
 	 *
 	 * Returns null when nothing could be opened (no plan bound, or no real TUI — those paths notify).
 	 */
-	async function openConsolePlanViewer(sid: string, ctx: ExtensionContext, ss: SessionState, view: { retired?: boolean } = {}): Promise<PlanEditorClose | null> {
+	async function openConsolePlanViewer(sid: string, ctx: ExtensionContext, ss: SessionState, view: { retired?: boolean; section?: PlanSection } = {}): Promise<PlanEditorClose | null> {
 		// #22: two documents, one viewer. Without `retired` this is the live plan (editable, and its edits
 		// are reported to the model by the caller). With it, it is the ARCHIVED plan: read-only, and the
 		// host's apply refuses instead of writing — a viewer must not be able to touch the checklist of a
@@ -1441,11 +1494,13 @@ export default function (pi: ExtensionAPI) {
 					},
 					notify: (m) => ctx.ui.notify(m, "info"),
 				},
-				theme as { fg(color: string, text: string): string },
+				theme as PlanEditorTheme,
 				done,
 				// #17: the overlay reads the same preference, but the OTHER way round — unset means wrap
 				// here, because opening /plan view is a decision to read the plan properly.
-				{ wrap: loadGuardState().planWrap ?? true, readOnly: archived },
+				// #23: the FULL theme, not just fg — the brief is rendered by pi's Markdown component, which
+				// wants style()/bold()/italic()/highlight() too. A narrowed theme would silently lose bold headings.
+				{ wrap: loadGuardState().planWrap ?? true, readOnly: archived, ...(view.section ? { section: view.section } : {}) },
 			),
 		);
 		refreshPlanPanel(ctx);
@@ -1565,6 +1620,9 @@ export default function (pi: ExtensionAPI) {
 			case "note": return p.kind && p.text?.trim() ? { action: "note", kind: p.kind, text: p.text } : null;
 			case "unnote": return p.kind && p.index !== undefined ? { action: "unnote", kind: p.kind, index: p.index } : null;
 			case "editNote": return p.kind && p.index !== undefined && p.text?.trim() ? { action: "editNote", kind: p.kind, index: p.index, text: p.text } : null;
+			// #23: whole-body on purpose. An empty text is a LEGAL op here (it clears the brief), which is why
+			// this case checks `!== undefined` and not `p.text?.trim()` like the other text ops.
+			case "brief": return p.text !== undefined ? { action: "brief", text: p.text } : null;
 			case "reset": return { action: "reset" };
 			default: return null;
 		}
@@ -1577,13 +1635,14 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Read/modify the CONSOLE plan (console plan mode) — the live TUI plan, instead of writing a plan file. " +
 			"Actions: set(title,task) · add(text,after?) · update(id,text,note) · status(id,status) · cycle(id) · " +
-			"reorder(id,after) · remove(id) · note(kind,text) · unnote(kind,index) · editNote(kind,index,text) · reset · show. " +
+			"reorder(id,after) · remove(id) · note(kind,text) · unnote(kind,index) · editNote(kind,index,text) · brief(text) · reset · show. " +
 			"Only works while this console is in console planning mode (or is implementing an approved console plan); it never writes files.",
 		promptSnippet: "plan_doc(action, …) — build the live console plan (steps, decisions, constraints) while console planning mode is on",
 		promptGuidelines: [
 			"plan_doc is the plan editor for CONSOLE plan mode (no plan file exists in that mode) — the plan is a live document the user watches above the editor and edits with /plan view, so every step you add is instantly visible to them.",
 			"Steps have STABLE ids (#3 stays #3 through adds, removals and reorders) — always address a step by its id, never by its position.",
-			"Actions: set(title?,task?) · add(text,after?) · update(id,text?,note?) · status(id,open|doing|done|dropped) · cycle(id) · reorder(id,after?) · remove(id) · note(kind:decision|constraint|open,text) · unnote(kind,index) · editNote(kind,index,text) · reset · show. Note indexes are 0-based.",
+			"Actions: set(title?,task?) · add(text,after?) · update(id,text?,note?) · status(id,open|doing|done|dropped) · cycle(id) · reorder(id,after?) · remove(id) · note(kind:decision|constraint|open,text) · unnote(kind,index) · editNote(kind,index,text) · brief(text) — a markdown body the user reads rendered · reset · show. Note indexes are 0-based.",
+			"A step is one line you can point at; the brief is the document behind the steps — background, an approach, a comparison table, the API shape in a fenced block. Write it once you know what you are doing: it is the half the user reads in /plan view (section Brief) and the half an approved implementation follows, so a table there is worth more than three steps saying the same thing.",
 			"Prefer status=dropped over remove: \"we are not doing step 3\" is a planning decision worth keeping visible to the user.",
 			"Every result returns the current plan — build on that, keep step texts to one short line each, and record the reasoning too: decisions say what was chosen and why, constraints the limits an implementation must honor, open the questions the human still has to answer.",
 		],
@@ -1591,11 +1650,11 @@ export default function (pi: ExtensionAPI) {
 			action: Type.Union([
 				Type.Literal("set"), Type.Literal("add"), Type.Literal("update"), Type.Literal("status"),
 				Type.Literal("cycle"), Type.Literal("reorder"), Type.Literal("remove"), Type.Literal("note"),
-				Type.Literal("unnote"), Type.Literal("editNote"), Type.Literal("reset"), Type.Literal("show"),
+				Type.Literal("unnote"), Type.Literal("editNote"), Type.Literal("brief"), Type.Literal("reset"), Type.Literal("show"),
 			]),
 			title: Type.Optional(Type.String({ description: "set: one-line plan title" })),
 			task: Type.Optional(Type.String({ description: "set: the request being planned" })),
-			text: Type.Optional(Type.String({ description: "add/update/editNote: the step or note text" })),
+			text: Type.Optional(Type.String({ description: "add/update/editNote: the step or note text. brief: the WHOLE markdown body (it replaces the current one; empty clears it)" })),
 			note: Type.Optional(Type.String({ description: "update: sub-note attached to the step" })),
 			id: Type.Optional(Type.Number({ description: "stable step id, printed as #3" })),
 			status: Type.Optional(Type.Union([Type.Literal("open"), Type.Literal("doing"), Type.Literal("done"), Type.Literal("dropped")])),
@@ -1620,7 +1679,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: `Console planning is not ON in this console — ${planStatusLine(ss)} Only "show" still works on a kept plan. To work on it again: /plan tui [task].` }], details: undefined };
 			}
 			const op = planOpFromParams(params);
-			if (!op) return { content: [{ type: "text", text: `plan_doc action=${params.action} is missing a required field (id for step ops, text for add/note/editNote, kind+index for note ops, title or task for set).\n\n${renderPlanText(doc)}` }], details: undefined };
+			if (!op) return { content: [{ type: "text", text: `plan_doc action=${params.action} is missing a required field (id for step ops, text for add/note/editNote/brief, kind+index for note ops, title or task for set).\n\n${renderPlanText(doc)}` }], details: undefined };
 			// #22: a reset that would WIPE A FINISHED PLAN archives it instead of dropping it — the human can
 			// still read it with /plan view last. Clearing a half-drafted plan is not archeworthy: that is a
 			// draft the model just decided to throw away, and the archive is for completed work only.

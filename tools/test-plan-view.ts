@@ -164,7 +164,9 @@ function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the
 	d = applyPlanOp(d, { action: "add", text: "a step" }).doc;
 	d = applyPlanOp(d, { action: "note", kind: "decision", text: "use SQLite" }).doc;
 	const { c, f, text } = fresh(d);
-	c.handleInput(KEYS.tab); // steps → decisions
+	c.handleInput(KEYS.tab); // steps → BRIEF (#23: the document sits right behind the checklist)
+	check("the first Tab lands on the Brief section", text().some((x) => x.includes("[Brief 0]")) && text().some((x) => x.includes("no brief yet")), JSON.stringify(text().slice(2, 6)));
+	c.handleInput(KEYS.tab); // → decisions
 	check("Tab shows the Decisions list", text().some((x) => x.includes("❯ 1. use SQLite")), JSON.stringify(text()));
 	c.handleInput("n");
 	c.handleInput(type("pick a theme"));
@@ -176,6 +178,7 @@ function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the
 	check("open questions section is reachable", text().some((x) => x.includes("no open questions yet")), JSON.stringify(text()));
 	c.handleInput(KEYS.tab); // → steps (wrap)
 	check("Tab wraps back to the steps list", text().some((x) => x.includes("❯") && x.includes("a step")), JSON.stringify(text()));
+	c.handleInput(KEYS.tab); // → brief
 	c.handleInput(KEYS.tab); // → decisions again
 	c.handleInput(KEYS.up);
 	c.handleInput("e");
@@ -187,6 +190,73 @@ function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the
 	c.handleInput("D");
 	check("D removes the hovered note", f.ops.some((o) => o.action === "unnote" && o.index === 0) && f.doc?.decisions.length === 1, JSON.stringify(f.doc?.decisions));
 }
+
+// ── 6b. #23: the Brief section — pi's markdown, edited a line at a time ──
+void (() => {
+	const BRIEF = [
+		"## Why the split",
+		"",
+		"The embedder stays on CPU; the reranker moves.",
+		"",
+		"| part | where | why |",
+		"| --- | --- | --- |",
+		"| embedder | CPU | fp32 is enough |",
+		"| reranker | GPU:0 | 8x faster there |",
+		"",
+		"```ts",
+		'export const split = { embed: "cpu", rank: "cuda:0" };',
+		"```",
+	].join("\n");
+	let d = newPlanDoc({ title: "GPU split" });
+	d = applyPlanOp(d, { action: "add", text: "wire the reranker" }).doc;
+	d = applyPlanOp(d, { action: "brief", text: BRIEF }).doc;
+	const { c, f, text, lines } = fresh(d, { section: "brief" });
+	// The rendering assertions need to SEE the whole document; the scroll assertions below run in the
+	// small terminal the rest of this file uses. A 12-line brief cannot fit 14 rows, and pretending
+	// otherwise would just move the assertion to wherever the window happened to land.
+	const TALL = 34;
+	Object.defineProperty(process.stdout, "rows", { value: TALL, configurable: true });
+	const body = text();
+	check("the section bar offers Brief with its line count", body.some((x) => x.includes("[Brief 12]")), JSON.stringify(body.slice(1, 2)));
+	check("a heading renders as a heading (not as a step)", body.some((x) => x.includes("Why the split")), JSON.stringify(body.slice(4, 8)));
+	check("a TABLE renders as a table — box-drawing borders, the same chrome the chat uses", body.some((x) => x.includes("┌")) && body.some((x) => x.includes("┴")), JSON.stringify(body.slice(6, 18)));
+	check("the table keeps its columns lined up", body.some((x) => /│ embedder │ CPU\s*│/.test(x)), JSON.stringify(body.slice(6, 14)));
+	check("a fenced block keeps its code verbatim", body.some((x) => x.includes('export const split = { embed: "cpu"')), JSON.stringify(body.slice(14, 20)));
+	check("nothing about the brief leaked into the step list", f.doc?.steps.length === 1, JSON.stringify(f.doc?.steps.map((s) => s.text)));
+	check("and every row fits the terminal width", lines().every((x) => strip(x).length <= WIDTH), JSON.stringify(lines().map((x) => strip(x).length)));
+	Object.defineProperty(process.stdout, "rows", { value: ROWS, configurable: true });
+	const small = text();
+	check("in a SHORT terminal a long brief scrolls instead of pushing the hints off screen", small.some((x) => x.includes("more below")) && small.some((x) => x.includes("↑↓ line")), JSON.stringify(small));
+	check("the line the cursor is on stays named while the body scrolls", small.some((x) => x.includes("❯ line 1/12") && x.includes("Why the split")), JSON.stringify(small.slice(4, 6)));
+
+	c.handleInput(KEYS.down); c.handleInput(KEYS.down);
+	check("↓ moves the line cursor", text().some((x) => x.includes("❯ line 3/12")), JSON.stringify(text().slice(4, 6)));
+	c.handleInput("e");
+	for (let i = 0; i < 60; i++) c.handleInput("\x7f");
+	c.handleInput(type("The embedder stays on CPU because 6 GB is the ceiling."));
+	c.handleInput(KEYS.enter);
+	check("editing one line rewrites THAT line (the op is a whole-body brief write)", f.ops.some((o) => o.action === "brief") && (f.doc?.brief ?? "").includes("because 6 GB is the ceiling"), JSON.stringify((f.doc?.brief ?? "").split("\n")[2]));
+	check("the edit did not touch any other line", (f.doc?.brief ?? "").split("\n").length === 12 && (f.doc?.brief ?? "").includes("| reranker | GPU:0 |"), String((f.doc?.brief ?? "").split("\n").length));
+
+	c.handleInput("a");
+	c.handleInput(type("> Constraint: the host has 6 GB of VRAM."));
+	c.handleInput(KEYS.enter);
+	check("a adds a line to the brief", (f.doc?.brief ?? "").includes("Constraint: the host has 6 GB"), JSON.stringify((f.doc?.brief ?? "").slice(-46)));
+	check("the cursor followed the line it just added", text().some((x) => x.includes("❯ line 4/13")), JSON.stringify(text().slice(-2)));
+	c.handleInput("D");
+	check("D deletes the hovered line", !(f.doc?.brief ?? "").includes("Constraint: the host has 6 GB"), JSON.stringify((f.doc?.brief ?? "").slice(-40)));
+
+	// Keys that belong to the checklist must say so rather than sit silent.
+	for (const key of ["x", "[", "]", "w"]) {
+		const before = JSON.stringify(f.doc);
+		c.handleInput(key);
+		check(`${JSON.stringify(key)} in the brief does nothing but explain itself`, JSON.stringify(f.doc) === before && text().at(-1)!.includes("does not apply to the brief") && text().at(-1)!.includes("STEP"), text().at(-1));
+	}
+	c.handleInput(KEYS.tab);
+	check("Tab leaves the brief for the notes", text().some((x) => /\[Dec(isions)? 0\]/.test(x)), JSON.stringify(text().slice(1, 2)));
+	c.handleInput(KEYS.esc);
+	check("esc closes from the brief and reports the brief edits it made", f.close !== null && f.close.edits === 3 && f.close.summary.every((l) => l.includes("brief")), JSON.stringify(f.close));
+})();
 
 // ── 7. concurrent model edits: the cursor is a STEP ID, not a position ──
 {
@@ -373,7 +443,8 @@ function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the
 	ro.c.handleInput("w");
 	check("and expands it back", ro.text().some((x) => x.includes("switch-back flag")), JSON.stringify(ro.text().slice(5, 8)));
 	const tabbed = ro.text();
-	ro.c.handleInput(KEYS.tab);
+	ro.c.handleInput(KEYS.tab); // steps → brief
+	ro.c.handleInput(KEYS.tab); // → decisions
 	check("Tab still cycles into the notes so they can be read", ro.text().some((x) => x.includes("one archive slot is enough")), JSON.stringify(ro.text()));
 	ro.c.handleInput(KEYS.tab);
 	check("Tab cycles on (task section is readable too)", ro.text().some((x) => x.includes("the old request")), JSON.stringify(ro.text().slice(0, 4)));

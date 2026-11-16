@@ -387,7 +387,7 @@ export function consolePlanningRulesText(doc: PlanDoc | null, opts: { resumed?: 
 		"",
 		"Rules:",
 		"- Do not implement anything and do not write ANY file — every write is blocked while planning is on (no plan file exists in this mode).",
-		"- Build the plan with the plan_doc tool: action=add for each step, action=note kind=decision|constraint|open for the reasoning, action=set for the title/task, action=status when a step is settled. The user watches it appear live and edits it with /plan view.",
+		"- Build the plan with the plan_doc tool: action=add for each step, action=note kind=decision|constraint|open for the reasoning, action=set for the title/task, action=status when a step is settled, action=brief for a markdown body (background, a comparison table, the API shape in a fenced block) that the user reads rendered in /plan view. The user watches it appear live and edits it with /plan view.",
 		"- Steps must be executable and ordered; decisions record what was chosen and why; constraints are the hard limits an implementation must honor.",
 		"- Reading, web search and read-only commands stay free.",
 		"- When you hit a real decision or ambiguity (architecture choice, trade-off, scope question), use the ask_user tool with concrete options instead of deciding silently — I want to make those calls.",

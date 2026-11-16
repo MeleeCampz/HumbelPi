@@ -58,6 +58,15 @@ export interface PlanDoc {
 	style: "tui";
 	title: string;
 	task: string;
+	/**
+	 * #23: the document half of a console plan — a markdown BODY the model writes and the human reads.
+	 * Steps stay the steerable checklist; the brief is the "what and why" behind them: background, the
+	 * approach, a comparison table, the API shape in a fenced block. It is ONE string of markdown, never
+	 * parsed into structure: the model owns writing it, `plan-view.ts` owns rendering it (through pi's own
+	 * Markdown component, so tables look like pi's tables), and export/import move it verbatim. Keeping it
+	 * a string is what keeps the pure model pure — no markdown parser here, no structure to keep in sync.
+	 */
+	brief?: string;
 	steps: PlanStep[];
 	decisions: string[];
 	constraints: string[];
@@ -66,6 +75,13 @@ export interface PlanDoc {
 	nextId: number;
 	updatedAt: string;
 }
+
+/**
+ * The brief lives in a session-state JSON file and in every tool result, so it needs a ceiling: a plan
+ * is not a place to park a 200 KB document. Past the cap the model is told to write a shorter one rather
+ * than having its text silently cut in half.
+ */
+export const MAX_BRIEF_CHARS = 20_000;
 
 // ── Status vocabulary (shared by renderer, overlay and tool text) ──────────────
 
@@ -98,7 +114,7 @@ export const PLAIN_THEME: PlanTheme = { fg: (_c, t) => t };
 
 // ── Construction / normalization ──────────────────────────────────────────────
 
-export function newPlanDoc(init: { title?: string; task?: string; steps?: string[] } = {}): PlanDoc {
+export function newPlanDoc(init: { title?: string; task?: string; steps?: string[]; brief?: string } = {}): PlanDoc {
 	const doc: PlanDoc = {
 		style: "tui",
 		title: (init.title ?? "").trim(),
@@ -111,6 +127,8 @@ export function newPlanDoc(init: { title?: string; task?: string; steps?: string
 		nextId: 1,
 		updatedAt: new Date().toISOString(),
 	};
+	const brief = (init.brief ?? "").replace(/\s+$/, "");
+	if (brief) doc.brief = brief.slice(0, MAX_BRIEF_CHARS);
 	for (const text of init.steps ?? []) {
 		if (!text.trim()) continue;
 		doc.steps.push({ id: doc.nextId++, text: text.trim(), status: "open" });
@@ -151,7 +169,7 @@ export function normalizePlanDoc(raw: unknown): PlanDoc | null {
 	}
 	const listsOk = (v: unknown): string[] =>
 		Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x.trim() !== "").map((x) => x.trim()) : [];
-	return {
+	const out: PlanDoc = {
 		style: "tui",
 		title: typeof r.title === "string" ? r.title.trim() : "",
 		task: typeof r.task === "string" ? r.task.trim() : "",
@@ -163,6 +181,11 @@ export function normalizePlanDoc(raw: unknown): PlanDoc | null {
 		nextId: maxId + 1,
 		updatedAt: typeof r.updatedAt === "string" ? r.updatedAt : new Date().toISOString(),
 	};
+	// A brief is a string or nothing at all: a number/object/whatever on disk is dropped rather than
+	// rendering "[object Object]" as the plan document. Truncated rather than rejected — a document that
+	// was written is worth reading even if the file grew past the cap.
+	if (typeof r.brief === "string" && r.brief.trim()) out.brief = r.brief.replace(/\s+$/, "").slice(0, MAX_BRIEF_CHARS);
+	return out;
 }
 
 // ── Operations ────────────────────────────────────────────────────────────────
@@ -178,6 +201,9 @@ export type PlanOp =
 	| { action: "note"; kind: PlanNoteKind; text: string }
 	| { action: "unnote"; kind: PlanNoteKind; index: number }
 	| { action: "editNote"; kind: PlanNoteKind; index: number; text: string }
+	/** Replace the whole markdown body (empty text clears it). Whole-body, on purpose: the overlay edits a
+	 *  LINE of it by rebuilding the string and sending it back, so the model has one op, not eleven. */
+	| { action: "brief"; text: string }
 	| { action: "reset" };
 
 export interface PlanOpResult {
@@ -346,6 +372,30 @@ export function applyPlanOp(doc: PlanDoc, op: PlanOp): PlanOpResult {
 			return { ok: true, doc: next, log: `${op.kind} #${op.index + 1}: ${list[op.index]} → ${text}` };
 		}
 
+		case "brief": {
+			// Verbatim markdown, minus trailing whitespace. Interior whitespace/newlines are the document —
+			// a markdown table is nothing without its line breaks.
+			const text = op.text.replace(/\s+$/, "");
+			if (text.length > MAX_BRIEF_CHARS) {
+				return fail(doc, `The brief would be ${text.length} characters — a plan body is capped at ${MAX_BRIEF_CHARS}. Write a shorter one (or put the long material in a file and reference it).`);
+			}
+			if (!text) {
+				if (!doc.brief) return fail(doc, "There is no brief to clear.");
+				const next = copy(doc);
+				delete next.brief;
+				next.revised = doc.revised + 1;
+				next.updatedAt = new Date().toISOString();
+				return { ok: true, doc: next, log: "brief cleared" };
+			}
+			if (doc.brief === text) return fail(doc, "The brief is already that text.");
+			const next = copy(doc);
+			next.brief = text;
+			next.revised = doc.revised + 1;
+			next.updatedAt = new Date().toISOString();
+			const named = /^\s*#{1,6}\s+(.+)$/m.exec(text)?.[1]?.trim();
+			return { ok: true, doc: next, log: `brief ${doc.brief ? "replaced" : "written"}: ${named ?? `${text.length} characters of markdown`}` };
+		}
+
 		case "reset": {
 			const fresh = newPlanDoc({ title: doc.title, task: doc.task });
 			fresh.revised = doc.revised + 1;
@@ -405,7 +455,7 @@ const notesOf = (doc: PlanDoc, kind: PlanNoteKind): string[] =>
  * Model-facing text. Used three ways from one source so they cannot drift: the per-message
  * [PLAN MODE] frame, every plan_doc tool result, and the approval dialog body.
  */
-export function renderPlanText(doc: PlanDoc, opts: { heading?: string; compact?: boolean; maxSteps?: number } = {}): string {
+export function renderPlanText(doc: PlanDoc, opts: { heading?: string; compact?: boolean; maxSteps?: number; maxBrief?: number } = {}): string {
 	const p = planProgress(doc);
 	const head = opts.heading ?? "PLAN";
 	const shown = doc.steps.slice(0, opts.maxSteps ?? doc.steps.length);
@@ -420,12 +470,27 @@ export function renderPlanText(doc: PlanDoc, opts: { heading?: string; compact?:
 		lines.push(`  #${s.id} ${STATUS_GLYPH[s.status]} ${s.text}${s.note ? `  ⟵ ${s.note}` : ""}`);
 	}
 	if (hidden > 0) lines.push(`  … ${hidden} more step(s) — plan_doc action=show lists them all`);
-	if (opts.compact) return lines.join("\n"); // per-message frame: steps only, so a long plan is not re-sent whole every message
+	if (opts.compact) {
+		// The per-message frame stays steps-only (a long plan must not be re-sent whole on every message),
+		// but it NAMES the body: a model that does not know a brief exists will plan around it. The whole
+		// text is one plan_doc action=show away.
+		if (doc.brief) lines.push("", `Brief: ${doc.brief.split("\n").filter((l) => l.trim()).length} lines of markdown sit behind these steps — plan_doc action=show prints them, the user reads them rendered in /plan view (section Brief).`);
+		return lines.join("\n");
+	}
 	for (const kind of ["decision", "constraint", "open"] as PlanNoteKind[]) {
 		const list = notesOf(doc, kind);
 		if (list.length === 0) continue;
 		lines.push("", `${NOTES_HEADING[kind]}:`);
 		for (const n of list) lines.push(`  - ${n}`);
+	}
+	// #23: the brief last, and verbatim. It is markdown, so it is NOT indented (four spaces would turn a
+	// table or a fenced block into a code block for anything that reads this as markdown) and it is capped
+	// so a tool result stays readable: the full text is one action=show away, and the human reads it whole
+	// in /plan view.
+	if (doc.brief) {
+		const cap = opts.maxBrief ?? 4000;
+		const shownBrief = doc.brief.length > cap ? `${doc.brief.slice(0, cap)}\n… ${doc.brief.length - cap} more characters (the whole body is in /plan view, section "Brief")` : doc.brief;
+		lines.push("", "Brief (" + doc.brief.length + " characters of markdown — write it with plan_doc action=brief, read it rendered with /plan view):", "", shownBrief);
 	}
 	return lines.join("\n");
 }
@@ -678,6 +743,12 @@ export function implementationInstructionFromDoc(doc: PlanDoc): string {
 		"Steps:",
 		steps || "  (none)",
 		notes.length ? ["", "Honor these:", ...notes].join("\n") : "",
+		// The brief travels with the approval because it holds the REASONING the plan was built on — the
+		// comparison table, the API shape, the constraint you wrote down as a table. Capped so an approved
+		// 40-step plan does not carry a 20 KB document into every turn; the full body stays one action=show away.
+		doc.brief
+			? ["", "The plan's brief (follow it — it is why these steps are these steps):", "", doc.brief.length > 3000 ? `${doc.brief.slice(0, 3000)}\n… ${doc.brief.length - 3000} more characters — plan_doc action=show prints the whole body.` : doc.brief].join("\n")
+			: "",
 		"",
 		`Implement it now, in order. ${p.remaining.length} step(s) remain (${p.done} already done, ${p.dropped} deliberately dropped — do not re-open a dropped step unless the user asks). Mark each one as you go with plan_doc action=status id=… status=done, and report progress as you work: one short line per completed step (e.g. "✅ #2 done: …"). Deviate only when something is genuinely impossible, and say why first. Start with the first remaining step.`,
 	].join("\n");
@@ -696,24 +767,62 @@ export function implementationInstructionFromDoc(doc: PlanDoc): string {
 export function planDocFromMarkdown(md: string, init: { title?: string; task?: string } = {}): PlanDoc {
 	const doc = newPlanDoc(init);
 	let bucket: PlanNoteKind | null = null;
+	// #23: the three things a markdown document has that a checklist does not — a prose preamble, fenced
+	// code, and tables — all become the BRIEF instead of being parsed into steps.
+	//
+	// WHY THAT IS THE RIGHT HOME FOR THEM: parseStepLine accepts "a bare line of prose" as a step, which is
+	// how an import used to turn a paragraph of background into a to-do item, a ``` block into a step named
+	// "```ts", and every row of a comparison table into its own step. A document block keeps them documents.
+	const briefParts: string[] = [];
+	let inBriefHeading = false;
+	let fence: string[] | null = null;
+	let seenPlanContent = false; // a step or a note has been parsed: the preamble is over
+	const preamble: string[] = [];
+	// A markdown table row: header, body, or the `|---|---|` delimiter — all start and end with a pipe.
+	const isTableLine = (l: string): boolean => /^\s*\|.*\|\s*$/.test(l);
+
 	for (const rawLine of md.split(/\r?\n/)) {
 		const line = rawLine.trim();
-		if (!line) continue;
+
+		// Fenced code is document material whole: from the opening fence to the closing one it goes to the
+		// brief untouched, and nothing inside it is read as a step.
+		if (fence) {
+			fence.push(rawLine);
+			if (/^\s*```/.test(rawLine)) {
+				briefParts.push(fence.join("\n").replace(/\s+$/, ""));
+				fence = null;
+			}
+			continue;
+		}
+		if (/^\s*```/.test(rawLine)) { fence = [rawLine]; continue; }
+
+		if (!line) {
+			if (inBriefHeading) briefParts.push("");
+			else if (!seenPlanContent) preamble.push("");
+			continue;
+		}
 		if (/^[-─—]+$/.test(line)) continue;
 
 		const h = line.match(/^#{1,6}\s+(.*)$/);
 		if (h) {
-			const t = h[1]!.trim().toLowerCase();
+			const name = h[1]!.trim();
+			const t = name.toLowerCase();
+			// A STEPS heading wins over a brief heading. "## Approach" has meant "the checklist starts here" in
+			// this importer since file mode began, and a heading that silently turns a checklist into a document
+			// block is a worse failure than a missing brief.
+			if (/^(step|plan|approach|implement)/.test(t)) { inBriefHeading = false; bucket = null; continue; }
+			if (/^(brief|background|context|summary|overview|why|scope|problem)/.test(t)) { inBriefHeading = true; continue; }
+			inBriefHeading = false;
 			if (/^(decision|choice|chosen)/.test(t)) bucket = "decision";
 			else if (/^(constraint|risk|assumption|limitation)/.test(t)) bucket = "constraint";
 			else if (/^(open question|question|unknown)/.test(t)) bucket = "open";
-			else if (/^(step|plan|approach|implement)/.test(t)) bucket = null;
-			else if (!doc.title) doc.title = h[1]!.trim();
-			else if (bucket === null) doc.constraints.push(h[1]!.trim()); // a stray heading is a section boundary worth knowing
+			else if (!doc.title) doc.title = name;
+			else if (bucket === null) doc.constraints.push(name); // a stray heading is a section boundary worth knowing
 			continue;
 		}
+		if (inBriefHeading) { briefParts.push(rawLine); continue; }
 
-		// Metadata the exporter writes; never a step.
+		// Metadata the exporter writes; never a step, never the brief.
 		const meta = line.match(/^(task|steps|plan)\b\s*(\([^)]*\))?\s*:?\s*(.*)$/i);
 		if (meta && /^task$/i.test(meta[1]!) && bucket === null) {
 			if (!doc.task && meta[3]) doc.task = meta[3].trim();
@@ -721,11 +830,28 @@ export function planDocFromMarkdown(md: string, init: { title?: string; task?: s
 		}
 		if (meta && bucket === null && /^(steps|plan)$/i.test(meta[1]!)) continue;
 
+		// A table (header, delimiter or body row) and the blank line before it belong together.
+		if (isTableLine(line)) {
+			briefParts.push(rawLine.replace(/\s+$/, ""));
+			continue;
+		}
+
 		const parsed = parseStepLine(line);
 		if (!parsed) continue;
-		if (bucket) { notesOf(doc, bucket).push(parsed.text); continue; }
+		if (bucket) {
+			seenPlanContent = true;
+			notesOf(doc, bucket).push(parsed.text);
+			continue;
+		}
+		seenPlanContent = true;
 		doc.steps.push({ id: doc.nextId++, text: parsed.text, status: parsed.status });
 	}
+	// An unterminated fence is still document material, not a step.
+	if (fence) briefParts.push(fence.join("\n"));
+	const merged = [preamble.join("\n").trim(), ...briefParts]
+		.map((p) => p.replace(/\s+$/, ""))
+		.filter((p) => p.trim());
+	if (merged.length) doc.brief = merged.join("\n\n").slice(0, MAX_BRIEF_CHARS);
 	if (!doc.title && init.title) doc.title = init.title;
 	return doc;
 }
@@ -751,6 +877,9 @@ export function planDocToMarkdown(doc: PlanDoc): string {
 	const p = planProgress(doc);
 	const out: string[] = [`# Plan — ${doc.title || "(untitled)"}`, ""];
 	if (doc.task) out.push(`Task: ${doc.task}`, "");
+	// The brief is exported under a heading the importer recognises as a document block, so a plan exported
+	// and imported again comes back with its tables and code fences intact instead of shredded into steps.
+	if (doc.brief) out.push("## Brief", "", doc.brief, "");
 	out.push(
 		`## Steps (${p.done}/${p.total} done, revision ${doc.revised})`,
 		"",

@@ -24,7 +24,7 @@
  * the extension graph. `theme` and the state host enter as parameters.
  */
 
-import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Markdown, type Component, type Focusable, type MarkdownTheme } from "@earendil-works/pi-tui";
 import { SelectingInput } from "./dialog-input";
 import {
 	STATUS_COLOR,
@@ -38,15 +38,25 @@ import {
 	type PlanStep,
 } from "./plan-doc";
 
-export type PlanSection = "steps" | "decisions" | "constraints" | "open";
-export const SECTION_ORDER: PlanSection[] = ["steps", "decisions", "constraints", "open"];
+export type PlanSection = "steps" | "brief" | "decisions" | "constraints" | "open";
+export const SECTION_ORDER: PlanSection[] = ["steps", "brief", "decisions", "constraints", "open"];
 export const SECTION_LABEL: Record<PlanSection, string> = {
 	steps: "Steps",
+	brief: "Brief",
 	decisions: "Decisions",
 	constraints: "Constraints",
 	open: "Open questions",
 };
-const SECTION_NOTE_KIND: Record<Exclude<PlanSection, "steps">, PlanNoteKind> = {
+/** #23: the same bar when the terminal is too narrow for the long names (see render). */
+export const SECTION_SHORT: Record<PlanSection, string> = {
+	steps: "Steps",
+	brief: "Brief",
+	decisions: "Dec",
+	constraints: "Cons",
+	open: "Open",
+};
+/** Only the three NOTE sections are backed by a plan-doc note list; steps and the brief are not. */
+const SECTION_NOTE_KIND: Partial<Record<PlanSection, PlanNoteKind>> = {
 	decisions: "decision",
 	constraints: "constraint",
 	open: "open",
@@ -68,12 +78,53 @@ export interface PlanEditorClose {
 	summary: string[];
 }
 
-interface Theme {
+export interface PlanEditorTheme {
 	fg(color: string, text: string): string;
+	/** pi's real theme has these; the keystroke tests pass a stub with only `fg`, so every extra is optional
+	 *  and every use has a fallback. That is also what keeps the markdown renderer testable without pi. */
+	style?(text: string, options: { fg?: string; bg?: string; bold?: boolean; italic?: boolean; underline?: boolean; strikethrough?: boolean; dim?: boolean }): string;
+	bold?(text: string): string;
+	italic?(text: string): string;
+	underline?(text: string): string;
+	strikethrough?(text: string): string;
+	highlight?(code: string, lang: string | undefined): readonly string[];
 }
 
-/** What the cursor is on: a step (by stable id) or a note in the current section (by position). */
-type Target = { kind: "step"; id: number } | { kind: "note"; index: number };
+/**
+ * #23: pi's own markdown theme, built from the theme this host was handed.
+ *
+ * WHY NOT import { getMarkdownTheme } from pi: that is pi's private module graph, and this file is the
+ * pi-tui-only half of the plan (the rule that lets tools/test-plan-view.ts drive it with real keystrokes
+ * and nothing else). The tokens used here are the ones already proven in these extensions — "accent",
+ * "muted", "dim", "text", "warning", "success" — because pi 1.5.2 rejects an unknown role outright.
+ */
+export function planMarkdownTheme(theme: PlanEditorTheme): MarkdownTheme {
+	const styled = (text: string, color: string, bold = false): string =>
+		theme.style
+			? theme.style(text, { fg: color, ...(bold ? { bold: true } : {}) })
+			: bold && theme.bold ? theme.bold(theme.fg(color, text)) : theme.fg(color, text);
+	return {
+		heading: (t) => styled(t, "accent", true),
+		link: (t) => styled(t, "accent"),
+		linkUrl: (t) => theme.fg("muted", t),
+		code: (t) => theme.fg("text", t),
+		codeBlock: (t) => theme.fg("text", t),
+		codeBlockBorder: (t) => theme.fg("muted", t),
+		quote: (t) => theme.fg("muted", t),
+		quoteBorder: (t) => theme.fg("muted", t),
+		hr: (t) => theme.fg("muted", t),
+		listBullet: (t) => theme.fg("accent", t),
+		bold: (t) => (theme.bold ? theme.bold(t) : t),
+		italic: (t) => (theme.italic ? theme.italic(t) : t),
+		underline: (t) => (theme.underline ? theme.underline(t) : t),
+		strikethrough: (t) => (theme.strikethrough ? theme.strikethrough(t) : t),
+		highlightCode: theme.highlight ? (code, lang) => [...theme.highlight!(code, lang)] : undefined,
+	};
+}
+
+/** What the cursor is on: a step (by stable id), a note in the current section (by position), or a
+ *  SOURCE LINE of the brief (by position — the rendered body is wrapped, so it has no row-per-line map). */
+type Target = { kind: "step"; id: number } | { kind: "note"; index: number } | { kind: "briefLine"; index: number };
 
 const EMPTY_PROGRESS: PlanProgress = { total: 0, done: 0, open: 0, doing: 0, dropped: 0, remaining: [], allDone: false };
 
@@ -84,7 +135,7 @@ export type PlanEditorComponent = Component & Focusable & { handleInput(data: st
 
 export function createPlanEditor(
 	host: PlanEditorHost,
-	theme: Theme,
+	theme: PlanEditorTheme,
 	done: (result: PlanEditorClose) => void,
 	options: { section?: PlanSection; wrap?: boolean; readOnly?: boolean } = {},
 ): PlanEditorComponent {
@@ -102,6 +153,7 @@ export function createPlanEditor(
 	let wrapRows = options.wrap ?? true;
 	let stepCursor: number | null = null; // steps: by ID
 	let noteCursor = 0;                   // notes: by position (they have no ids)
+	let briefCursor = 0;                  // #23: the brief: by source-line position
 	let editing: Target | null = null;
 	let draft: SelectingInput | null = null;
 	let focused = false;
@@ -126,6 +178,8 @@ export function createPlanEditor(
 	const stepsOf = (d: PlanDoc | null): PlanStep[] => (d ? d.steps : []);
 	const notesOf = (d: PlanDoc | null, s: PlanSection): string[] =>
 		!d ? [] : s === "decisions" ? d.decisions : s === "constraints" ? d.constraints : s === "open" ? d.openQuestions : [];
+	/** #23: the brief as SOURCE lines (that is what a line cursor and a line edit operate on). */
+	const briefLinesOf = (d: PlanDoc | null): string[] => (d?.brief ?? "").split("\n");
 
 	/** Clamp the cursor into the current list, healing a cursor whose step was removed underneath it. */
 	const targetList = (d: PlanDoc | null): Target | null => {
@@ -134,6 +188,12 @@ export function createPlanEditor(
 			if (st.length === 0) { stepCursor = null; return null; }
 			if (stepCursor === null || !st.some((s) => s.id === stepCursor)) stepCursor = st[0]!.id;
 			return { kind: "step", id: stepCursor };
+		}
+		if (section === "brief") {
+			const lines = briefLinesOf(d);
+			if (lines.length === 0 || (lines.length === 1 && !lines[0]!.trim())) { briefCursor = 0; return null; }
+			briefCursor = Math.min(Math.max(0, briefCursor), lines.length - 1);
+			return { kind: "briefLine", index: briefCursor };
 		}
 		const n = notesOf(d, section).length;
 		if (n === 0) { noteCursor = 0; return null; }
@@ -168,8 +228,9 @@ export function createPlanEditor(
 			stepCursor = st[next]!.id;
 			return;
 		}
-		const n = notesOf(d, section).length;
+		const n = section === "brief" ? briefLinesOf(d).length : notesOf(d, section).length;
 		if (!n) return;
+		if (section === "brief") { briefCursor = Math.min(n - 1, Math.max(0, briefCursor + delta)); return; }
 		noteCursor = Math.min(n - 1, Math.max(0, noteCursor + delta));
 	};
 
@@ -182,13 +243,20 @@ export function createPlanEditor(
 		editing = t;
 		const current = t.kind === "step"
 			? stepsOf(d).find((s) => s.id === t.id)?.text ?? ""
-			: notesOf(d, section)[t.index] ?? "";
-		openEditor(current, "type to append · backspace clears the row · ⏎ commits · esc cancels");
+			: t.kind === "briefLine"
+				? briefLinesOf(d)[t.index] ?? ""
+				: notesOf(d, section)[t.index] ?? "";
+		openEditor(current, t.kind === "briefLine" ? "edit this line of the brief · ⏎ commits · esc cancels" : "type to append · backspace clears the row · ⏎ commits · esc cancels");
 	};
 
 	/** a / n: an empty editor for a NEW row (a step after the cursor, or a note in this section). */
 	const startAdd = (): void => {
 		if (readOnly) { readOnlyKey(); return; }
+		if (section === "brief") {
+			editing = { kind: "briefLine", index: -1 }; // -1 = a NEW line, appended after the cursor
+			openEditor("", "new line of markdown (⏎ adds it after the cursor)");
+			return;
+		}
 		editing = section === "steps" ? { kind: "step", id: hoveredStep(doc())?.id ?? -1 } : { kind: "note", index: -1 };
 		openEditor("", section === "steps" ? "new step (⏎ adds it after the cursor)" : `new ${SECTION_LABEL[section].toLowerCase()} (⏎ adds it)`);
 	};
@@ -204,8 +272,23 @@ export function createPlanEditor(
 			else apply({ action: "update", id: t.id, text });
 			return;
 		}
+		// #23: the brief is ONE string, so a line edit is "rebuild the body with this line replaced".
+		// That keeps the model a single op (`brief`) instead of eleven ways to poke at a document.
+		if (section === "brief") {
+			const d = doc();
+			if (!d) return;
+			const lines = briefLinesOf(d);
+			if (t.kind === "briefLine" && t.index >= 0 && t.index < lines.length) lines[t.index] = text;
+			else {
+				const at = Math.min(briefCursor + 1, lines.length);
+				lines.splice(at, 0, text);
+				briefCursor = at; // the cursor follows what you just added, the way a new step does
+			}
+			apply({ action: "brief", text: lines.join("\n") });
+			return;
+		}
 		if (t.kind !== "note") return;
-		const kind = SECTION_NOTE_KIND[section as Exclude<PlanSection, "steps">]!;
+		const kind = SECTION_NOTE_KIND[section]!;
 		if (t.index === -1) apply({ action: "note", kind, text });
 		else apply({ action: "editNote", kind, index: t.index, text });
 	};
@@ -221,11 +304,26 @@ export function createPlanEditor(
 			else apply({ action: "status", id: s.id, status: "dropped" });
 			return;
 		}
+		if (section === "brief") {
+			const d = doc();
+			if (!d?.brief) return;
+			const lines = briefLinesOf(d);
+			const at = Math.min(Math.max(0, briefCursor), lines.length - 1);
+			lines.splice(at, 1);
+			briefCursor = Math.max(0, at - 1);
+			apply({ action: "brief", text: lines.join("\n") }); // an empty body is the op that CLEARS the brief
+			return;
+		}
 		const list = notesOf(d, section);
 		if (list.length === 0) return;
-		const kind = SECTION_NOTE_KIND[section as Exclude<PlanSection, "steps">]!;
+		const kind = SECTION_NOTE_KIND[section]!;
 		apply({ action: "unnote", kind, index: Math.min(Math.max(0, noteCursor), list.length - 1) });
 		noteCursor = Math.max(0, noteCursor - 1);
+	};
+
+	/** A key that means nothing in this section, said out loud instead of going silent. */
+	const notHere = (key: string, where: string): void => {
+		lastLog = `✗ ${key} does not apply to the ${SECTION_LABEL[section].toLowerCase()} — ${where}`;
 	};
 
 	const reorder = (delta: number): void => {
@@ -243,6 +341,18 @@ export function createPlanEditor(
 		}
 		if (at >= st.length - 1) return;
 		apply({ action: "reorder", id: s.id, after: st[at + 1]!.id });
+	};
+
+	// ── #23: the markdown body, rendered through pi-tui's Markdown ──────────────────
+	// One-entry cache keyed by (text, width): the overlay re-renders on every keystroke and re-parsing a
+	// 20 KB document each time is the kind of work a render path should not do.
+	let mdCache: { text: string; width: number; lines: string[] } | null = null;
+	const markdownLines = (text: string, width: number): string[] => {
+		if (!text.trim()) return [];
+		if (mdCache && mdCache.text === text && mdCache.width === width) return mdCache.lines;
+		const lines = new Markdown(text, 0, 0, planMarkdownTheme(theme)).render(width);
+		mdCache = { text, width, lines };
+		return lines;
 	};
 
 	const component: PlanEditorComponent & Component & Focusable = {
@@ -278,11 +388,17 @@ export function createPlanEditor(
 			if (data === "e" || matchesKey(data, "enter") || data === "\n") { startEdit(); return; }
 			if (data === "a" || data === "n") { startAdd(); return; }
 			if (data === "x" || data === " ") {
+				if (section === "brief") { notHere("x", "x cycles a STEP's status"); return; }
 				const s = hoveredStep(doc());
 				if (s) apply({ action: "cycle", id: s.id });
 				return;
 			}
-			if (data === "w") { wrapRows = !wrapRows; lastLog = wrapRows ? "expanded — long steps wrap over several rows" : "compact — long steps are truncated to one row"; return; }
+			if (data === "w") {
+				if (section === "brief") { lastLog = "✗ w does not apply to the brief — it wraps already; w is for STEPS"; return; }
+				wrapRows = !wrapRows;
+				lastLog = wrapRows ? "expanded — long steps wrap over several rows" : "compact — long steps are truncated to one row";
+				return;
+			}
 			// #22: in a viewer the editing keys say why they do nothing instead of pretending to work.
 			if (readOnly && (data === "e" || data === "a" || data === "n" || data === "x" || data === " " || data === "D" || data === "[" || data === "]" || data === "\n")) {
 				readOnlyKey();
@@ -290,13 +406,17 @@ export function createPlanEditor(
 			}
 			if (readOnly && matchesKey(data, "enter")) { readOnlyKey(); return; }
 			if (data === "D") { deleteTarget(); return; }
-			if (data === "[") { reorder(-1); return; }
-			if (data === "]") { reorder(1); return; }
+			if (data === "[") { if (section === "brief") { notHere("[", "[ ] reorders STEPS"); return; } reorder(-1); return; }
+			if (data === "]") { if (section === "brief") { notHere("]", "[ ] reorders STEPS"); return; } reorder(1); return; }
 			// A typing mistake must not look like a dead key: every other keypress says what to press
 			// instead, because nothing here is destructive enough to be worth a silent no-op.
 			if (/^[a-zA-Z0-9]$/.test(data)) {
-				lastLog = readOnly
-					? "read-only — ↑↓ move · Tab section · w wrap/compact · esc close"
+				if (readOnly) {
+					lastLog = "read-only — ↑↓ move · Tab section · w wrap/compact · esc close";
+					return;
+				}
+				lastLog = section === "brief"
+					? `✗ ${data} does nothing here — ↑↓ line · ⏎ edit that line · a new line · D delete it · Tab section · esc close`
 					: `✗ ${data} does nothing here — ↑↓ move · Tab section · e/⏎ edit · a add · x status · [ ] reorder · D drop/remove · w ${wrapRows ? "compact" : "expand"} · esc close`;
 			}
 		},
@@ -313,13 +433,25 @@ export function createPlanEditor(
 				: `📋 console plan — ${d?.title || "(untitled)"} · ${p.done}/${p.total} done${p.doing ? ` · ◐ ${p.doing} doing` : ""}${p.dropped ? ` · ✗ ${p.dropped} dropped` : ""} · rev ${d?.revised ?? 0}`;
 			out.push(theme.fg("accent", head));
 			if (d?.task) out.push(theme.fg("muted", `task: ${d.task}`));
-			out.push(SECTION_ORDER.map((s) => {
-				const n = s === "steps" ? p.total : notesOf(d, s).length;
-				return s === section ? theme.fg("accent", `[${SECTION_LABEL[s]} ${n}]`) : theme.fg("dim", `[${SECTION_LABEL[s]} ${n}]`);
-			}).join("  "));
+			const bar = (labels: Record<PlanSection, string>) => SECTION_ORDER.map((s) => {
+				const n = s === "steps" ? p.total : s === "brief" ? (d?.brief ? briefLinesOf(d).length : 0) : notesOf(d, s).length;
+				return s === section ? theme.fg("accent", `[${labels[s]} ${n}]`) : theme.fg("dim", `[${labels[s]} ${n}]`);
+			}).join("  ");
+			// #23: five sections is one more bar than the terminal used to have to hold. Abbreviate BEFORE
+			// truncating — a cut bar loses a section's COUNT, which is the one number that says whether there
+			// are open questions to answer at all.
+			const fullBar = bar(SECTION_LABEL);
+			out.push(visibleWidth(fullBar) > w ? bar(SECTION_SHORT) : fullBar);
 			// Two rows on purpose: one row of key hints is ~100 columns, and the terminal cuts it at 70 —
 			// which is exactly where the `w` wrap state lived. #17's toggle has to be READABLE to exist.
-			if (readOnly) {
+			if (section === "brief") {
+				out.push(readOnly
+					? theme.fg("dim", "read-only viewer · ↑↓ line · Tab section · esc close")
+					: theme.fg("dim", "↑↓ line · ⏎ or e edit that line · a add a line · D delete it · Tab section"));
+				out.push(theme.fg("dim", readOnly
+					? "rendered markdown — headings, tables, code blocks · /plan export last [file] saves this plan"
+					: "rendered markdown — the model writes it with plan_doc action=brief, /plan brief [file] loads one"));
+			} else if (readOnly) {
 				out.push(theme.fg("dim", "read-only viewer · ↑↓ move · Tab section · w wrap/compact · esc close"));
 				out.push(theme.fg("dim", "/plan export last [file] saves this plan as markdown"));
 			} else {
@@ -339,7 +471,40 @@ export function createPlanEditor(
 				? theme.fg("accent", boxPrefix) + truncateToWidth(draft.render(Math.max(8, w - visibleWidth(boxPrefix)))[0] ?? "", Math.max(8, w - visibleWidth(boxPrefix)))
 				: null;
 			let boxPlaced = false;
-			if (section === "steps") {
+			if (section === "brief") {
+				// #23: the document half of a console plan, rendered by PI'S OWN markdown component — the same
+				// renderer that draws the assistant's messages, so a table in a plan looks like a table in the
+				// chat (box-drawing borders, width-aware cell wrapping included) rather than a pipe-separated
+				// rumour of one.
+				const src = briefLinesOf(d);
+				const t = targetList(d);
+				// Which SOURCE line ⏎ will edit, named out loud. The rendered body has no row-per-line mapping
+				// (one source line becomes a heading, a blank, and four table rows), so this row is the only
+				// honest way to say what a line edit is about — and it sits OUTSIDE the scrolled window, because
+				// a cursor you cannot see while the body scrolls is not a cursor.
+				if (t && t.kind === "briefLine") {
+					const preview = (src[t.index] ?? "").trim() || "(blank line)";
+					out.push(theme.fg("dim", `❯ line ${t.index + 1}/${src.length} · ⏎ edits: ${truncateToWidth(preview, Math.max(8, w - 34))}`));
+					if (boxLine && draft && editing?.kind === "briefLine") { out.push(boxLine); boxPlaced = true; }
+				}
+				const body = d?.brief ? markdownLines(d.brief, Math.max(10, w - 2)) : [];
+				if (body.length === 0) {
+					rows.push(theme.fg("dim", "  (no brief yet — plan_doc action=brief writes one; /plan brief <file> loads markdown)"));
+					hoveredRow = 0;
+				} else {
+					// Rendered at w-2 and re-indented by 2 so a wide table or a long paragraph can never spill past
+					// the panel's own frame — pi pads every line it returns to the width it was given.
+					// The window anchors on the cursor's line PROPORTIONALLY (line 8 of 12 ≈ row 8/12 of the
+					// body): exact would mean re-rendering line by line, which would break tables and fences.
+					const at = t && t.kind === "briefLine"
+						? Math.round((t.index / Math.max(1, src.length - 1)) * Math.max(0, body.length - 1))
+						: 0;
+					body.forEach((line, i) => {
+						rows.push(`  ${line.replace(/\s+$/, "")}`);
+						if (i === at) hoveredRow = rows.length - 1;
+					});
+				}
+			} else if (section === "steps") {
 				const idWidth = Math.max(2, String(d?.steps.reduce((m, s) => Math.max(m, s.id), 0) ?? 0).length);
 				for (const s of stepsOf(d)) {
 					const hovered = hoveredStep(d)?.id === s.id;
@@ -440,5 +605,6 @@ export function planPlainLines(doc: PlanDoc | null): string[] {
 		...(doc.decisions.length ? ["decisions:", ...doc.decisions.map((x) => `  - ${x}`)] : []),
 		...(doc.constraints.length ? ["constraints:", ...doc.constraints.map((x) => `  - ${x}`)] : []),
 		...(doc.openQuestions.length ? ["open questions:", ...doc.openQuestions.map((x) => `  - ${x}`)] : []),
+		...(doc.brief ? ["brief:", ...doc.brief.split("\n").slice(0, 40).map((l) => `  ${l.replace(/\s+$/, "")}`), ...(doc.brief.split("\n").length > 40 ? [`  … ${doc.brief.split("\n").length - 40} more lines — /plan view reads the whole brief`] : [])] : []),
 	];
 }
