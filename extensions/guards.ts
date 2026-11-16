@@ -1210,7 +1210,9 @@ export default function (pi: ExtensionAPI) {
 					}
 					const imported = updateSessionState(sid, s => { s.planDoc = doc; s.planStyle = "tui"; });
 					refreshPlanPanel(ctx);
-					ctx.ui.notify(`📋 Imported ${doc.steps.length} step(s) from ${file} into the console plan${imported.planMode ? " — live now (planning mode is ON)" : " — start with /plan tui"}. /plan view to edit it.`, "info");
+					// Named the way the human named it: `target` is what they typed ("imported-plan.md"), where the
+					// resolved path is 60 characters of directories nobody asked to read on a 140-column row.
+					ctx.ui.notify(`📋 Imported ${doc.steps.length} step(s) from ${target.trim() || file} into the console plan${imported.planMode ? " — live now (planning mode is ON)" : " — start with /plan tui"}. /plan view to edit it.`, "info");
 					break;
 				}
 
@@ -1475,6 +1477,16 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify((archived ? ["🗂 archived plan (read-only — /plan export last [file] saves it as markdown)"] : []).concat(planPlainLines(doc)).join("\n"), "info");
 			return null;
 		}
+		// Backlog #15 (measured in .pi/press raw-t.log): with the overlay open, the panel header, its hint row
+		// and its step rows were painted IN THE SAME FRAME as the overlay's own rows — the plan was on screen
+		// twice, one above the other. The panel exists to show the plan when you are NOT looking at it; while
+		// you are, it is a duplicate that eats rows the overlay needs. Only VISIBILITY changes: "viewer-open"
+		// is a signature no real plan can produce, so the refreshPlanPanel() below re-registers the panel after
+		// the close even when the document did not change, and nothing about wrap/budget/anchor state is touched.
+		if (ctx.hasUI && planPanelSignature !== "viewer-open") {
+			ctx.ui.setWidget("plan-panel", undefined);
+			planPanelSignature = "viewer-open";
+		}
 		const closed = await ctx.ui.custom<PlanEditorClose>(
 			(_tui, theme, _kb, done) => createPlanEditor(
 				{
@@ -1658,7 +1670,7 @@ export default function (pi: ExtensionAPI) {
 			note: Type.Optional(Type.String({ description: "update: sub-note attached to the step" })),
 			id: Type.Optional(Type.Number({ description: "stable step id, printed as #3" })),
 			status: Type.Optional(Type.Union([Type.Literal("open"), Type.Literal("doing"), Type.Literal("done"), Type.Literal("dropped")])),
-			after: Type.Optional(Type.Number({ description: "add/reorder: step id to land behind (omit = front)" })),
+			after: Type.Optional(Type.Number({ description: "add/reorder: step id to land behind (for add, omit = append at the END; for reorder, omit = move to the FRONT)" })),
 			kind: Type.Optional(Type.Union([Type.Literal("decision"), Type.Literal("constraint"), Type.Literal("open")])),
 			index: Type.Optional(Type.Number({ description: "note position, 0-based" })),
 		}),

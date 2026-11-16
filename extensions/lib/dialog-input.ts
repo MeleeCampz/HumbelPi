@@ -301,8 +301,11 @@ export class SelectingInput extends SpellInput {
 	override handleInput(data: string): void {
 		// Diagnostic key log (canary pattern, see __humbel_pi_dialog_seams): every claim this module
 		// makes about a wire format is only falsifiable if you can see what the host ACTUALLY delivered
-		// to handleInput, and what the selection endpoints were when it arrived. Bounded (12 entries) and
-		// in memory only — the press test reads it through /probe-state.
+		// to handleInput, and what the selection endpoints were when it arrived. Bounded (240 entries —
+		// measured, not generous: press scenario q parks the caret before each copy key with a short burst
+		// of plain Rights, and at the old 12-entry bound that burst flushed out of the ring the very keys
+		// the scenario then asserts were delivered) and in memory only — the press test reads it through
+		// /probe-state.
 		try {
 			const log = ((globalThis as any).__humbel_pi_dialog_keys ??= []) as Record<string, unknown>[];
 			log.push({
@@ -317,7 +320,7 @@ export class SelectingInput extends SpellInput {
 				hs: this.hasSelection() ? 1 : 0,
 				cp: isCopyKey(data) ? 1 : 0,
 			});
-			if (log.length > 12) log.shift();
+			if (log.length > 240) log.shift();
 		} catch { /* diagnostics never break the input */ }
 		if (data.includes("\x1b[200~")) this.inPaste = true;
 		const pasteStart = data.includes("\x1b[200~");

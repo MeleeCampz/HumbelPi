@@ -251,8 +251,10 @@ and is edited by both sides without leaving the TUI.
   one that draws the assistant's messages, so a table gets real box-drawing borders, headings are
   headings, quotes and rules render, and a long paragraph wraps instead of running off the panel. There
   the cursor names a **line of the source** (`❯ line 4/13 · ⏎ edits: …`) because the rendered body is
-  wrapped and rows are not lines: `↑↓` move by line, `e`/`⏎` rewrites that line, `a` adds one, `D`
-  deletes one, and a checklist key like `x` or `[` answers "does not apply to the brief" instead of
+  wrapped and rows are not lines: `↑↓` move by line, `e`/`⏎` rewrites that line, `a` adds one, `D` deletes
+  one **twice-armed** (the first `D` marks that line in the cursor row, the second deletes it, any other
+  keystroke cancels it — a Brief line has no status to drop first, so it gets the same two-press protection
+  a step has), and a checklist key like `x` or `[` answers "does not apply to the brief" instead of
   going dead. From your side: **`/plan brief <file>`** loads a markdown file you wrote yourself as the
   body, **`/plan brief`** opens the overlay directly on that section, **`/plan brief clear`** removes
   it, and `/plan status` reports what is in it. A plan without a brief looks exactly as it did before.
@@ -476,7 +478,8 @@ tools/
                      rows counted against the panel budget, and the brief: cap, render, export/import
                      round trip, which headings become the document and which stay the checklist) |
                      test-plan-view.ts (the overlay editor, driven by keystrokes, incl. the `w`
-                     wrap/compact toggle, the Brief section's rendered markdown and its line editor) |
+                     wrap/compact toggle, the Brief section's rendered markdown, its line editor, and
+                     the two-press `D` that deletes a Brief line) |
                      test-dialog-select.ts
   tsconfig.check.json typecheck scaffold — npx tsc -p tools/tsconfig.check.json --noEmit
                      (Windows: tools/mklink.bat first, to give node_modules the two pi packages)
@@ -502,6 +505,46 @@ pi writes plan and session files under `.pi/` that legitimately contain your own
 `C:\Users\…` paths and are never pushed, so a filesystem-wide scan aborted *every* push on a
 false positive. Audit ignored files deliberately with `node tools/secret-scan.js --all`.
 Regression test: `tools/test-secret-scan.ts`.
+
+## Testing a keyboard interaction (press scenarios)
+
+Unit tests call functions. Most of what this package does is a **key press changing state**, which a unit
+test can only imitate. So there is a second layer: `.pi/press/driver.py` runs **real pi in a PTY** (60×140)
+against a local **fake model server** whose scripted turns issue real tool calls (`ask_user`, `finish_plan`,
+`plan_doc`, `bash`), with a probe extension dumping session state on demand (`/probe-state`) and a trace
+file recording every event. Assertions read the terminal bytes and the stored state — not the extensions.
+
+```bash
+python3 .pi/press/driver.py            # every scenario
+python3 .pi/press/driver.py n t        # just these two
+```
+
+Scenarios `a–d` ask_user (escape, draft, cancel, dismiss) · `e f r` finish_plan (approve, reject with
+feedback, pause/resume/exit) · `g–j` working_task (lifecycle, steering safety) · `k l m o p` done-notify
+(OSC 9, Home Assistant wire, presence heuristic) · `s` the whole console-plan arc through settlement and
+retirement · `n` the Brief section in a live overlay · `t` the overlay's **step** keys and `/plan import`.
+
+The harness lives under `.pi/`, which this repo gitignores: it is a dev tool on the machine that has it, not
+something the package ships. Logs it writes (`raw-<name>.log`, `trace-<name>.jsonl`) are where a rendering
+claim is checked — pi writes **rows**, so "is X visible at the same moment as Y?" is answered by splitting
+those writes into frames, not by searching a buffer that holds every frame since launch.
+
+### When you see something at the keyboard
+
+`python3 .pi/press/driver.py repro` runs two **text files** instead of Python:
+`.pi/press/repro/turns.json` (what the model called) and `.pi/press/repro/script.txt` (what you typed, plus
+the assertions). A report becomes a pair of files anyone can run, and a run that disagrees prints the FAIL
+with the screen it saw. How to write one: `.pi/press/REPRO.md`.
+
+### Running the suite on Windows
+
+- `tools/mklink.bat` first. It makes **two** junctions into `node_modules` — `pi-coding-agent` and `pi-tui` —
+  pointing at your global npm install, which is how `npx tsc -p tools/tsconfig.check.json --noEmit` and the
+  tests find pi's own packages. Making a junction needs developer mode enabled or an elevated prompt.
+- Some tests need pi's internal modules resolvable: `NODE_PATH=<global npm>/node_modules/@earendil-works/pi-coding-agent/node_modules`.
+- A few checks assert POSIX behaviour a Windows filesystem cannot express (a `600` mode, a filename
+  containing a backslash). Those print `SKIP …` and keep going. A SKIP is a hole in coverage, not a pass —
+  if you want those covered too, run that file under WSL.
 
 ## Notifications: "it's done" and "it needs me"
 

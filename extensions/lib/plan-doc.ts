@@ -767,6 +767,13 @@ export function implementationInstructionFromDoc(doc: PlanDoc): string {
 export function planDocFromMarkdown(md: string, init: { title?: string; task?: string } = {}): PlanDoc {
 	const doc = newPlanDoc(init);
 	let bucket: PlanNoteKind | null = null;
+	// A title the CALLER supplied (usually the file name, from /plan import) is a fallback, not a claim
+	// about the document. Without that distinction a file that has its own `# Title` loses it to its own
+	// file name, and the H1 line then fell through the heading chain into `constraints` — so importing
+	// "imported-plan.md" titled "Rollout switch imported" produced a plan named after the file PLUS a
+	// stray constraint row named after the document. A fallback title is exactly as good as the file name,
+	// which is why an H1 is allowed to replace it.
+	let titleIsFallback = !!doc.title;
 	// #23: the three things a markdown document has that a checklist does not — a prose preamble, fenced
 	// code, and tables — all become the BRIEF instead of being parsed into steps.
 	//
@@ -803,10 +810,18 @@ export function planDocFromMarkdown(md: string, init: { title?: string; task?: s
 		}
 		if (/^[-─—]+$/.test(line)) continue;
 
-		const h = line.match(/^#{1,6}\s+(.*)$/);
+		const h = line.match(/^(#{1,6})\s+(.*)$/);
 		if (h) {
-			const name = h[1]!.trim();
+			const level = h[1]!.length;
+			const name = h[2]!.trim();
 			const t = name.toLowerCase();
+			// planDocToMarkdown's own title line, checked BEFORE the step-heading rule: "Plan — X" starts with
+			// the word "plan", and the checklist-heading rule (which exists so `## Approach` still means the
+			// checklist) was swallowing it — an exported plan came back from import with NO title at all.
+			if (level === 1) {
+				const own = name.replace(/^(console plan|the plan|plan)\s*[—–:-]\s*/i, "").trim();
+				if (own && !seenPlanContent && (!doc.title || titleIsFallback)) { doc.title = own; titleIsFallback = false; continue; }
+			}
 			// A STEPS heading wins over a brief heading. "## Approach" has meant "the checklist starts here" in
 			// this importer since file mode began, and a heading that silently turns a checklist into a document
 			// block is a worse failure than a missing brief.
@@ -816,7 +831,17 @@ export function planDocFromMarkdown(md: string, init: { title?: string; task?: s
 			if (/^(decision|choice|chosen)/.test(t)) bucket = "decision";
 			else if (/^(constraint|risk|assumption|limitation)/.test(t)) bucket = "constraint";
 			else if (/^(open question|question|unknown)/.test(t)) bucket = "open";
-			else if (!doc.title) doc.title = name;
+			else if (!doc.title) { doc.title = name; titleIsFallback = false; }
+			// A top-level heading BEFORE any plan content is the document's own name, and it outranks a
+			// caller's fallback. The `# Plan — …` heading planDocToMarkdown writes is stripped to what is
+			// left after its marker, so an export→import round trip keeps the real title instead of gaining
+			// "Plan — …" as a title or (the old behaviour) a constraint row.
+			else if (level === 1 && titleIsFallback && !seenPlanContent) {
+				const own = name.replace(/^(console plan|the plan|plan)\s*[—–:-]\s*/i, "").trim();
+				if (own) { doc.title = own; titleIsFallback = false; }
+			}
+			// A heading that just restates the title is the document introducing itself twice, not a section.
+			else if (name.toLowerCase() === (doc.title ?? "").toLowerCase()) { /* nothing to record */ }
 			else if (bucket === null) doc.constraints.push(name); // a stray heading is a section boundary worth knowing
 			continue;
 		}

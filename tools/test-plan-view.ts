@@ -158,6 +158,49 @@ function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the
 	check("cancel is reported in the commit line", text().some((x) => x.includes("edit cancelled")), JSON.stringify(text().slice(-2)));
 }
 
+// ── 5b. `a` adds a NEW step after the cursor (backlog #15, found by press scenario `t`) ──
+// It used to open an empty editor against the HOVERED step's id, so ⏎ took the `update` branch and
+// overwrote the row you were standing on — while the box it opened said "new step (⏎ adds it after the
+// cursor)". The unit suite missed it because its only `a` test ran on an EMPTY plan (no row to destroy).
+{
+	let d = newPlanDoc({ title: "A" });
+	for (const t of ["first row", "second row", "third row"]) d = applyPlanOp(d, { action: "add", text: t }).doc;
+	const { c, f, text } = fresh(d);
+	c.handleInput("a");
+	check("the add box states where the new row is going", text().some((x) => x.includes("adds it after the cursor")), JSON.stringify(text()));
+	c.handleInput(type("inserted after one"));
+	c.handleInput(KEYS.enter);
+	check("a commits an ADD, never an update of the hovered row", f.ops.length === 1 && f.ops[0]!.action === "add", JSON.stringify(f.ops));
+	check("every row that existed before `a` still exists", (f.doc?.steps.map((s) => s.text) ?? []).join("|") === "first row|inserted after one|second row|third row", JSON.stringify(f.doc?.steps));
+	check("the cursor follows the row it just made", text().some((x) => x.includes("❯") && x.includes("inserted after one")), JSON.stringify(text()));
+	check("the commit line names the new step", f.logs.some((l) => l.includes("added step #4")), JSON.stringify(f.logs));
+}
+{
+	let d = newPlanDoc({ title: "A2" });
+	for (const t of ["one", "two", "three"]) d = applyPlanOp(d, { action: "add", text: t }).doc;
+	const { c, f } = fresh(d);
+	c.handleInput(KEYS.down);
+	c.handleInput(KEYS.down); // cursor on #3, the last row
+	c.handleInput("a");
+	c.handleInput(type("appended at the end"));
+	c.handleInput(KEYS.enter);
+	check("`a` on the last row appends (after the last row IS the end)", (f.doc?.steps.map((s) => s.text) ?? []).join("|") === "one|two|three|appended at the end", JSON.stringify(f.doc?.steps));
+}
+{
+	// The agent lands plan_doc calls while the overlay is open. If it deletes the row `a` was anchored to,
+	// an `after` naming a step that no longer exists would fail the op and eat the text already typed.
+	let d = newPlanDoc({ title: "A3" });
+	for (const t of ["one", "two"]) d = applyPlanOp(d, { action: "add", text: t }).doc;
+	const { c, f } = fresh(d);
+	c.handleInput("a");
+	f.doc = applyPlanOp(f.doc!, { action: "remove", id: 1 }).doc; // the agent removed the anchor mid-edit
+	c.handleInput(type("survives a vanished anchor"));
+	c.handleInput(KEYS.enter);
+	check("a step added against a deleted anchor still lands (appended, not refused)",
+		f.ops.length === 1 && f.ops[0]!.action === "add" && !f.logs.some((l) => l.startsWith("✗")) && (f.doc?.steps.length ?? 0) === 2,
+		JSON.stringify([f.ops, f.logs, f.doc?.steps]));
+}
+
 // ── 6. sections: Tab cycles, n adds a note, D unnotes, e edits in place ──
 {
 	let d = newPlanDoc({ title: "T" });
@@ -243,8 +286,23 @@ void (() => {
 	c.handleInput(KEYS.enter);
 	check("a adds a line to the brief", (f.doc?.brief ?? "").includes("Constraint: the host has 6 GB"), JSON.stringify((f.doc?.brief ?? "").slice(-46)));
 	check("the cursor followed the line it just added", text().some((x) => x.includes("❯ line 4/13")), JSON.stringify(text().slice(-2)));
+	const briefOps = (n: number): boolean => f.ops.filter((o) => o.action === "brief").length === n;
 	c.handleInput("D");
-	check("D deletes the hovered line", !(f.doc?.brief ?? "").includes("Constraint: the host has 6 GB"), JSON.stringify((f.doc?.brief ?? "").slice(-40)));
+	check("D once ARMS the hovered line — the first press deletes nothing (backlog #15: Brief lines are two-press like steps)",
+		(f.doc?.brief ?? "").includes("Constraint: the host has 6 GB") && briefOps(2) && text().some((x) => x.includes("D again DELETES it")),
+		JSON.stringify(text().slice(-3)));
+	check("the arm is written ON the cursor row, where the cursor row lives (an armed delete you cannot see is just a key that deletes on the second press)",
+		text().some((x) => x.includes("❯ line 4/13 · D again DELETES it")), JSON.stringify(text()));
+	c.handleInput(KEYS.down);
+	check("moving the cursor disarms it — the arm was about a line, and that line is no longer under the cursor",
+		!text().some((x) => x.includes("DELETES it")) && (f.doc?.brief ?? "").includes("Constraint: the host has 6 GB"),
+		JSON.stringify(text().slice(-3)));
+	c.handleInput(KEYS.up);
+	c.handleInput("D");
+	check("arming the same line a second time is still not a delete", (f.doc?.brief ?? "").includes("Constraint: the host has 6 GB") && briefOps(2), JSON.stringify(f.ops));
+	c.handleInput("D");
+	check("the second D on the SAME line deletes it", !(f.doc?.brief ?? "").includes("Constraint: the host has 6 GB") && briefOps(3), JSON.stringify((f.doc?.brief ?? "").slice(-40)));
+	check("and the row says which line went and how many are left", text().some((x) => x.includes("deleted brief line 4")), JSON.stringify(text().slice(-2)));
 
 	// Keys that belong to the checklist must say so rather than sit silent.
 	for (const key of ["x", "[", "]", "w"]) {

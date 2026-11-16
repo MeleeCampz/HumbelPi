@@ -27,7 +27,10 @@ const mod = createRequire(import.meta.url)(SCAN_JS) as {
 	scan: (root: string, mode: "git" | "all") => { hits: string[]; files: number; mode: string };
 	scanText: (rel: string, text: string) => string[];
 	forbiddenReason: (rel: string) => string | null;
+	skipped: (rel: string) => boolean;
+	toPosixRel: (p: string) => string;
 	publishablePaths: (root: string) => { tracked: string[]; fresh: string[] };
+	walkAll: (root: string, dir?: string, out?: string[]) => string[];
 };
 
 let failures = 0;
@@ -47,16 +50,27 @@ function mkRepo(): string {
 	// own ~/.gitconfig, ~/.gitignore_global or CORP config cannot change what this test proves.
 	const empty = path.join(dir, "empty-git-config");
 	fs.writeFileSync(empty, "");
-	const r = spawnSync("git", ["-C", dir, "-c", `core.excludesFile=${empty}`, "init", "-q"], {
+	const r = spawnSync("git", ["-C", dir, "-c", `core.excludesFile=${gitPath(empty)}`, "init", "-q"], {
 		encoding: "utf8",
-		env: { ...process.env, GIT_CONFIG_GLOBAL: empty, GIT_CONFIG_SYSTEM: empty },
+		env: { ...process.env, GIT_CONFIG_GLOBAL: gitPath(empty), GIT_CONFIG_SYSTEM: gitPath(empty) },
 	});
 	if (r.status !== 0) throw new Error(`git init failed: ${r.stderr}`);
 	return dir;
 }
 
+/**
+ * Git-facing path values are handed to git with "/" on every platform.
+ * Git for Windows accepts "/" in a config value or a -c argument, while a value like
+ * `C:\Users\…\empty-git-config` goes through git's own quoting rules — a test about path
+ * handling should not also be a test of how a config value survives backslash quoting.
+ * (This is the same one-spelling rule the scanner itself now enforces.)
+ */
+function gitPath(p: string): string {
+	return p.replace(/\\+/g, "/");
+}
+
 function gitConfig(dir: string): Record<string, string> {
-	const empty = path.join(dir, "empty-git-config");
+	const empty = gitPath(path.join(dir, "empty-git-config"));
 	return { ...process.env, GIT_CONFIG_GLOBAL: empty, GIT_CONFIG_SYSTEM: empty } as Record<string, string>;
 }
 
@@ -137,6 +151,60 @@ const USER_DIR = "C:" + "/Users/" + "Ada";
 	check("forbiddenReason is path-component based, not just basename",
 		mod.forbiddenReason(path.join("a", "plans", "x.md")) === "forbidden directory (plans/)",
 		String(mod.forbiddenReason(path.join("a", "plans", "x.md"))));
+
+	// ── #10: every path rule is asserted in BOTH spellings, on every platform ──
+	// A check written with path.join() only ever proves the host's own separator, so on Linux it
+	// proves nothing about Windows and vice versa — yet the rules compare path COMPONENTS, which is
+	// exactly where the two spellings differ. Splitting only on path.sep made "a\\plans\\x.md" one
+	// component on Linux: the plans/ rule did not apply to the spelling Windows produces, and the
+	// suite was green. A scanner should be platform-aware, not platform-lucky.
+	const BOTH_FORBIDDEN = [
+		["plans/x.md", "forbidden directory (plans/)"],
+		["plans\\x.md", "forbidden directory (plans/)"],
+		["a/plans/b/x.md", "forbidden directory (plans/)"],
+		["a\\plans\\b\\x.md", "forbidden directory (plans/)"],
+		["sessions/state.json", "forbidden directory (sessions/)"],
+		["sessions\\state.json", "forbidden directory (sessions/)"],
+		["nested\\auth.json", "forbidden file (auth.json)"],
+	] as const;
+	for (const [spelling, expected] of BOTH_FORBIDDEN) {
+		check(`forbidden rule holds for the spelling this platform does NOT use natively: ${JSON.stringify(spelling)}`,
+			mod.forbiddenReason(spelling) === expected, String(mod.forbiddenReason(spelling)));
+	}
+	// …and normalizing must not make the scanner imagine rules that are not there.
+	for (const clean of ["notes/clean.md", "notes\\clean.md", "models.example.json", "cfg.json"]) {
+		check(`no false forbidden hit for ${JSON.stringify(clean)}`, mod.forbiddenReason(clean) === null,
+			String(mod.forbiddenReason(clean)));
+	}
+	check("node_modules is skipped in both spellings",
+		mod.skipped("node_modules/pkg/index.js") && mod.skipped("node_modules\\pkg\\index.js"));
+	check("toPosixRel folds both separators, runs of them, and a UNC-style prefix",
+		mod.toPosixRel("a\\b/c\\\\d") === "a/b/c/d" && mod.toPosixRel("//server/share/x") === "/server/share/x",
+		`${mod.toPosixRel("a\\b/c\\\\d")} / ${mod.toPosixRel("//server/share/x")}`);
+
+	// A NEW (untracked) file in a SUBDIRECTORY must be caught and reported with one spelling.
+	// Before this rule existed, the whole-tree walk produced `sub\deep\leak.md` on Windows and the
+	// reported-path assertions (and every "is this path mentioned" check) missed it.
+	write(dir, "sub/deep/leak.md", `rotate ${SECRET_KEY} soon\n`);
+	const nested = mod.scan(dir, "git");
+	check("a nested untracked file with a key is caught, reported with / on every platform",
+		mentions(nested.hits, "sub/deep/leak.md") && mentions(nested.hits, "sk-… key"),
+		nested.hits.filter((h) => h.includes("sub/deep")).join(" | "));
+	const nestedAll = mod.scan(dir, "all");
+	check("--all reports nested paths in the same one spelling too",
+		mentions(nestedAll.hits, "sub/deep/leak.md"), nestedAll.hits.filter((h) => h.includes("sub/deep")).join(" | ").slice(0, 160));
+
+	// The normalized spelling is for RULES and OUTPUT; reading a file uses the RAW spelling. A name
+	// that literally contains a backslash is legal on Linux and must still be read (and flagged).
+	// Windows forbids such a name, so the case is skipped there — honestly, not silently.
+	if (process.platform === "win32") {
+		console.log('  SKIP  a file named `weird\u005cname.md` cannot exist on Windows — the raw-spelling read path is only provable on unix');
+	} else {
+		write(dir, "weird\\name.md", `rotate ${SECRET_KEY} soon\n`);
+		const odd = mod.scan(dir, "git");
+		check("a file whose NAME contains a backslash is still read and flagged (rules normalize, reads do not)",
+			mentions(odd.hits, "sk-… key"), odd.hits.slice(-3).join(" | "));
+	}
 
 	// ── a real apiKey value, and the shape the hook actually trips on ──
 	write(dir, "cfg2.json", JSON.stringify({ apiKey: "hunter2supersecretnonplaceholder" }));

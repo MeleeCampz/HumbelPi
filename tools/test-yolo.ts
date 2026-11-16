@@ -12,15 +12,25 @@
  * Both spellings are set now, and the first check verifies the module's OWN exported
  * paths landed under the temp home; if they did not, the write cases are refused
  * rather than run.
+ *
+ * It then compares the REAL ~/.pi/agent before and after the run, for every file this test
+ * knows how to write. The stray-id check can only see files that APPEARED; a leak that rewrites
+ * the live guard-state.json in place leaves nothing to find — and an in-place rewrite is the
+ * exact accident this test used to have. A suite that is green while touching your live guard
+ * state is not green, which matters most on Windows, where the redirect used to fail.
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 let failures = 0;
-function check(name: string, cond: boolean): void {
+function check(name: string, cond: boolean, detail?: string): void {
 	if (cond) console.log(`  PASS  ${name}`);
-	else { failures++; console.error(`  FAIL  ${name}`); }
+	else {
+		failures++;
+		console.error(`  FAIL  ${name}`);
+		if (detail) console.error(`        ${detail}`);
+	}
 }
 
 const HOME_BEFORE = process.env.USERPROFILE ?? process.env.HOME ?? os.homedir();
@@ -37,6 +47,58 @@ delete process.env.SANDBOX_NAME;
 // Dynamic import (inside an async main) so the temp home is set before the module's
 // top-level path constants are evaluated.
 async function main(): Promise<void> {
+	// Snapshot the REAL ~/.pi/agent BEFORE the module is imported. The stray-id check at the end
+	// only proves our session files did not APPEAR; a leak that rewrites the live guard-state.json
+	// in place creates no new file to find — and rewriting that file in place is exactly what this
+	// test once did. A before/after comparison catches a CHANGE, not just an addition.
+	const REAL_AGENT_DIR = (() => {
+		try { return path.join(fs.realpathSync(HOME_BEFORE), ".pi", "agent"); } catch { return null; }
+	})();
+	function snapshotAgentDir(): Map<string, string> {
+		const out = new Map<string, string>();
+		if (!REAL_AGENT_DIR) return out;
+		const walk = (dir: string, depth: number): void => {
+			if (depth > 2) return;
+			let entries: fs.Dirent[];
+			try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+			for (const e of entries) {
+				const p = path.join(dir, e.name);
+				if (e.isDirectory()) { walk(p, depth + 1); continue; }
+				if (!e.isFile()) continue;
+				try {
+					const st = fs.statSync(p);
+					out.set(path.relative(REAL_AGENT_DIR, p).split(path.sep).join("/"), `${st.size}:${Math.round(st.mtimeMs)}`);
+				} catch { /* removed while we looked */ }
+			}
+		};
+		walk(REAL_AGENT_DIR, 0);
+		return out;
+	}
+	const AGENT_BEFORE = snapshotAgentDir();
+/**
+ * Only the files THIS test could write are allowed to fail the comparison. If some other
+ * process (a live pi console in another window) writes ~/.pi/agent while this runs, that is
+ * not this test's doing — but it is printed, because "the suite is green" should never be
+ * bought by looking away.
+ */
+function agentChanges(): { ours: string[]; other: string[] } {
+	const ours: string[] = [];
+	const other: string[] = [];
+	if (!REAL_AGENT_DIR) return { ours, other };
+	const after = snapshotAgentDir();
+	const mine = (rel: string): boolean =>
+		rel === path.basename(GUARD_FILE) || rel.split("/").some((p) => OUR_IDS.some((id) => p.startsWith(id)));
+	for (const [rel, sig] of after) {
+		if (AGENT_BEFORE.get(rel) === sig) continue;
+		const kind = AGENT_BEFORE.has(rel) ? "changed" : "appeared";
+		(mine(rel) ? ours : other).push(`${rel} (${kind})`);
+	}
+	for (const rel of AGENT_BEFORE.keys()) {
+		if (!after.has(rel) && mine(rel)) ours.push(`${rel} (vanished)`);
+	}
+	return { ours, other };
+}
+
 const { loadGuardState, updateGuardState, loadSessionState, updateSessionState, sessionStateFile, GUARD_STATE_FILE, yoloDefaultOn } = await import("../extensions/lib/session-state");
 // The test asserts against the module's own paths instead of re-deriving them — no
 // second guess about what "home" means on this platform.
@@ -110,6 +172,16 @@ console.log("session-state files no longer carry yolo:");
 }
 
 check("nothing this test wrote landed in the real session-state dir", straysInRealDir().length === 0, straysInRealDir().join(", "));
+
+// The stronger version of the same promise: the live ~/.pi/agent is byte-for-byte the same
+// after this test as before it, for every file this test knows how to write.
+{
+	const { ours, other } = agentChanges();
+	const realGuard = REAL_AGENT_DIR ? path.join(REAL_AGENT_DIR, path.basename(GUARD_FILE)) : "guard-state.json";
+	check(`the real ${realGuard} and the real session-state files were not touched (${REAL_AGENT_DIR ?? "no ~/.pi/agent on this machine"})`,
+		ours.length === 0, ours.join(", "));
+	if (other.length) console.log(`  NOTE  other processes wrote ${REAL_AGENT_DIR} during this run: ${other.join(", ")} — not this test's doing, and not counted as a failure`);
+}
 
 fs.rmSync(tmpHome, { recursive: true, force: true });
 console.log(failures === 0 ? "\nAll yolo regression checks passed." : `\n${failures} check(s) FAILED.`);

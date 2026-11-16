@@ -400,6 +400,24 @@ void (() => {
 	const bg = planDocFromMarkdown(["# T", "", "## Background", "A paragraph about the host.", "", "## Steps", "1. first"].join("\n"));
 	check("## Background opens a document block and ## Steps reopens the checklist", (bg.brief ?? "").includes("A paragraph about the host.") && bg.steps.length === 1, JSON.stringify([bg.brief, bg.steps.map((s) => s.text)]));
 	check("a plan with no brief renders exactly as it did before #23", !renderPlanText(newPlanDoc({ title: "plain" })).includes("Brief ("), renderPlanText(newPlanDoc({ title: "plain" })));
+
+	// #15: a title the CALLER supplied is a fallback (the file name /plan import passes when the reader gave
+	// no name), and a document that has its own `# Title` outranks it. Before this, the file name won and the
+	// H1 fell through the heading chain into `constraints` — a plan named after its own file plus a stray note
+	// row named after its own title.
+	const imp = planDocFromMarkdown("# Rollout switch imported\n\n## Steps\n1. one\n\n## Decisions\n- off by default\n", { title: "imported-plan" });
+	check("the file's own # title beats the caller's file-name fallback", imp.title === "Rollout switch imported", imp.title);
+	check("and that H1 did not become a constraint row", imp.constraints.length === 0, JSON.stringify(imp.constraints));
+	const noTitle = planDocFromMarkdown("## Steps\n1. one\n", { title: "just-a-file" });
+	check("a document with no title of its own keeps the fallback (import always names something)", noTitle.title === "just-a-file", noTitle.title);
+	const twice = planDocFromMarkdown(["# Same name", "", "# Same name", "", "## Steps", "1. one"].join("\n"), { title: "fallback" });
+	check("a heading that restates the title is the document introducing itself twice, not a section",
+		twice.title === "Same name" && twice.constraints.length === 0, JSON.stringify([twice.title, twice.constraints]));
+	const rt = planDocFromMarkdown(planDocToMarkdown(applyPlanOp(applyPlanOp(newPlanDoc({ title: "Original title", task: "t" }), { action: "add", text: "s1" }).doc, { action: "brief", text: "body" }).doc));
+	check("export → import keeps the plan's own title (the exporter's `# Plan —` marker is not mistaken for one)",
+		rt.title === "Original title", JSON.stringify([rt.title, rt.constraints]));
+	check("an imported H1 after the checklist has started is not treated as the title",
+		planDocFromMarkdown("## Steps\n1. one\n\n# A later heading\n", { title: "fb" }).title === "fb", JSON.stringify([planDocFromMarkdown("## Steps\n1. one\n\n# A later heading\n", { title: "fb" }).title, planDocFromMarkdown("## Steps\n1. one\n\n# A later heading\n", { title: "fb" }).constraints]));
 })();
 
 console.log("");

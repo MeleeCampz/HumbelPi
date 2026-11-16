@@ -59,11 +59,18 @@ const SKIP_DIRS = new Set([".git", "node_modules"]);
  * Repo-relative paths are always "/" separated, on every platform.
  * git prints "/" even on Windows; path.relative() prints "\" there. Skip dirs, forbidden
  * components and the reported hit paths all compare against one spelling, otherwise the same
- * repo passes on Linux and leaks (or cries foul) on Windows. File CONTENT patterns keep
- * matching both separators — this is only about path handling.
+ * repo passes on Linux and leaks (or cries foul) on Windows.
+ *
+ * BOTH separators are converted, not just the host's own: `path.sep` is one character, and a
+ * path handed to this scanner can be spelled with the other one — a Windows-checkout path read
+ * on Linux, a fixture built to prove the Windows case, a tool that prints "\" everywhere.
+ * Splitting only on `path.sep` made `"a\\plans\\x.md"` a single component on Linux, so the
+ * `plans/` rule did not apply to the exact spelling Windows produces. That is the difference
+ * between a scanner that is platform-aware and one that is platform-lucky.
+ * File CONTENT patterns keep matching both separators — this is only about path handling.
  */
 function toPosixRel(p) {
-	return p.split(path.sep).join("/");
+	return String(p).replace(/[\\/]+/g, "/");
 }
 
 /** Forbidden by NAME (file) or by any path component (directory). */
@@ -128,7 +135,10 @@ function walkAll(root, dir = root, out = []) {
 		if (SKIP_DIRS.has(e.name)) continue;
 		const p = path.join(dir, e.name);
 		if (e.isDirectory()) walkAll(root, p, out);
-		else if (e.isFile()) out.push(toPosixRel(path.relative(root, p)));
+		// RAW spelling here: this is the string that gets handed to readFileSync. A file on Linux
+		// may legitimately be named `weird\name.md`, and normalizing before the read would make the
+		// scanner read a path that does not exist and quietly scan nothing.
+		else if (e.isFile()) out.push(path.relative(root, p));
 	}
 	return out;
 }
@@ -136,38 +146,46 @@ function walkAll(root, dir = root, out = []) {
 /** Scan `root`; returns { hits, files, mode }. */
 function scan(root, mode) {
 	const hits = [];
-	let rel = [];
+	/** { raw } as git/filesystem spelled it (for reading) and { rel } normalized (for rules and output). */
+	let entries = [];
+	const seen = new Set();
+	const add = (raw) => {
+		const rel = toPosixRel(raw);
+		if (seen.has(rel)) return;
+		seen.add(rel);
+		entries.push({ raw, rel });
+	};
 	let used = mode;
 	if (mode === "git") {
 		try {
 			const { tracked, fresh } = publishablePaths(root);
-			rel = [...new Set([...tracked, ...fresh].map(toPosixRel))];
+			for (const r of [...tracked, ...fresh]) add(r);
 		} catch {
 			console.warn("secret-scan: not a git repository — auditing every file on disk instead");
-			rel = walkAll(root);
+			for (const r of walkAll(root)) add(r);
 			used = "all";
 		}
 	} else {
-		rel = walkAll(root);
+		for (const r of walkAll(root)) add(r);
 	}
 
 	const files = [];
-	for (const r of rel) {
-		if (skipped(r)) continue;
-		files.push(r);
-		const why = forbiddenReason(r);
+	for (const { raw, rel } of entries) {
+		if (skipped(rel)) continue;
+		files.push(rel);
+		const why = forbiddenReason(rel);
 		if (why) {
 			// The name alone is the finding: these hold runtime/private data and must not be published.
-			hits.push(`${r} — ${why}`);
+			hits.push(`${rel} — ${why}`);
 			continue;
 		}
 		let text;
 		try {
-			text = fs.readFileSync(path.join(root, r), "utf8");
+			text = fs.readFileSync(path.join(root, raw), "utf8");
 		} catch {
 			continue; // deleted from the index, or unreadable — the name check already ran
 		}
-		hits.push(...scanText(r, text));
+		hits.push(...scanText(rel, text));
 	}
 	return { hits, files: files.length, mode: used };
 }
@@ -193,4 +211,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { scan, scanText, forbiddenReason, publishablePaths, walkAll, PATTERNS, FORBIDDEN_FILES, FORBIDDEN_DIRS };
+module.exports = { scan, scanText, forbiddenReason, skipped, toPosixRel, publishablePaths, walkAll, PATTERNS, FORBIDDEN_FILES, FORBIDDEN_DIRS };

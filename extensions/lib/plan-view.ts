@@ -154,6 +154,11 @@ export function createPlanEditor(
 	let stepCursor: number | null = null; // steps: by ID
 	let noteCursor = 0;                   // notes: by position (they have no ids)
 	let briefCursor = 0;                  // #23: the brief: by source-line position
+	// #15 (the delete-safety call): a Brief line has no status to drop first, so a step's "D drops, D removes"
+	// trick cannot protect it. The protection is an ARM: the first D marks one line under the cursor and says
+	// so on that line; the second D deletes it. It lives here, in overlay state, not as a new PlanOp — the
+	// model's one brief op stays a single whole-body write, and plan-doc.ts stays import-free.
+	let armedBrief: number | null = null;
 	let editing: Target | null = null;
 	let draft: SelectingInput | null = null;
 	let focused = false;
@@ -257,7 +262,11 @@ export function createPlanEditor(
 			openEditor("", "new line of markdown (⏎ adds it after the cursor)");
 			return;
 		}
-		editing = section === "steps" ? { kind: "step", id: hoveredStep(doc())?.id ?? -1 } : { kind: "note", index: -1 };
+		// Backlog #15 (found by press scenario `t`): this used to be `{ kind: "step", id: hoveredStep() }`,
+		// so ⏎ took the `update` branch and OVERWROTE the row the cursor sat on — while the editor it opened
+		// said "new step (⏎ adds it after the cursor)". A key that denies its own hint row is the exact
+		// failure a press test exists to catch: -1 means NEW here exactly like it does for notes.
+		editing = section === "steps" ? { kind: "step", id: -1 } : { kind: "note", index: -1 };
 		openEditor("", section === "steps" ? "new step (⏎ adds it after the cursor)" : `new ${SECTION_LABEL[section].toLowerCase()} (⏎ adds it)`);
 	};
 
@@ -268,7 +277,17 @@ export function createPlanEditor(
 		if (!t || !text) { lastLog = "edit cancelled (nothing typed)"; return; }
 		if (section === "steps") {
 			if (t.kind !== "step") return;
-			if (t.id === -1) apply({ action: "add", text });
+			if (t.id === -1) {
+				// "after the cursor" has to mean the row you were standing on when you pressed `a`. The id is
+				// re-checked against the CURRENT document: the agent can remove that row while you type, and an
+				// `after` naming a step that no longer exists would fail the whole op and eat what you typed —
+				// so a vanished anchor falls back to plain append, which is where a new row belongs anyway.
+				const anchor = stepCursor !== null && stepsOf(doc()).some((s) => s.id === stepCursor) ? stepCursor : undefined;
+				// nextId is the id the new step is about to take (plan-doc's add does `next.nextId++`), so the
+				// cursor can land on the row it just made — the same promise the brief makes for a new line.
+				const newId = doc()?.nextId;
+				if (apply({ action: "add", text, ...(anchor !== undefined ? { after: anchor } : {}) }) && newId !== undefined) stepCursor = newId;
+			}
 			else apply({ action: "update", id: t.id, text });
 			return;
 		}
@@ -305,13 +324,23 @@ export function createPlanEditor(
 			return;
 		}
 		if (section === "brief") {
-			const d = doc();
-			if (!d?.brief) return;
+			if (!d?.brief) return; // nothing written yet: D says nothing rather than arming a line that does not exist
 			const lines = briefLinesOf(d);
 			const at = Math.min(Math.max(0, briefCursor), lines.length - 1);
+			if (armedBrief !== at) {
+				armedBrief = at;
+				lastLog = `D again deletes line ${at + 1}/${lines.length} of the brief — any other key cancels it`;
+				return;
+			}
+			armedBrief = null;
 			lines.splice(at, 1);
 			briefCursor = Math.max(0, at - 1);
-			apply({ action: "brief", text: lines.join("\n") }); // an empty body is the op that CLEARS the brief
+			// An empty body is the op that CLEARS the brief. The op log the model gets is the generic brief log;
+			// the row the human reads says which line went away, because "brief set (4 lines)" is not an answer
+			// to "did I just delete the line I meant?".
+			if (apply({ action: "brief", text: lines.join("\n") })) {
+				lastLog = `deleted brief line ${at + 1} — ${lines.filter((l) => l.trim()).length} line(s) left`;
+			}
 			return;
 		}
 		const list = notesOf(d, section);
@@ -376,6 +405,10 @@ export function createPlanEditor(
 				return;
 			}
 			if (matchesKey(data, "ctrl+c")) { done({ edits: applied.length, summary: applied }); return; }
+			// An armed Brief delete is a statement about ONE line under the cursor. Any key that is not D —
+			// including the keystroke that opened an editor or moved the cursor or simply missed — cancels it,
+			// so an arm can never survive the thing that made it untrue.
+			if (data !== "D") armedBrief = null;
 			if (matchesKey(data, "up") || data === "k") { move(-1); return; }
 			if (matchesKey(data, "down") || data === "j") { move(1); return; }
 			if (matchesKey(data, "pageUp")) { move(-5); return; }
@@ -416,7 +449,7 @@ export function createPlanEditor(
 					return;
 				}
 				lastLog = section === "brief"
-					? `✗ ${data} does nothing here — ↑↓ line · ⏎ edit that line · a new line · D delete it · Tab section · esc close`
+					? `✗ ${data} does nothing here — ↑↓ line · ⏎ edit that line · a new line · D twice deletes it · Tab section · esc close`
 					: `✗ ${data} does nothing here — ↑↓ move · Tab section · e/⏎ edit · a add · x status · [ ] reorder · D drop/remove · w ${wrapRows ? "compact" : "expand"} · esc close`;
 			}
 		},
@@ -447,7 +480,7 @@ export function createPlanEditor(
 			if (section === "brief") {
 				out.push(readOnly
 					? theme.fg("dim", "read-only viewer · ↑↓ line · Tab section · esc close")
-					: theme.fg("dim", "↑↓ line · ⏎ or e edit that line · a add a line · D delete it · Tab section"));
+					: theme.fg("dim", "↑↓ line · ⏎ or e edit that line · a add a line · D twice deletes it · Tab section"));
 				out.push(theme.fg("dim", readOnly
 					? "rendered markdown — headings, tables, code blocks · /plan export last [file] saves this plan"
 					: "rendered markdown — the model writes it with plan_doc action=brief, /plan brief [file] loads one"));
@@ -484,7 +517,11 @@ export function createPlanEditor(
 				// a cursor you cannot see while the body scrolls is not a cursor.
 				if (t && t.kind === "briefLine") {
 					const preview = (src[t.index] ?? "").trim() || "(blank line)";
-					out.push(theme.fg("dim", `❯ line ${t.index + 1}/${src.length} · ⏎ edits: ${truncateToWidth(preview, Math.max(8, w - 34))}`));
+					// The arm is shown ON the row it points at, in the warning colour, in the same place the cursor
+					// row normally lives — an armed delete you cannot see is just a key that deletes on the second press.
+					out.push(armedBrief === t.index
+						? theme.fg("warning", `❯ line ${t.index + 1}/${src.length} · D again DELETES it: ${truncateToWidth(preview, Math.max(8, w - 56))}`)
+						: theme.fg("dim", `❯ line ${t.index + 1}/${src.length} · ⏎ edits: ${truncateToWidth(preview, Math.max(8, w - 34))}`));
 					if (boxLine && draft && editing?.kind === "briefLine") { out.push(boxLine); boxPlaced = true; }
 				}
 				const body = d?.brief ? markdownLines(d.brief, Math.max(10, w - 2)) : [];
