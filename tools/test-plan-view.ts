@@ -7,7 +7,7 @@
  * Run: npx -y tsx tools/test-plan-view.ts
  */
 import { applyPlanOp, newPlanDoc, type PlanDoc, type PlanOp } from "../extensions/lib/plan-doc";
-import { createPlanEditor, planPlainLines, type PlanEditorClose, type PlanSection } from "../extensions/lib/plan-view";
+import { createPlanEditor, planPlainLines, briefBlocksOf, type BriefBlock, type PlanEditorClose, type PlanSection } from "../extensions/lib/plan-view";
 
 const theme = { fg: (_c: string, t: string) => t };
 const strip = (s: string) => s.replace(/\u001b[^\n]*?m/g, "");
@@ -99,6 +99,97 @@ function fresh(doc: PlanDoc | null = newPlanDoc({ title: "Test plan", task: "the
 	c.handleInput(KEYS.down);
 	check("down at the end does not run off", hovered()?.includes("#7"), hovered());
 }
+
+// ── 2b. #15: g / G jump the cursor to the first and last row of whatever section is open ──
+// Why not PageUp/PageDown: measured in the press harness, those sequences never reach this overlay —
+// pi handles them for the chat viewport (PageUp even forces a full-screen repaint). Letters reach it,
+// which is what x / e / a / D already prove, so the jump is spelled with letters.
+void (() => {
+	let d = newPlanDoc({ title: "J" });
+	for (const t of ["first", "second", "third", "fourth"]) d = applyPlanOp(d, { action: "add", text: t }).doc;
+	d = applyPlanOp(d, { action: "note", kind: "decision", text: "the only decision" }).doc;
+	d = applyPlanOp(d, { action: "note", kind: "decision", text: "a second decision" }).doc;
+	d = applyPlanOp(d, { action: "note", kind: "constraint", text: "constraint one" }).doc;
+	d = applyPlanOp(d, { action: "brief", text: "line one\nline two\nline three" }).doc;
+	const { c, f, text } = fresh(d);
+	const hovered = (): string => text().find((x) => x.includes("❯")) ?? "";
+
+	c.handleInput("G");
+	check("G lands the step cursor on the LAST row (and names it by id, not by position)", hovered().includes("#4") && hovered().includes("fourth"), hovered());
+	check("the hint row offers the jump keys so they are discoverable", text().some((x) => x.includes("g top") && x.includes("G end")), JSON.stringify(text().slice(4, 6)));
+	c.handleInput("x");
+	check("and the row it landed on is the one the keys then act on", f.ops.some((o) => o.action === "cycle" && o.id === 4), JSON.stringify(f.ops));
+	c.handleInput("g");
+	check("g lands on the FIRST row", hovered().includes("#1") && hovered().includes("first"), hovered());
+	c.handleInput("G"); c.handleInput("[");
+	check("a jump does not break reorder — the row under the cursor moves", (f.doc?.steps.map((s) => s.text).join(",") ?? "").includes("fourth,third"), JSON.stringify(f.doc?.steps.map((s) => s.id)));
+	c.handleInput("g");
+	check("g works from anywhere, including the middle of a reordered list", hovered().includes("#1"), hovered());
+
+	c.handleInput(KEYS.tab); // Brief
+	c.handleInput("G");
+	check("in the Brief, G parks the line cursor on the LAST line of the body", text().some((x) => x.includes("❯ line 3/3")), JSON.stringify(text().slice(4, 7)));
+	c.handleInput("g");
+	check("g returns it to the first line, and the ruler in the body moves with it", text().some((x) => x.includes("❯ line 1/3")) && text().some((x) => x.includes("❯  1│")), JSON.stringify(text().slice(4, 8)));
+	c.handleInput("G");
+	check("the last line is reachable and editable (the jump is a cursor move, not a view change)", (() => { c.handleInput("e"); c.handleInput(" — jumped to and edited"); c.handleInput(KEYS.enter); return (f.doc?.brief ?? "").endsWith("line three — jumped to and edited"); })(), JSON.stringify((f.doc?.brief ?? "").split("\n").at(-1)));
+
+	c.handleInput(KEYS.tab); // Brief -> Decisions
+	c.handleInput("G");
+	check("G jumps the NOTE cursor too", text().some((x) => x.includes("❯") && x.includes("a second decision")), JSON.stringify(text().slice(-4)));
+	c.handleInput("g");
+	check("and g brings it back to the first note", text().some((x) => x.includes("❯") && x.includes("the only decision")), JSON.stringify(text().slice(-4)));
+	check("jumping is navigation: it is not reported as an edit when the overlay closes",
+		(() => { c.handleInput(KEYS.esc); return f.close !== null && f.close.edits === 3; })(),
+		JSON.stringify(f.close?.summary));
+})();
+
+// ── 2c. #17: `<` and `>` move a PAGE (a screenful of this plan), not one line ──
+void (() => {
+	// Steps: four rows fit the 14-row terminal, so one page is the whole list — a page jump clamps.
+	let d = newPlanDoc({ title: "P" });
+	for (const t of ["one", "two", "three", "four"]) d = applyPlanOp(d, { action: "add", text: t }).doc;
+	const st = fresh(d);
+	const hovered = (): string => st.text().find((x) => x.includes("❯")) ?? "";
+	st.c.handleInput(">");
+	check("> pages to the last row when the whole list fits on screen", hovered().includes("#4") && hovered().includes("four"), hovered());
+	st.c.handleInput("<");
+	check("< pages back, and neither press wrote anything", hovered().includes("#1") && st.f.ops.length === 0, JSON.stringify(st.f.ops));
+
+	// Brief in a terminal that CANNOT show the body: this is the case your report was about.
+	const LONG = Array.from({ length: 40 }, (_, i) => (i % 5 === 0 ? `## Heading ${i / 5 + 1}` : `body line ${i + 1} of 40`)).join("\n");
+	let b = newPlanDoc({ title: "Long brief" });
+	b = applyPlanOp(b, { action: "add", text: "a step" }).doc;
+	b = applyPlanOp(b, { action: "brief", text: LONG }).doc;
+	const br = fresh(b, { section: "brief" });
+	const line = (): number => {
+		const m = /❯ line (\d+)\/40/.exec(br.text().join("\n"));
+		return m ? Number(m[1]) : -1;
+	};
+	const a0 = line();
+	br.c.handleInput(">");
+	const a1 = line();
+	check("> moves the line cursor a SCREENFUL down (not one line, not straight to the end)",
+		a1 > a0 + 1 && a1 < 40, `line ${a0} -> ${a1}`);
+	const visible = br.text().filter((x) => /│/.test(x)).length;
+	check("and the page it moved by is the number of rows this terminal actually paints",
+		Math.abs((a1 - a0) - visible) <= 2, `moved ${a1 - a0}, body shows ${visible} rows`);
+	const gutter = br.text().flatMap((x) => [...x.matchAll(/(\d+)│/g)].map((m) => Number(m[1])));
+	check("after a page jump the cursor row sits MID-WINDOW: a line above it and a line below it are both painted (you see where you came from and where you are going)",
+		gutter.includes(a1 - 1) && gutter.includes(a1) && gutter.includes(a1 + 1), `line ${a1}, gutter numbers ${JSON.stringify(gutter)}`);
+	for (let i = 0; i < 12; i++) br.c.handleInput(">");
+	check("repeated > walks the document page by page and CLAMPS at the last line (it cannot run off the end)",
+		line() === 40, `line ${line()}`);
+	br.c.handleInput("<");
+	const up1 = line();
+	check("< comes back a page from there", up1 < 40 && up1 > 1, `line 40 -> ${up1}`);
+	br.c.handleInput("g");
+	check("g then < clamps at the first line", (() => { br.c.handleInput("<"); return line() === 1; })(), `line ${line()}`);
+	check("page moves are not edits either", br.f.ops.length === 0, JSON.stringify(br.f.ops));
+	br.c.handleInput("?");
+	check("and a key that means nothing here says so out loud — punctuation included, because a silent key is indistinguishable from a key the terminal swallowed (the PageUp/PageDown case)",
+		br.text().at(-1)!.includes("✗ ? does nothing here") && br.text().at(-1)!.includes("< > page"), br.text().at(-1));
+})();
 
 // ── 3. status cycling (x) and the two-step delete (D, then D) ──
 {
@@ -316,6 +407,113 @@ void (() => {
 	check("esc closes from the brief and reports the brief edits it made", f.close !== null && f.close.edits === 3 && f.close.summary.every((l) => l.includes("brief")), JSON.stringify(f.close));
 })();
 
+// ── 6c. #12: the Brief gets a CURSOR you can see — a ruler whose number is the source line ──
+void (() => {
+	// The grouping rule first, because the ruler is only honest if the blocks are.
+	const grouped = [
+		"## Head",                        // 0 own block
+		"para line one",                  // 1 own block
+		"para line two",                  // 2 own block (markdown would JOIN them; the ruler must not)
+		"",                               // 3 blank = a real, countable line
+		"| a | b |",                      // 4\ table: one block, four lines
+		"| --- | --- |",                  // 5|
+		"| 1 | 2 |",                      // 6|
+		"| 3 | 4 |",                      // 7/
+		"```md",                          // 8 fence opens
+		"| looks | like | a | table |",   // 9 inside the fence: must NOT become its own block
+		"- not a list item",              // 10 ditto
+		"```",                            // 11 fence closes
+		"1. first",                       // 12\ list run groups with its indented continuation
+		"   more about first",            // 13/
+	].join("\n").split("\n");
+	const blocks = briefBlocksOf(grouped);
+	const find = (n: number): BriefBlock | undefined => blocks.find((b) => n >= b.start && n <= b.end);
+	check("briefBlocksOf keeps a TABLE in one block (all four of its lines)",
+		find(4)?.start === 4 && find(4)?.end === 7 && find(7)?.start === 4, JSON.stringify(blocks));
+	check("a FENCE swallows everything inside it, even lines that look like a table or a list",
+		find(8)?.start === 8 && find(8)?.end === 11 && find(9)?.start === 8 && find(10)?.end === 11,
+		JSON.stringify(blocks.filter((b) => b.start >= 8)));
+	check("a LIST run groups with its indented continuation",
+		find(12)?.start === 12 && find(12)?.end === 13, JSON.stringify(blocks.slice(-2)));
+	check("paragraph lines stay SEPARATE blocks — a joined run could not name the row your line became",
+		find(1)?.start === 1 && find(1)?.end === 1 && find(2)?.start === 2 && find(2)?.end === 2,
+		JSON.stringify(blocks.slice(1, 3)));
+	check("a blank line is a block too (it is a line you can cursor onto, edit, or delete twice)",
+		find(3)?.start === 3 && find(3)?.end === 3, JSON.stringify(blocks[3]));
+	check("every source line belongs to exactly one block",
+		blocks.reduce((m, b) => m + (b.end - b.start + 1), 0) === grouped.length && blocks.every((b) => b.end >= b.start),
+		`${blocks.length} blocks / ${grouped.length} lines`);
+
+	// Now the screen: your report was "I need some sort of cursor when looking at the brief, otherwise
+	// it is very cumbersome to edit it" — the body carried no cursor at all.
+	const BRIEF = [
+		"## Why the split",
+		"",
+		"The embedder stays on CPU; the reranker moves.",
+		"| part | where | why |",
+		"| --- | --- | --- |",
+		"| embedder | CPU | fp32 is enough |",
+		"```ts",
+		'export const split = { embed: "cpu", rank: "cuda:0" };',
+		"```",
+		"1. wire the reranker",
+		"   then measure the panel row budget",
+	].join("\n");
+	let d = newPlanDoc({ title: "GPU split" });
+	d = applyPlanOp(d, { action: "add", text: "wire the reranker" }).doc;
+	d = applyPlanOp(d, { action: "brief", text: BRIEF }).doc;
+	const { c, f, text, lines } = fresh(d, { section: "brief" });
+	const RULER = /^\s*(❯\s+|\s+\s?)\d+│\s/;
+	const TALL2 = 34;
+	Object.defineProperty(process.stdout, "rows", { value: TALL2, configurable: true });
+	let body = text();
+	check("the body rows carry a ruler (a number and a │ down the left edge)",
+		body.filter((x) => /^\s*(❯\s+\d+|\s+\d+)│/.test(x)).length >= 5 && body.some((x) => /^\s+\s+│/.test(x)),
+		JSON.stringify(body.filter((x) => /│/.test(x)).slice(0, 4)));
+	check("the cursor row is marked IN the body: ❯ <line>│ on the row its line rendered into",
+		body.some((x) => /^❯\s+1│ .*Why the split/.test(x)), JSON.stringify(body.slice(4, 7)));
+	check("the ruler NUMBER is the source line — line 1 is the heading it names",
+		body.some((x) => /^❯\s+1│/.test(x)) && body.some((x) => /^\s+3│ .*embedder stays on CPU/.test(x)),
+		JSON.stringify(body.slice(4, 9)));
+	check("a multi-row block marks its FIRST row with the table's first line and lets the rest continue under an empty ruler",
+		body.some((x) => /^\s+4│ ┌/.test(x)) && body.filter((x) => /^\s+\s+│ │/.test(x)).length >= 2,
+		JSON.stringify(body.slice(8, 16)));
+	check("a fenced block stays verbatim UNDER the ruler", body.some((x) => x.includes('export const split = { embed')));
+	check("a list keeps its numbering and its continuation line inside one block",
+		body.some((x) => /wire the reranker/.test(x)) && body.some((x) => /measure the panel row budget/.test(x)));
+	check("and every row still fits the terminal width with the ruler taking 5 columns",
+		lines().every((x) => strip(x).length <= WIDTH), JSON.stringify(lines().map((x) => strip(x).length).filter((n) => n > WIDTH)));
+
+	c.handleInput(KEYS.down); c.handleInput(KEYS.down); c.handleInput(KEYS.down);
+	body = text();
+	check("↓ moves the cursor INSIDE the body too — the ruler follows it to line 4",
+		body.some((x) => /^❯\s+4│/.test(x)) && !body.some((x) => /^❯\s+1│/.test(x)), JSON.stringify(body.slice(4, 8)));
+	check("the readout row above the body and the ruler in the body agree about which line it is",
+		body.some((x) => x.includes("❯ line 4/11 · ⏎ edits:")), JSON.stringify(body.slice(3, 6)));
+	Object.defineProperty(process.stdout, "rows", { value: ROWS, configurable: true });
+
+	// The anchor claim: not a proportional guess. Park the cursor on the LAST line of a document that
+	// cannot fit, and the window must START at that line — a proportional map would still be showing
+	// the top of the document.
+	const LONG = Array.from({ length: 40 }, (_, i) => (i % 4 === 0 ? `## Section ${i / 4 + 1}` : `line ${i + 1} of the long brief`)).join("\n");
+	let d2 = newPlanDoc({ title: "Long brief" });
+	d2 = applyPlanOp(d2, { action: "brief", text: LONG }).doc;
+	const big = fresh(d2, { section: "brief" });
+	for (let i = 0; i < 39; i++) big.c.handleInput(KEYS.down);
+	const tail = big.text();
+	check("parked on the last line of a 40-line brief, the window STARTS there (exact anchor, not 40/40 of the way through a guess)",
+		tail.some((x) => /^❯\s+40│ line 40 of the long brief/.test(x)), JSON.stringify(tail.slice(4, 7)));
+	check("and scrolling back up from there brings the earlier lines back",
+		(() => { for (let i = 0; i < 39; i++) big.c.handleInput(KEYS.up); return big.text().some((x) => /^❯\s+1│ .*Section 1/.test(x)); })(),
+		JSON.stringify(big.text().slice(4, 7)));
+	check("the ruler is not counted as a step or a note — the document is still one brief and one step",
+		(f.doc?.steps.length ?? 0) === 1 && (f.doc?.brief ?? "").split("\n").length === 11
+		&& (big.f.doc?.steps.length ?? 0) === 0 && f.ops.length === 0 && big.f.ops.length === 0,
+		JSON.stringify([f.doc?.steps.length, (f.doc?.brief ?? "").split("\n").length, big.f.ops.length]));
+	c.handleInput(KEYS.esc);
+	check("esc closes the brief ruler view without claiming an edit", f.close !== null && f.close.edits === 0, JSON.stringify(f.close));
+})();
+
 // ── 7. concurrent model edits: the cursor is a STEP ID, not a position ──
 {
 	let d = newPlanDoc({ title: "C" });
@@ -495,6 +693,12 @@ void (() => {
 	const at = cursorRow();
 	ro.c.handleInput(KEYS.down);
 	check("↑↓ still moves", cursorRow() !== at, `${at} -> ${cursorRow()}`);
+	// #15: a viewer exists so a long plan can be READ, and one arrow key at a time is not how a person
+	// reads a 40-row checklist. Jumping is navigation, so it is not refused the way editing is.
+	ro.c.handleInput("G");
+	check("G jumps to the last row of a plan you are only reading", ro.text().some((x) => x.includes("❯") && x.includes("second step")), JSON.stringify(ro.text().slice(6, 9)));
+	ro.c.handleInput("g");
+	check("g jumps back to the first, and nothing was written while doing it", ro.text().some((x) => x.includes("❯") && x.includes("one settled step")) && ro.f.ops.length === 0, JSON.stringify(ro.text().slice(5, 8)));
 	// The viewer starts expanded (that is the /plan view default) — `w` still flips it both ways.
 	ro.c.handleInput("w");
 	check("w still collapses in a viewer", !ro.text().some((x) => x.includes("switch-back flag")), JSON.stringify(ro.text().slice(5, 8)));

@@ -235,7 +235,10 @@ and is edited by both sides without leaving the TUI.
 - **Enter**: `/plan tui [task]` (or `/plan on` when the machine default is set to console mode).
   `/plan default tui|file` decides what a bare `/plan on` means; `/plan file [task]` is the file
   mode spelled out explicitly; `/plan wrap on|off|status` decides whether long rows are expanded.
-  Which style a plan uses is decided once per plan, not per command:
+  **`/plan status`** answers in human terms — the plan's title, `<N> rows: · open · · doing · · done`, the
+  task, the Brief's size if it has one, any archived plan, and the state-file path — and **`/plan status
+  raw`** is the command that prints the JSON as stored, for when you want to see the bytes. Which style a
+  plan uses is decided once per plan, not per command:
   an existing plan keeps its style, so `/plan resume` on a paused console never resurrects a file.
 - **The plan is a checklist, not prose**: steps (with stable `#ids` that survive adds, removals and
   reorders), plus decisions, constraints and open questions — because a plan that only says *what*
@@ -250,8 +253,11 @@ and is edited by both sides without leaving the TUI.
   each time. **`/plan view` → `Tab` to Brief renders it with pi's own markdown renderer** — the same
   one that draws the assistant's messages, so a table gets real box-drawing borders, headings are
   headings, quotes and rules render, and a long paragraph wraps instead of running off the panel. There
-  the cursor names a **line of the source** (`❯ line 4/13 · ⏎ edits: …`) because the rendered body is
-  wrapped and rows are not lines: `↑↓` move by line, `e`/`⏎` rewrites that line, `a` adds one, `D` deletes
+  the cursor names a **line of the source** (`❯ line 4/13 · ⏎ edits: …`) and the body carries a **numbered
+  gutter** (`❯  4│ ## Approach`) whose number *is* that source line, so your cursor and the model's
+  `plan_doc action=brief` agree about which line you mean. Rows are not lines: `↑↓` move by line, **`g`/`G`
+  jump to the first and last line, `<`/`>` move one page** — a page being a screenful of *this* plan, the
+  number of rows this terminal actually painted — clamped at both ends; `e`/`⏎` rewrites that line, `a` adds one, `D` deletes
   one **twice-armed** (the first `D` marks that line in the cursor row, the second deletes it, any other
   keystroke cancels it — a Brief line has no status to drop first, so it gets the same two-press protection
   a step has), and a checklist key like `x` or `[` answers "does not apply to the brief" instead of
@@ -262,10 +268,14 @@ and is edited by both sides without leaving the TUI.
   remove / show …). Every result returns the current plan, so the model never reasons from a stale
   copy. In console mode the write guard blocks **every** write and every file-writing command —
   there is no exempt file, because there is no file to protect.
-- **You edit it with `/plan view`**: an overlay editor over the live plan — ↑↓ move, `Tab` section
+- **You edit it with `/plan view`**: an overlay editor over the live plan — ↑↓ move, **`g`/`G` jump to the
+  first/last row, `<`/`>` move a page** (`PageUp`/`PageDown`/`Home`/`End` are deliberately *not* the keys
+  here: measured against a real terminal, pi keeps those for the chat viewport and they never reach the
+  overlay), `Tab` section
   (Steps → Brief → Decisions → Constraints → Open questions), `e`/⏎ edit a row, `a` add, `x` cycle
   status, `[` `]` reorder, `D` drop (and `D` again to remove — one stray keystroke never erases a row),
-  `w` wraps or compacts long rows, `esc` closes. Every
+  `w` wraps or compacts long rows, `esc` closes. A key that means nothing here says so, and the message
+  names the keys that do. Every
   keystroke commits immediately as an operation against the session state, so the agent's `plan_doc`
   calls and your hand edits cannot overwrite each other; when the overlay closes, the model is told
   exactly which rows you changed.

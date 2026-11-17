@@ -1060,23 +1060,39 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			switch (cmd) {
-				case undefined:
-				case "":
 				case "status": {
-					// #1: show the raw on-disk state so disk vs. behavior can be cross-checked
+					// #1: the raw on-disk state is still cross-checkable — but only when it is ASKED for.
+					// Your report was "plan status didn't seem to work", and press showed why: the JSON dump is
+					// 26 rows on a plan with a 90-line Brief, the status slot scrolls its own body, and the head of
+					// the answer (the mode line, the counts) is pushed above the viewport before you can read it.
+					// So the default answer is the summary a person pressing /plan status is after, and the byte-for-byte
+					// disk state lives behind `raw`.
+					const wantRaw = /^(raw|json|dump)$/i.test(target.trim());
 					const file = sessionStateFile(sid);
 					let raw = "(no state file yet)";
-					try { raw = fs.readFileSync(file, "utf8"); } catch { /* missing */ }
+					try { raw = fs.readFileSync(file, "utf8"); }
+					catch { /* missing */ }
+					const doc = consolePlanOf(ss);
+					const p = doc ? planProgress(doc) : null;
+					const briefRows = doc?.brief ? doc.brief.split("\n").filter((x) => x.trim()).length : 0;
 					ctx.ui.notify(
 						[
 							`Planning mode: ${planStatusLine(ss)}`,
+							// The counts first, because that is the question a person pressed the command to ask.
+							...(p && doc
+								? [`${doc.title || "untitled"} — ${p.total} rows: ${p.open} open · ${p.doing} doing · ${p.done} done${p.dropped ? ` · ${p.dropped} dropped` : ""} · revision ${doc.revised}`]
+								: []),
+							...(doc?.task ? [`task: ${doc.task}`] : []),
 							// #22: the archive is named where you would otherwise wonder about it.
-							...(retiredPlanOf(ss) ? (() => { const r = retiredPlanOf(ss)!; const p = planProgress(r); return [`Archived plan: "${r.title || "untitled"}" (${p.done}/${p.total} settled) — /plan view last reads it, /plan export last [file] saves it.`]; })() : []),
+							...(retiredPlanOf(ss) ? (() => { const r = retiredPlanOf(ss)!; const rp = planProgress(r); return [`Archived plan: "${r.title || "untitled"}" (${rp.done}/${rp.total} settled) — /plan view last reads it, /plan export last [file] saves it.`]; })() : []),
 							// #23: same for the document half of the live plan — /plan status is where you look when
 							// you can see a plan exists but not what is in it.
-							...(ss.planDoc?.brief ? [(() => { const l = ss.planDoc!.brief!.split("\n").filter((x) => x.trim()).length; return `Brief: ${l} lines of markdown (${ss.planDoc!.brief!.length} characters) — /plan view → Brief renders it; /plan brief <file> replaces it, "/plan brief clear" removes it.`; })()] : []),
-							`state file: ${file}`,
-							raw,
+							...(doc?.brief && briefRows
+								? [`Brief: ${briefRows} lines of markdown (${doc.brief.length} characters) — /plan view → Brief renders it; /plan brief <file> replaces it, "/plan brief clear" removes it.`]
+								: []),
+							wantRaw
+								? `state file: ${file} (${raw.length} characters):\n${raw}`
+								: `state file: ${file} (${raw.length} characters on disk) — "/plan status raw" prints the bytes as stored`,
 						].join("\n"),
 						"info",
 					);

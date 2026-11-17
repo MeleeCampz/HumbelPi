@@ -55,6 +55,67 @@ export const SECTION_SHORT: Record<PlanSection, string> = {
 	constraints: "Cons",
 	open: "Open",
 };
+/**
+ * A run of brief source lines that markdown must render TOGETHER. The brief's cursor points at one
+ * SOURCE line, but the body is rendered (a table line becomes three box-drawing rows, a fence becomes
+ * its own block), so "which row is my line on?" is only answerable if the document is cut into pieces
+ * that each render independently. A block is the smallest such piece: a fenced code block, one table,
+ * one list run, or a single line. Blank lines are blocks too — an empty line is still a line you can
+ * put the cursor on, edit, or delete twice.
+ */
+export interface BriefBlock {
+	/** inclusive index into the brief's source line list */
+	start: number;
+	end: number;
+}
+
+const BRIEF_FENCE = /^\s{0,3}(```|~~~|`{4,}|~{4,})/;
+const BRIEF_TABLE_ROW = (l: string): boolean => l.trimStart().startsWith("|");
+const BRIEF_LIST_ITEM = /^\s{0,3}([-*+]|\d+[.)])\s/;
+/** indented continuation of the list item above it */
+const BRIEF_LIST_CONT = /^\s{2,}\S/;
+
+export function briefBlocksOf(lines: string[]): BriefBlock[] {
+	const out: BriefBlock[] = [];
+	let i = 0;
+	while (i < lines.length) {
+		const l = lines[i];
+		if (!l.trim()) { out.push({ start: i, end: i }); i++; continue; }
+		if (BRIEF_FENCE.test(l)) {
+			// A fence runs to its closing fence (or the end of the document). Everything inside it is
+			// rendered verbatim by markdown, including a line that looks like a table or a list item —
+			// grouping anything else into a fence would say "your cursor is on line 7" while markdown
+			// was drawing line 7 as code.
+			let j = i + 1;
+			while (j < lines.length && !BRIEF_FENCE.test(lines[j])) j++;
+			const end = Math.min(j, lines.length - 1);
+			out.push({ start: i, end });
+			i = end + 1;
+			continue;
+		}
+		if (BRIEF_TABLE_ROW(l)) {
+			let j = i;
+			while (j < lines.length && BRIEF_TABLE_ROW(lines[j])) j++;
+			out.push({ start: i, end: j - 1 });
+			i = j;
+			continue;
+		}
+		if (BRIEF_LIST_ITEM.test(l)) {
+			let j = i;
+			while (j < lines.length && (BRIEF_LIST_ITEM.test(lines[j]) || BRIEF_LIST_CONT.test(lines[j]))) j++;
+			out.push({ start: i, end: j - 1 });
+			i = j;
+			continue;
+		}
+		// Paragraph lines each get their own block. Markdown would join them into one paragraph, so a
+		// joined run could not say which of its rendered rows your line became — and the whole point of
+		// the ruler is that the number on the row is the line `⏎` will edit.
+		out.push({ start: i, end: i });
+		i++;
+	}
+	return out;
+}
+
 /** Only the three NOTE sections are backed by a plan-doc note list; steps and the brief are not. */
 const SECTION_NOTE_KIND: Partial<Record<PlanSection, PlanNoteKind>> = {
 	decisions: "decision",
@@ -239,6 +300,61 @@ export function createPlanEditor(
 		noteCursor = Math.min(n - 1, Math.max(0, noteCursor + delta));
 	};
 
+	// #17 (your request: "add an option to scroll page wise when reading the brief instead of just line by
+	// line"). PageUp/PageDown are the keys everyone reaches for and press measured that they never arrive
+	// here — pi handles them for the chat viewport. So the pager keys are letters/punctuation that DO
+	// arrive, and the page size is the number of rows this overlay actually painted last frame (pageSize,
+	// written by render) — a page here is a screenful of THIS plan, not a made-up 20.
+	let pageSize = 10;
+
+	const page = (dir: number): void => {
+		const d = doc();
+		if (!d) return;
+		const step = Math.max(1, pageSize) * (dir < 0 ? -1 : 1);
+		if (section === "steps") {
+			const st = stepsOf(d);
+			if (!st.length) return;
+			const at = st.findIndex((s) => s.id === stepCursor);
+			const next = Math.min(st.length - 1, Math.max(0, (at < 0 ? 0 : at) + step));
+			stepCursor = st[next]!.id;
+			return;
+		}
+		if (section === "brief") {
+			const n = briefLinesOf(d).length;
+			if (!n) return;
+			briefCursor = Math.min(n - 1, Math.max(0, briefCursor + step));
+			return;
+		}
+		const list = notesOf(d, section);
+		if (!list.length) return;
+		noteCursor = Math.min(list.length - 1, Math.max(0, noteCursor + step));
+	};
+
+	const jump = (to: "top" | "end"): void => {
+		// #12/#15: the viewer's OWN jump keys. PageUp/PageDown/Home/End look like the obvious choice and
+		// press measured that they never arrive — pi handles them for the chat viewport (PageUp even
+		// triggers a full-screen repaint), so the overlay never sees them and a 90-line brief could only
+		// be walked one line at a time. Letters arrive — that is what `x`, `e`, `a`, `D` prove — so the
+		// jump is spelled with letters, vim-style: g = first row of this section, G = last.
+		const d = doc();
+		if (!d) return;
+		if (section === "steps") {
+			const st = stepsOf(d);
+			if (!st.length) return;
+			stepCursor = (to === "top" ? st[0] : st[st.length - 1])!.id;
+			return;
+		}
+		if (section === "brief") {
+			const n = briefLinesOf(d).length;
+			if (!n) return;
+			briefCursor = to === "top" ? 0 : n - 1;
+			return;
+		}
+		const list = notesOf(d, section);
+		if (!list.length) return;
+		noteCursor = to === "top" ? 0 : list.length - 1;
+	};
+
 	const startEdit = (): void => {
 		if (readOnly) { readOnlyKey(); return; }
 		const d = doc();
@@ -373,14 +489,23 @@ export function createPlanEditor(
 	};
 
 	// ── #23: the markdown body, rendered through pi-tui's Markdown ──────────────────
-	// One-entry cache keyed by (text, width): the overlay re-renders on every keystroke and re-parsing a
-	// 20 KB document each time is the kind of work a render path should not do.
-	let mdCache: { text: string; width: number; lines: string[] } | null = null;
+	// The body is now rendered BLOCK BY BLOCK (#12: the cursor ruler has to know which rows a source
+	// line became), so a one-entry cache would miss on every block of every keystroke. Small bounded
+	// Map instead: a plan's blocks do not change between keystrokes, and the eviction keeps a 20 KB
+	// document from holding a rendered copy of every block forever.
+	const MD_CACHE_MAX = 64;
+	const mdCache = new Map<string, string[]>();
 	const markdownLines = (text: string, width: number): string[] => {
 		if (!text.trim()) return [];
-		if (mdCache && mdCache.text === text && mdCache.width === width) return mdCache.lines;
+		const key = `${width}\u0000${text}`;
+		const hit = mdCache.get(key);
+		if (hit) return hit;
 		const lines = new Markdown(text, 0, 0, planMarkdownTheme(theme)).render(width);
-		mdCache = { text, width, lines };
+		if (mdCache.size >= MD_CACHE_MAX) {
+			const first = mdCache.keys().next();
+			if (!first.done) mdCache.delete(first.value);
+		}
+		mdCache.set(key, lines);
 		return lines;
 	};
 
@@ -413,6 +538,12 @@ export function createPlanEditor(
 			if (matchesKey(data, "down") || data === "j") { move(1); return; }
 			if (matchesKey(data, "pageUp")) { move(-5); return; }
 			if (matchesKey(data, "pageDown")) { move(5); return; }
+			// g / G: the jump keys that actually reach this overlay (see `jump`).
+			if (data === "g") { jump("top"); return; }
+			if (data === "G") { jump("end"); return; }
+			// < / >: one page (one screenful of this plan) up or down.
+			if (data === "<") { page(-1); return; }
+			if (data === ">") { page(1); return; }
 			if (data === "\t") {
 				section = SECTION_ORDER[(SECTION_ORDER.indexOf(section) + 1) % SECTION_ORDER.length]!;
 				noteCursor = 0;
@@ -442,15 +573,18 @@ export function createPlanEditor(
 			if (data === "[") { if (section === "brief") { notHere("[", "[ ] reorders STEPS"); return; } reorder(-1); return; }
 			if (data === "]") { if (section === "brief") { notHere("]", "[ ] reorders STEPS"); return; } reorder(1); return; }
 			// A typing mistake must not look like a dead key: every other keypress says what to press
-			// instead, because nothing here is destructive enough to be worth a silent no-op.
-			if (/^[a-zA-Z0-9]$/.test(data)) {
+			// instead, because nothing here is destructive enough to be worth a silent no-op. #17: "every
+			// other key" means punctuation too — `<` used to fall through silently, which is indistinguishable
+			// from the terminal swallowing the key (that is exactly the PageUp/PageDown case, so a key that
+			// says nothing here is a key you cannot tell apart from a key that never arrived).
+			if (data.length === 1 && data >= "!" && data <= "~") {
 				if (readOnly) {
 					lastLog = "read-only — ↑↓ move · Tab section · w wrap/compact · esc close";
 					return;
 				}
 				lastLog = section === "brief"
-					? `✗ ${data} does nothing here — ↑↓ line · ⏎ edit that line · a new line · D twice deletes it · Tab section · esc close`
-					: `✗ ${data} does nothing here — ↑↓ move · Tab section · e/⏎ edit · a add · x status · [ ] reorder · D drop/remove · w ${wrapRows ? "compact" : "expand"} · esc close`;
+					? `✗ ${data} does nothing here — ↑↓ line · g top · G end · < > page · ⏎ edit that line · a new line · D twice deletes it · Tab section · esc close`
+					: `✗ ${data} does nothing here — ↑↓ move · g top G end · < > page · Tab section · e/⏎ edit · a add · x status · [ ] reorder · D drop/remove · w ${wrapRows ? "compact" : "expand"} · esc close`;
 			}
 		},
 
@@ -478,18 +612,18 @@ export function createPlanEditor(
 			// Two rows on purpose: one row of key hints is ~100 columns, and the terminal cuts it at 70 —
 			// which is exactly where the `w` wrap state lived. #17's toggle has to be READABLE to exist.
 			if (section === "brief") {
-				out.push(readOnly
-					? theme.fg("dim", "read-only viewer · ↑↓ line · Tab section · esc close")
-					: theme.fg("dim", "↑↓ line · ⏎ or e edit that line · a add a line · D twice deletes it · Tab section"));
 				out.push(theme.fg("dim", readOnly
-					? "rendered markdown — headings, tables, code blocks · /plan export last [file] saves this plan"
-					: "rendered markdown — the model writes it with plan_doc action=brief, /plan brief [file] loads one"));
+					? "read-only viewer · ↑↓ line · g top · G end · < > page · Tab section · esc close"
+					: "↑↓ line · g top · G end · < > page · Tab section"));
+				out.push(theme.fg("dim", readOnly
+					? "⏎ edits nothing here · /plan export last [file] saves this plan"
+					: "⏎ or e edits the line · a adds · D twice deletes · rendered markdown"));
 			} else if (readOnly) {
-				out.push(theme.fg("dim", "read-only viewer · ↑↓ move · Tab section · w wrap/compact · esc close"));
-				out.push(theme.fg("dim", "/plan export last [file] saves this plan as markdown"));
+				out.push(theme.fg("dim", "read-only viewer · ↑↓ move · g top · G end · Tab section · esc close"));
+				out.push(theme.fg("dim", "w wrap · < > page · /plan export last [file] saves this plan"));
 			} else {
 				out.push(theme.fg("dim", "↑↓ move · Tab section · e/⏎ edit · a add · x status · D drop/remove"));
-				out.push(theme.fg("dim", `[ ] reorder · w ${wrapRows ? "compact lines" : "expand lines"} · esc close`));
+				out.push(theme.fg("dim", `[ ] reorder · g top G end · < > page · w ${wrapRows ? "compact" : "expand"} lines · esc close`));
 			}
 
 			// Build the body rows first (each row knows whether the cursor is on it), then fit a
@@ -515,7 +649,7 @@ export function createPlanEditor(
 				// (one source line becomes a heading, a blank, and four table rows), so this row is the only
 				// honest way to say what a line edit is about — and it sits OUTSIDE the scrolled window, because
 				// a cursor you cannot see while the body scrolls is not a cursor.
-				if (t && t.kind === "briefLine") {
+				if (t && t.kind === "briefLine" && d?.brief) {
 					const preview = (src[t.index] ?? "").trim() || "(blank line)";
 					// The arm is shown ON the row it points at, in the warning colour, in the same place the cursor
 					// row normally lives — an armed delete you cannot see is just a key that deletes on the second press.
@@ -524,22 +658,55 @@ export function createPlanEditor(
 						: theme.fg("dim", `❯ line ${t.index + 1}/${src.length} · ⏎ edits: ${truncateToWidth(preview, Math.max(8, w - 34))}`));
 					if (boxLine && draft && editing?.kind === "briefLine") { out.push(boxLine); boxPlaced = true; }
 				}
-				const body = d?.brief ? markdownLines(d.brief, Math.max(10, w - 2)) : [];
-				if (body.length === 0) {
+				const blocks = briefBlocksOf(src);
+				const cursorAt = t && t.kind === "briefLine" ? t.index : -1;
+				// "(no brief yet)" is the ABSENT body, not a body of one blank line: "" is what `plan_doc
+				// action=brief` with empty text (or /plan brief clear) leaves behind, and "\n" is a document
+				// that has one blank line in it — a real line the cursor can sit on.
+				if (!d?.brief) {
 					rows.push(theme.fg("dim", "  (no brief yet — plan_doc action=brief writes one; /plan brief <file> loads markdown)"));
 					hoveredRow = 0;
 				} else {
-					// Rendered at w-2 and re-indented by 2 so a wide table or a long paragraph can never spill past
-					// the panel's own frame — pi pads every line it returns to the width it was given.
-					// The window anchors on the cursor's line PROPORTIONALLY (line 8 of 12 ≈ row 8/12 of the
-					// body): exact would mean re-rendering line by line, which would break tables and fences.
-					const at = t && t.kind === "briefLine"
-						? Math.round((t.index / Math.max(1, src.length - 1)) * Math.max(0, body.length - 1))
-						: 0;
-					body.forEach((line, i) => {
-						rows.push(`  ${line.replace(/\s+$/, "")}`);
-						if (i === at) hoveredRow = rows.length - 1;
-					});
+					// #12, your report: "I need some sort of cursor when looking at the brief, otherwise it is
+					// very cumbersome to edit it." The readout row above the body named the line but the body
+					// itself carried no cursor at all, and the window anchored on a PROPORTIONAL guess (line 8 of
+					// 12 ≈ row 8/12 down) — so moving the cursor could scroll a document you could not tell the
+					// place in. Now every rendered row carries a ruler `❯ 12│` whose NUMBER IS THE SOURCE LINE,
+					// and the window starts at the block the cursor is inside: exact, because the document is cut
+					// into blocks that each render on their own (see briefBlocksOf).
+					const digits = Math.max(2, String(src.length).length);
+					const gut = 2 + digits;                 // "❯ 12│" = mark + space + number + │
+					const bodyWidth = Math.max(10, w - gut - 1);
+					const pad = (n: number) => String(n).padStart(digits);
+					const blankRuler = theme.fg("dim", `  ${" ".repeat(digits)}│`);
+					for (const b of blocks) {
+						const inBlock = cursorAt >= b.start && cursorAt <= b.end;
+						const text = src.slice(b.start, b.end + 1).join("\n");
+						const rendered = markdownLines(text, bodyWidth);
+						if (rendered.length === 0) {
+							// A blank line renders to nothing, but it is still a line the cursor can sit on, edit
+							// or delete — so it gets a row of its own instead of vanishing from the count.
+							rows.push(`${inBlock ? theme.fg("accent", `❯ ${pad(cursorAt + 1)}│`) : blankRuler}`.replace(/\s+$/, ""));
+							if (inBlock) hoveredRow = rows.length - 1;
+							if (boxLine && draft && editing?.kind === "briefLine" && inBlock) { rows.push(boxLine); boxPlaced = true; }
+							continue;
+						}
+						rendered.forEach((line, ri) => {
+							// The ruler marks the FIRST row of the block and numbers it with the line `⏎` edits.
+							// A multi-row block (a table, a fence) cannot say which of its rows one source line
+							// became — so the cursor sits at the top of the block it belongs to, which is the
+							// honest version of "your line is in here".
+							const first = ri === 0;
+							const ruler = !first
+								? blankRuler
+								: inBlock
+									? theme.fg("accent", `❯ ${pad(cursorAt + 1)}│`)
+									: theme.fg("dim", `  ${pad(b.start + 1)}│`);
+							rows.push(`${ruler} ${line.replace(/\s+$/, "")}`.replace(/\s+$/, ""));
+							if (inBlock && first) hoveredRow = rows.length - 1;
+						});
+						if (boxLine && draft && editing?.kind === "briefLine" && inBlock) { rows.push(boxLine); boxPlaced = true; }
+					}
 				}
 			} else if (section === "steps") {
 				const idWidth = Math.max(2, String(d?.steps.reduce((m, s) => Math.max(m, s.id), 0) ?? 0).length);
@@ -608,8 +775,18 @@ export function createPlanEditor(
 				let start = anchor;
 				let end = anchor;
 				let used = 1;
-				for (let i = anchor - 1; i >= 0 && used + 1 <= budget; i--) { used++; start = i; }
-				for (let i = anchor + 1; i < rows.length && used + 1 <= budget; i++) { used++; end = i; }
+				// The cursor row sits in the MIDDLE of what is painted: fill below and above alternately,
+				// preferring below. Filling above first parked the cursor on the bottom row of the window, so
+				// after a page jump you could see where you had come from and nothing of where you were going.
+				for (;;) {
+					let progressed = false;
+					if (used + 1 <= budget && end + 1 < rows.length) { end++; used++; progressed = true; }
+					if (used + 1 <= budget && start - 1 >= 0) { start--; used++; progressed = true; }
+					if (!progressed) break;
+				}
+				// #17: the page a `<` / `>` jump moves by is this frame's visible row count — measured, not a
+				// constant, so a jump lands where the next screenful begins on THIS terminal.
+				pageSize = Math.max(1, used);
 				for (let i = start; i <= end; i++) out.push(rows[i]!);
 				if (start > 0) out.push(theme.fg("dim", `  ↑ ${start} more above`));
 				if (rows.length - 1 - end > 0) out.push(theme.fg("dim", `  ↓ ${rows.length - 1 - end} more below`));
