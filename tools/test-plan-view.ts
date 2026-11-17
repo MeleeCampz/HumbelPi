@@ -186,9 +186,20 @@ void (() => {
 	br.c.handleInput("g");
 	check("g then < clamps at the first line", (() => { br.c.handleInput("<"); return line() === 1; })(), `line ${line()}`);
 	check("page moves are not edits either", br.f.ops.length === 0, JSON.stringify(br.f.ops));
+	// #18 (your report): on a German ANSI/QWERTZ keyboard `<` and `>` live on the `<>|` key next to Left
+	// Shift, and `>` needs Shift on top of that. `b` / `f` are unshifted letters — the same glyph on every
+	// layout — so they are the primaries and `<` / `>` stay as aliases.
+	const q0 = line();
+	br.c.handleInput("f");
+	const q1 = line();
+	check("f pages forward exactly like > does", q0 === 1 && q1 > 1 && q1 < 40, `line ${q0} -> ${q1}`);
+	br.c.handleInput("b");
+	const q2 = line();
+	check("b pages back exactly like < does, and neither alias wrote anything", q2 < q1 && br.f.ops.length === 0, `line ${q1} -> ${q2}`);
+	check("the hint rows name the layout-independent keys, not the shifted ones", br.text().some((x) => x.includes("b f page")), JSON.stringify(br.text().slice(2, 4)));
 	br.c.handleInput("?");
 	check("and a key that means nothing here says so out loud — punctuation included, because a silent key is indistinguishable from a key the terminal swallowed (the PageUp/PageDown case)",
-		br.text().at(-1)!.includes("✗ ? does nothing here") && br.text().at(-1)!.includes("< > page"), br.text().at(-1));
+		br.text().at(-1)!.includes("✗ ? does nothing here") && br.text().at(-1)!.includes("b f page"), br.text().at(-1));
 })();
 
 // ── 3. status cycling (x) and the two-step delete (D, then D) ──

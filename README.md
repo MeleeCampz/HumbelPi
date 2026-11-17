@@ -256,7 +256,7 @@ and is edited by both sides without leaving the TUI.
   the cursor names a **line of the source** (`❯ line 4/13 · ⏎ edits: …`) and the body carries a **numbered
   gutter** (`❯  4│ ## Approach`) whose number *is* that source line, so your cursor and the model's
   `plan_doc action=brief` agree about which line you mean. Rows are not lines: `↑↓` move by line, **`g`/`G`
-  jump to the first and last line, `<`/`>` move one page** — a page being a screenful of *this* plan, the
+  jump to the first and last line, **`b`/`f` move one page** — a page being a screenful of *this* plan, the
   number of rows this terminal actually painted — clamped at both ends; `e`/`⏎` rewrites that line, `a` adds one, `D` deletes
   one **twice-armed** (the first `D` marks that line in the cursor row, the second deletes it, any other
   keystroke cancels it — a Brief line has no status to drop first, so it gets the same two-press protection
@@ -269,9 +269,11 @@ and is edited by both sides without leaving the TUI.
   copy. In console mode the write guard blocks **every** write and every file-writing command —
   there is no exempt file, because there is no file to protect.
 - **You edit it with `/plan view`**: an overlay editor over the live plan — ↑↓ move, **`g`/`G` jump to the
-  first/last row, `<`/`>` move a page** (`PageUp`/`PageDown`/`Home`/`End` are deliberately *not* the keys
-  here: measured against a real terminal, pi keeps those for the chat viewport and they never reach the
-  overlay), `Tab` section
+  first/last row, `b`/`f` move a page** (`PageUp`/`PageDown`/`Home`/`End`/`Ctrl+B`/`Ctrl+F` are deliberately
+  *not* the keys here: measured against a real terminal, pi keeps those for the chat viewport and they never
+  reach the overlay. `b`/`f` rather than `<`/`>` because an unshifted letter is the same glyph on every
+  keyboard layout — `<`/`>` sit on the `<>|` key and are awkward on German ANSI — and they still work as
+  aliases), `Tab` section
   (Steps → Brief → Decisions → Constraints → Open questions), `e`/⏎ edit a row, `a` add, `x` cycle
   status, `[` `]` reorder, `D` drop (and `D` again to remove — one stray keystroke never erases a row),
   `w` wraps or compacts long rows, `esc` closes. A key that means nothing here says so, and the message

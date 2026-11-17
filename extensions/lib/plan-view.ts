@@ -541,9 +541,13 @@ export function createPlanEditor(
 			// g / G: the jump keys that actually reach this overlay (see `jump`).
 			if (data === "g") { jump("top"); return; }
 			if (data === "G") { jump("end"); return; }
-			// < / >: one page (one screenful of this plan) up or down.
-			if (data === "<") { page(-1); return; }
-			if (data === ">") { page(1); return; }
+			// < / > and b / f: one page (one screenful of this plan) back or forward. They stay because they
+			// are the shape every pager uses, but b/f are the primaries: on a German ANSI/QWERTZ keyboard the
+			// `<>|` key sits next to Left Shift and `>` needs Shift on top of that, so a pager bound to them is
+			// a pager you fight with. `b` and `f` (back / forward, standing in for the Ctrl+B / Ctrl+F every
+			// pager uses — keys pi swallows here) are plain unshifted letters, the same glyph on every layout.
+			if (data === "<" || data === "b") { page(-1); return; }
+			if (data === ">" || data === "f") { page(1); return; }
 			if (data === "\t") {
 				section = SECTION_ORDER[(SECTION_ORDER.indexOf(section) + 1) % SECTION_ORDER.length]!;
 				noteCursor = 0;
@@ -583,8 +587,8 @@ export function createPlanEditor(
 					return;
 				}
 				lastLog = section === "brief"
-					? `✗ ${data} does nothing here — ↑↓ line · g top · G end · < > page · ⏎ edit that line · a new line · D twice deletes it · Tab section · esc close`
-					: `✗ ${data} does nothing here — ↑↓ move · g top G end · < > page · Tab section · e/⏎ edit · a add · x status · [ ] reorder · D drop/remove · w ${wrapRows ? "compact" : "expand"} · esc close`;
+					? `✗ ${data} does nothing here — ↑↓ line · g top · G end · b f page · ⏎ edit that line · a new line · D twice deletes it · Tab section · esc close`
+					: `✗ ${data} does nothing here — ↑↓ move · g top G end · b f page · Tab section · e/⏎ edit · a add · x status · [ ] reorder · D drop/remove · w ${wrapRows ? "compact" : "expand"} · esc close`;
 			}
 		},
 
@@ -613,17 +617,17 @@ export function createPlanEditor(
 			// which is exactly where the `w` wrap state lived. #17's toggle has to be READABLE to exist.
 			if (section === "brief") {
 				out.push(theme.fg("dim", readOnly
-					? "read-only viewer · ↑↓ line · g top · G end · < > page · Tab section · esc close"
-					: "↑↓ line · g top · G end · < > page · Tab section"));
+					? "read-only viewer · ↑↓ line · g top · G end · Tab section · esc close"
+					: "↑↓ line · g top · G end · b f page · Tab section"));
 				out.push(theme.fg("dim", readOnly
-					? "⏎ edits nothing here · /plan export last [file] saves this plan"
+					? "⏎ edits nothing here · b f page · /plan export last saves it"
 					: "⏎ or e edits the line · a adds · D twice deletes · rendered markdown"));
 			} else if (readOnly) {
 				out.push(theme.fg("dim", "read-only viewer · ↑↓ move · g top · G end · Tab section · esc close"));
-				out.push(theme.fg("dim", "w wrap · < > page · /plan export last [file] saves this plan"));
+				out.push(theme.fg("dim", "w wrap · b f page · /plan export last [file] saves this plan"));
 			} else {
 				out.push(theme.fg("dim", "↑↓ move · Tab section · e/⏎ edit · a add · x status · D drop/remove"));
-				out.push(theme.fg("dim", `[ ] reorder · g top G end · < > page · w ${wrapRows ? "compact" : "expand"} lines · esc close`));
+				out.push(theme.fg("dim", `[ ] reorder · g top G end · b f page · w ${wrapRows ? "compact" : "expand"} lines · esc close`));
 			}
 
 			// Build the body rows first (each row knows whether the cursor is on it), then fit a
