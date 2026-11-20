@@ -15,6 +15,7 @@
     "./test-backlog-scroll.ts",
     "./test-plan-state.ts",
     "./test-dialog-select.ts",
+    "./test-compaction-thinking.ts",
     "./test-plan-doc.ts",
     "./test-plan-view.ts"
   ]

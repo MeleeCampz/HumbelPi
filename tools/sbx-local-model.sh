@@ -5,9 +5,11 @@
 # host's ~/.pi/agent is not imported. This script writes a models.json into the
 # sandbox's agent dir, pointing at the host via host.docker.internal (verified
 # reachable from inside the microVM; plain localhost/127.0.0.1 are the VM itself).
-# Default model: the first locally hosted provider that answers from inside the
-# VM, tried in preference order unsloth-studio (:8888) -> any provider named
-# strata* (:8890 light profile, :8889 heavy one) -> file order.
+# Default model: the HOST's own selection (defaultProvider/defaultModel from the
+# host settings.json), verified to answer from inside the VM. The old preference
+# order (unsloth-studio :8888 -> any provider named strata* :8890 light profile,
+# :8889 heavy one -> file order) is now the FALLBACK, used only when the host
+# default is unreachable from the VM or is no longer in the host models.json.
 #
 # Usage: tools/sbx-local-model.sh <sandbox-name> [--install-pi]
 #   --install-pi  also run `pi install .` in the sandbox's workspace (if it is a pi package)
@@ -63,6 +65,13 @@ done
 HOST_MODELS="${USERPROFILE:+$USERPROFILE/.pi/agent/models.json}"
 [ -f "${HOST_MODELS:-/nonexistent}" ] || HOST_MODELS="$HOME/.pi/agent/models.json"
 [ -f "$HOST_MODELS" ] || { echo "host models.json not found (looked in \$USERPROFILE and \$HOME)" >&2; exit 1; }
+HOST_SETTINGS="${USERPROFILE:+$USERPROFILE/.pi/agent/settings.json}"
+[ -f "${HOST_SETTINGS:-/nonexistent}" ] || HOST_SETTINGS="$HOME/.pi/agent/settings.json"
+# What the host session would run: "provider<TAB>model". Empty when there is no
+# settings.json or no default in it (then the old probe order alone decides).
+HOST_DEFAULTS=$("$NODE" -e 'try{const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(`${s.defaultProvider||""}\t${s.defaultModel||""}`)}catch{console.log("\t")}' "$HOST_SETTINGS" 2>/dev/null || printf '\t')
+HOST_DEFAULT_PROVIDER=${HOST_DEFAULTS%%$'\t'*}
+HOST_DEFAULT_MODEL=${HOST_DEFAULTS#*$'\t'}
 
 # A hostname is "local" in either place a baseUrl can live: on the provider, or
 # on an individual model that overrides it. Both get rewritten to the VM's view
@@ -110,8 +119,32 @@ const local = Object.entries(provs).filter(([name, p]) => {
 if (!local.length) process.exit(1);
 const rank = ([n]) => n === "unsloth-studio" ? 0 : /^strata/.test(n) ? 1 : 2;
 local.sort((a, b) => rank(a) - rank(b));
+const effUrl = (p, mo) => {
+  let u;
+  try { u = new URL(mo.baseUrl || p.baseUrl); } catch { return null; }
+  u.hostname = "host.docker.internal";
+  return u.toString();
+};
+// Mirror the host session: emit the host default first, because that is the
+// model the host session runs and the sandbox is meant to run the same one.
+const HOST_P = process.argv[2] || "", HOST_M = process.argv[3] || "";
+const emitted = new Set();
+if (HOST_M) {
+  // settings.json stores provider and model separately, and a model id can contain
+  // a slash (unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M) — so split only when the provider
+  // is missing, never by hunting for the first slash in the model id.
+  const cut = HOST_M.indexOf("/");
+  const hp = HOST_P || (cut >= 0 ? HOST_M.slice(0, cut) : "");
+  const hm = HOST_P ? HOST_M : (cut >= 0 ? HOST_M.slice(cut + 1) : HOST_M);
+  const entry = local.find(([n]) => n === hp);
+  const mo = entry ? (entry[1].models || []).find((x) => x.id === hm) : null;
+  const u = mo ? effUrl(entry[1], mo) : null;
+  if (u) { console.log(hp + "/" + hm + " " + u); emitted.add(hp + "/" + hm); }
+  else console.error(`[warn] host default ${hp}/${hm} is not a locally hosted model in ${process.argv[1]} — falling back to provider availability`);
+}
 for (const [name, p] of local) {
   if (!p.models || !p.models.length) continue;
+  if (emitted.has(name + "/" + p.models[0].id)) continue;
   // Probe the URL the VM will actually use, not the host-side one — 127.0.0.1
   // inside the microVM is the microVM, so probing the host URL answers 000 for
   // every provider and every candidate looks dead. Probe the effective URL of
@@ -125,7 +158,7 @@ for (const [name, p] of local) {
   u.hostname = "host.docker.internal";
   console.log(name + "/" + mo.id + " " + u.toString());
 }
-' "$HOST_MODELS")
+' "$HOST_MODELS" "${HOST_DEFAULT_PROVIDER:-}" "${HOST_DEFAULT_MODEL:-}")
 if [ -z "$CANDIDATES" ]; then echo "error: no locally hosted provider with a model found in $HOST_MODELS" >&2; exit 1; fi
 
 # Ask the VM which of those endpoints actually answers. A provider copied from
@@ -178,6 +211,17 @@ done <<< "$CANDIDATES"
 if [ -z "$DEFAULT_MODEL" ]; then
   DEFAULT_MODEL=$(head -1 <<< "$CANDIDATES" | cut -d" " -f1)
   echo "[warn] no local provider answered — setting $DEFAULT_MODEL anyway, start the engine or switch with /model"
+fi
+
+if [ -n "${HOST_DEFAULT_MODEL:-}" ]; then
+  # provider + model id, joined the way pi names models (the model id itself may
+  # contain a slash, so never test for one to decide whether the provider is there)
+  if [ -n "${HOST_DEFAULT_PROVIDER:-}" ]; then HOST_DEFAULT_FULL="$HOST_DEFAULT_PROVIDER/$HOST_DEFAULT_MODEL"; else HOST_DEFAULT_FULL=$HOST_DEFAULT_MODEL; fi
+  if [ "$DEFAULT_MODEL" = "$HOST_DEFAULT_FULL" ]; then
+    echo "[ok] sandbox default mirrors the host selection: $HOST_DEFAULT_FULL"
+  else
+    echo "[warn] host default $HOST_DEFAULT_FULL did not answer from inside the VM — this sandbox runs $DEFAULT_MODEL instead (switch with /model in the sandbox, or start the host engine)"
+  fi
 fi
 
 # Provider the default model belongs to.

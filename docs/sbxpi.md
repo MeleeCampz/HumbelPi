@@ -90,6 +90,17 @@ Do this once before your first `sbxpi`:
   `sbx-local-model.sh` uses exactly this to pick a default model that is actually
   running, and prints `[skip] … HTTP 500` plus the gateway's own words when a
   provider is configured but down.
+- **The sandbox runs the model the host runs.** Since 2026-11-20 the default is
+  *mirrored from the host*: `sbx-local-model.sh` reads `defaultProvider` /
+  `defaultModel` from the host `settings.json`, probes that model first, and only
+  falls back to the old preference order (unsloth-studio → strata* → file order)
+  with a `[warn]` when the host's model does not answer from inside the VM or is
+  no longer in `models.json`. `tools/sbx-model-hygiene.sh` is the matching
+  housekeeping, run on the host: it drops every non-local (third-party API)
+  provider from the host `models.json` — including a model whose per-model
+  `baseUrl` points off-host — checks that the host default survived the purge,
+  and refreshes every sandbox to the host's selection. `--dry-run` shows the
+  plan; it writes a `models.json.bak-<timestamp>` before changing anything.
 - **Yolo by default:** sandboxes created by `sbxpi` carry `HUMBLE_PI_YOLO=1`
   (baked in via `sbx create --env`), and yolo defaults on whenever a sandbox is
   detected (`SANDBOX_NAME` / `/run/sandbox` cover older sandboxes too) — the microVM

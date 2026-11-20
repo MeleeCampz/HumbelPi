@@ -494,8 +494,8 @@ export function createPlanEditor(
 	// Map instead: a plan's blocks do not change between keystrokes, and the eviction keeps a 20 KB
 	// document from holding a rendered copy of every block forever.
 	const MD_CACHE_MAX = 64;
-	const mdCache = new Map<string, string[]>();
-	const markdownLines = (text: string, width: number): string[] => {
+	const mdCache = new Map<string, readonly string[]>();
+	const markdownLines = (text: string, width: number): readonly string[] => {
 		if (!text.trim()) return [];
 		const key = `${width}\u0000${text}`;
 		const hit = mdCache.get(key);

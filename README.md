@@ -22,6 +22,9 @@ What you get:
   input editor, where pi's shift keys are dead by default ([shift select](#shift-select))
 - ✍️ **Spellcheck** — live typo highlighting while you type ([spellcheck](#spellcheck))
 - 🔎 **Web search**, 💬 **ask_user** dialogs, 📈 **perf stats** in the footer
+- 🧠 **Compaction thinking** — `high` thinking stays on the work, while the summary
+  auto-compaction asks for runs at `off`, so it fits its own token budget instead of failing
+  ([compaction at high thinking](#compaction-at-high-thinking))
 
 Two ways to run it: plainly on your machine (install below), or — recommended — inside
 a real sandbox with one command: [Real sandbox (sbxpi)](#real-sandbox-docker-sandboxes-sbx).
@@ -456,6 +459,11 @@ extensions/
   ask-user.ts      structured ask_user dialog
   done-notify.ts   finish/waiting notifications: terminal toast + bell, Home Assistant push
                    when pi needs you and you are not at the machine (/notify)
+  compaction-thinking.ts  thinking level for compaction summaries: the work keeps `high`, the
+                   summarization call runs at `off` and the level is put back after
+                   (HUMBEL_PI_COMPACT_THINKING, /compact-think [level|keep|status]) — this is the
+                   fix for "auto-compaction fails when thinking is high" (see
+                   "Compaction at high thinking")
   lib/             plain helper modules — excluded from extension auto-loading, register
                    nothing, and importable straight from the tests:
                    ask-loop.ts (answer/esc-back loop) · ask-flow.ts (ctx.ui wiring) ·
@@ -475,14 +483,22 @@ extensions/
                    in the tests; the brief section renders through pi-tui's own Markdown component)
                    · session-state.ts (state IO)
                    notify.ts (done-notify engine)
+                   compact-think.ts (the level bookkeeping: target parsing and aliases, hold,
+                   reconcile-after-pi-clamps, release rules incl. hands-off when the level moved
+                   mid-summary, the failure notice, and the llama.cpp compat knobs as measured)
 .githooks/pre-push   secret scan that runs on every push (this repo is public)
 bin/
   sbxpi, .ps1, .cmd  PATH launcher shims — `sbxpi` in any terminal/OS
 docs/
   sbxpi.md           sbxpi setup (per OS), sandbox management, gotchas
+  handoff-compaction-thinking.md  the compaction-thinking fix: proof, host-side steps, gotchas
 tools/
   sbx-pi.sh          one-command sandbox launcher — see "Real sandbox" above
-  sbx-local-model.sh wires a sandbox's pi to the host's local model
+  sbx-local-model.sh wires a sandbox's pi to the host's local model (mirrors the host's own
+                     default model; probe order is the fallback)
+  sbx-model-hygiene.sh  drops non-local (third-party API) providers from the host models.json,
+                     stamps the chat-template thinking shape, re-points every sandbox at the
+                     host's selection — run it on the host
   test-*.ts          regression tests — npx tsx tools/test-ask-flow.ts |
                      test-backlog-scroll.ts (needs pi's own node_modules on NODE_PATH) |
                      test-yolo.ts | test-secret-scan.ts | test-plan-state.ts |
@@ -492,7 +508,13 @@ tools/
                      test-plan-view.ts (the overlay editor, driven by keystrokes, incl. the `w`
                      wrap/compact toggle, the Brief section's rendered markdown, its line editor, and
                      the two-press `D` that deletes a Brief line) |
-                     test-dialog-select.ts
+                     test-dialog-select.ts |
+                     test-compaction-thinking.ts (57 checks — the hold/restore bookkeeping driven
+                     through a fake pi that mirrors pi's real hook ordering: level lowered for the
+                     summary and put back on success, on failure, on abort, and by the agent_end
+                     net; pi's clamping of a level the model refuses; hands off when you move the
+                     level mid-summary; no transcript churn when nothing had to change;
+                     /compact-think)
   tsconfig.check.json typecheck scaffold — npx tsc -p tools/tsconfig.check.json --noEmit
                      (Windows: tools/mklink.bat first, to give node_modules the two pi packages)
 ```
@@ -661,9 +683,140 @@ HA-shaped fake that answers 404 off-route and 401 without a token: k proves the 
 a finished run buzzes when the heuristic is off; l proves the same finished run stays off the phone
 when you typed seconds ago; m proves `/notify services` reads the instance's real registry).
 
+## Compaction at high thinking
+
+At `thinking=high`, auto-compaction kept failing with
+
+```
+Summarization failed: generation hit the token cap and the summary is incomplete
+```
+
+and then tried again a few turns later, each attempt costing a full local generation. The
+compaction logic is not what is broken — the **summary request's output budget** is. Four facts,
+measured against the running servers and against pi 1.5.2's own request builder:
+
+1. **pi summarizes at your level.** `createSummarizationOptions()` in
+   `dist/core/compaction/compaction.js` sets `options.reasoning = thinkingLevel`: a session at
+   `high` compacts at `high`.
+2. **that request gets no budget of its own.** Its `max_tokens` comes from pi-ai's
+   `clampMaxTokensToContext()` — `min(model.maxTokens, contextWindow − input − margin)` — and every
+   model in `~/.pi/agent/models.json` here declares `maxTokens: 16384`.
+3. **thinking is not sized to that ceiling.** pi-ai's `DEFAULT_THINKING_BUDGETS` put `high` at
+   16384, i.e. the entire response, and `clampThinkingBudgetToAnswerRoom()` only trims a budget that
+   would leave less than `MIN_ANSWER_TOKENS` (1024) for the answer. The effective split is 15360
+   thinking / 1024 answer.
+4. **a truncated summary is rejected.** `stopReason: "length"` with no summary text hits
+   `getSummarizationFailure()`, which produces exactly the message above; no `CompactionEntry` is
+   written and the next turn tries again.
+
+One reasoning-inducing prompt against `:8890` with `max_tokens: 400`:
+
+| request | finish_reason | thinking | answer |
+|---|---|---|---|
+| thinking on, no cap | `length` | 1001 chars | truncated |
+| + top-level `thinking_budget_tokens: 128` | `stop` | 591 chars | 695 chars |
+| + `chat_template_kwargs.thinking_budget: 128` | `length` | 1539 chars | **0 chars** |
+| `chat_template_kwargs.enable_thinking: false` | `length`\* | 0 chars | 1283 chars |
+
+\* that last `length` is only the 400-token ceiling on a long answer; at the 16384 ceiling pi really
+sends, the same request finishes `stop`.
+
+And the knob names differ per server, which is why both fixes below are needed:
+
+| server | top-level `enable_thinking` | `chat_template_kwargs.enable_thinking` | a thinking budget field |
+|---|---|---|---|
+| `:8890` llama.cpp arm | **ignored** — it thinks even when pi asked for `off` | honoured | `thinking_budget_tokens` honoured; `chat_template_kwargs.thinking_budget` ignored |
+| `:8888` unsloth studio | honoured (pi's `thinkingFormat: "qwen"`) | honoured | nothing is honoured → the level itself has to reach `off` |
+
+### 1. The extension: summarize at `off`, keep `high` for the work
+
+`extensions/compaction-thinking.ts` listens to `session_before_compact`, lowers the thinking level,
+and puts it back on `session_compact` / `session_compact_failed` (that event covers failures and
+aborts alike), with an `agent_end` net in case a compaction never settles. Pi awaits the hook
+**before** it resolves the summarization request (`_runAutoCompaction` → the request auth reads
+`this.thinkingLevel`), in the manual `/compact` path and in the automatic threshold/overflow paths,
+so the level set inside the hook is the level the summary runs at. Pi's compaction machinery —
+split-turn merge, file tracking, retry policy, overflow recovery — is untouched; only the thinking
+level under it changes.
+
+- Nothing is written when the level already matches the target. `setThinkingLevel` appends a
+  transcript entry only on a real change, so a session already at `off` does not get an `off → off`
+  pair per compaction.
+- `pi.setThinkingLevel` is session-scoped (`options.persist` stays at its default): your global
+  default level is never rewritten, and the footer just flickers `off` and back during a compaction.
+- If the level moves while the summary runs — your keypress, or a model switch, which re-picks a
+  level per model — the extension hands off. Yours wins.
+
+```
+HUMBEL_PI_COMPACT_THINKING=off      # default; minimal | low | medium | high | xhigh | max | keep
+/compact-think                      # status: what is targeted, and what is in place mid-compaction
+/compact-think low                  # set it for this session, no restart needed
+/compact-think keep                 # leave the session level alone (extension effectively disabled)
+```
+
+### 2. `~/.pi/agent/models.json`: make the level mean something on the llama.cpp arm
+
+`thinkingFormat: "qwen"` sends `{"enable_thinking": …}` at the top level, which `:8890` ignores — the
+model thought whatever pi asked for. The llama.cpp-shaped compat is stamped onto that provider's
+models:
+
+```json
+"compat": {
+  "maxTokensField": "max_tokens",
+  "thinkingFormat": "chat-template",
+  "chatTemplateKwargs": { "enable_thinking": { "$var": "thinking.enabled" } },
+  "thinkingTokenBudgetField": "thinking_budget_tokens"
+}
+```
+
+Captured from pi's own request builder for that model: level `off` sends
+`chat_template_kwargs: {"enable_thinking": false}`; level `high` sends `{"enable_thinking": true}`
+plus `thinking_budget_tokens: <budget>`. The edited file was checked against pi's
+`ModelsConfigSchema` (`dist/core/model-config.js`). `:8888` accepts the same shape (measured — its
+server ignores `thinking_budget_tokens` but honours `chat_template_kwargs.enable_thinking`), so
+`tools/sbx-model-hygiene.sh --stamp-compat` writes it into every local reasoning model rather than
+only the llama.cpp ones.
+
+> ⚠️ `tools/sbx-local-model.sh` regenerates the **sandbox's** `models.json` from the host file on
+> every launch. A compat block added only to the sandbox copy is gone at the next launch — the same
+> block has to be in the host's `%USERPROFILE%\.pi\agent\models.json` (or in whatever writes that
+> file).
+
+`tools/sbx-model-hygiene.sh` does that host-side pass in one command: it drops every non-local
+(third-party API) provider from the host `models.json`, stamps this compat into every local reasoning
+model, refuses to leave a dangling host default behind, and then re-points every sandbox at the host's
+own selection. Look first, then apply:
+
+```bash
+tools/sbx-model-hygiene.sh --dry-run --stamp-compat
+tools/sbx-model-hygiene.sh --stamp-compat
+```
+
+Full walkthrough, including what to do in a session started on the host:
+[docs/handoff-compaction-thinking.md](docs/handoff-compaction-thinking.md).
+
+### 3. `thinkingBudgets`: thinking sized to the model, not to pi's defaults
+
+`high` at 16384 tokens *is* these models' whole response ceiling, so ordinary turns at `high` get
+truncated too, not only summaries:
+
+```json
+"thinkingBudgets": { "minimal": 512, "low": 1536, "medium": 3072, "high": 6144 }
+```
+
+Honoured on `:8890` (`thinking_budget_tokens`), ignored on `:8888` — which is exactly why the summary
+path goes to `off` rather than to a smaller budget: a level is the one knob both servers obey.
+
+Tests: `tools/test-compaction-thinking.ts` (57 checks) drives the extension through a fake pi that
+mirrors pi's real hook ordering, including the case where pi clamps a level the model refuses — the
+level asked for is not the level held, and a restore that silently never happens is the bug that case
+exists to catch.
+
 ## Troubleshooting
 
 - `pi list` — shows installed packages and where they resolve to.
+- Auto-compaction failing with "generation hit the token cap and the summary is incomplete" is a
+  thinking-budget problem, not a compaction bug: `/compact-think` ([compaction at high thinking](#compaction-at-high-thinking)).
 - `/reload` — reload extensions/settings after manual edits.
 - `pi update --extensions` — reconcile package installs (pulls new commits from a git source).
 - Grants live in `~/.pi/agent/guard-state.json`. `/guards` shows the full status;
