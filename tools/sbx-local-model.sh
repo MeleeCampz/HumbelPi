@@ -227,7 +227,10 @@ fi
 # Provider the default model belongs to.
 PROVIDER_NAME="${DEFAULT_MODEL%%/*}"
 
-"$SBX" exec "$NAME" -- bash -c 'mkdir -p ~/.pi/agent && cat > ~/.pi/agent/models.json <<EOF
+# The heredoc delimiter is backslash-escaped (<<\EOF): an unquoted heredoc would let
+# the VM's bash expand the $var in stamped compat ({"$var":"thinking.enabled"}) to an
+# empty string, and pi then rejects the whole models.json — no local providers at all.
+"$SBX" exec "$NAME" -- bash -c 'mkdir -p ~/.pi/agent && cat > ~/.pi/agent/models.json <<\EOF
 '"$PROVIDER_JSON"'
 EOF'
 

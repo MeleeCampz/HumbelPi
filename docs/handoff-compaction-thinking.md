@@ -101,6 +101,16 @@ afterwards, and no `Summarization failed` line appears.
 - **The sandbox `models.json` is a snapshot** that `sbxpi` rewrites every launch
   from the host file. That is why hygiene edits the **host** file and then
   re-provisions sandboxes — a hand-edit inside a VM dies with the VM.
+  (Fixed 2026-11-20: the rewrite used an unquoted heredoc, so the VM expanded
+  the stamped `"$var"` key to `""` and pi rejected the whole file — no local
+  providers in the sandbox, claude-only model list, session models erroring.
+  The heredoc delimiter is now escaped, `<<\EOF`.)
+- **Claude models listed inside a sandbox are credential noise, not capability.**
+  Older sandboxes were created with the pi-kit's Anthropic binding accepted, so
+  the key is injected and pi lists 18 claude models. The local network policies
+  deny `api.anthropic.com` / `platform.claude.com` (curl from a VM: 403), so
+  they cannot answer; `sbxpi` now declines the binding at create. Removing the
+  binding from existing sandboxes would require re-creating them.
 - **Knob compatibility** (measured): `:8888` Unsloth Studio honours top-level
   `enable_thinking` *and* `chat_template_kwargs.enable_thinking`, ignores
   `thinking_budget*`. `:8890` llama.cpp honours `chat_template_kwargs.enable_thinking`
